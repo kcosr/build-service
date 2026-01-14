@@ -4,6 +4,19 @@ A host-side build service that executes `make` on the host when triggered from c
 
 This exists to support builds that depend on proprietary host libraries that cannot be exposed inside containers used by coding agents or third-party hosted models.
 
+## ⚠️ Security Considerations
+
+This service intentionally bridges a container isolation boundary. Any process with write access to the mounted workspace directory can create a Makefile (or modify an existing one) and trigger its execution on the host via this service. Build commands run with the peer user's privileges, meaning they can access files and resources on the host that are not exposed inside the container.
+
+This is a deliberate trade-off. The alternative—exposing proprietary libraries inside containers accessible to third-party models—may carry greater risk depending on your threat model. If you trust the code and agents operating within your containers, or have other controls in place (network isolation, restricted user permissions, auditing), this service provides a pragmatic way to support host-dependent builds without broadening container access.
+
+Before deploying, consider:
+- **Who has write access** to workspace directories mounted into containers
+- **What host resources** the peer user can reach (files, network, credentials)
+- **Whether audit logging** and timeouts provide sufficient visibility and limits
+
+If your environment includes untrusted or semi-trusted workloads with write access to mounted paths, this service may not be appropriate.
+
 ## Components
 
 - **build-service**: host daemon running as root under systemd. Validates requests, drops privileges, runs the configured command, and streams output.
