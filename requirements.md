@@ -162,7 +162,7 @@ console = false
 {
     "command": "make",
     "args": ["-j4", "all"],
-    "cwd": "/home/kcassidy/workspace/VailSBCLite",
+    "cwd": "/home/kevin/workspace/app",
     "timeout_sec": 600
 }
 ```
@@ -257,10 +257,10 @@ On timeout:
 Plain text format via `tracing` (matching acl-proxy style):
 
 ```
-2026-01-14T12:00:00.000Z  INFO build_service: build started user=kcassidy cwd=/home/kcassidy/workspace/VailSBCLite args=["-j4","all"]
-2026-01-14T12:00:30.000Z  INFO build_service: build completed user=kcassidy exit_code=0 duration_sec=30
-2026-01-14T12:00:30.000Z ERROR build_service: build completed user=kcassidy exit_code=2 duration_sec=30
-2026-01-14T12:01:00.000Z  WARN build_service: build timed out user=kcassidy duration_sec=600
+2026-01-14T12:00:00.000Z  INFO build_service: build started user=kevin cwd=/home/kevin/workspace/app args=["-j4","all"]
+2026-01-14T12:00:30.000Z  INFO build_service: build completed user=kevin exit_code=0 duration_sec=30
+2026-01-14T12:00:30.000Z ERROR build_service: build completed user=kevin exit_code=2 duration_sec=30
+2026-01-14T12:01:00.000Z  WARN build_service: build timed out user=kevin duration_sec=600
 ```
 
 > Note: log levels are a policy choice; this suggests non-zero exit codes as `ERROR` for easier alerting.
