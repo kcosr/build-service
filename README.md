@@ -2,6 +2,8 @@
 
 A host-side build service that executes `make` on the host when triggered from containers, while preserving the caller's identity via Unix socket peer credentials.
 
+This exists to support builds that depend on proprietary host libraries that cannot be exposed inside containers used by coding agents or third-party hosted models.
+
 ## Components
 
 - **build-service**: host daemon running as root under systemd. Validates requests, drops privileges, runs the configured command, and streams output.
