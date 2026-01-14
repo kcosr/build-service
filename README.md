@@ -40,7 +40,9 @@ Key fields:
 - `service.socket_path`: Unix socket path.
 - `service.socket_group`: group that can access the socket.
 - `service.socket_mode`: octal permissions (e.g., "0660").
-- `build.workspace_root`: base path expanded as `<workspace_root>/<username>/workspace`.
+- `build.workspace_root`: base path used by `{workspace_root}` in path templates.
+- `build.path_mapping.container_template`: container-side workspace root template (`{user}`, `{workspace_root}`).
+- `build.path_mapping.host_template`: host-side workspace root template (`{user}`, `{workspace_root}`).
 - `build.commands`: allowlist mapping `command` -> absolute binary path.
 - `build.timeouts.default_sec`: default timeout.
 - `build.timeouts.max_sec`: hard cap for client requests.
@@ -50,6 +52,8 @@ Key fields:
 Environment overrides:
 - `BUILD_SERVICE_CONFIG`: alternate config path.
 - `BUILD_SERVICE_LOG_LEVEL`: override `logging.level`.
+
+Path mapping templates support `{user}` and `{workspace_root}` (`host_template` must include `{user}`). Defaults keep host and container paths identical; to map container `/home/<user>` to host `/home/<user>/workspace`, set `build.path_mapping.container_template = "/home/{user}"` and keep `build.path_mapping.host_template = "{workspace_root}/{user}/workspace"`.
 
 ## Protocol
 
@@ -78,8 +82,8 @@ Output is streamed as lossy UTF-8; invalid bytes are replaced.
 
 ## Path Validation
 
-- `cwd` must resolve under `/home/<user>/workspace` (derived from config).
-- `-C`/`--directory` and `-f`/`--file` args are resolved relative to the current directory and must stay under the workspace.
+- `cwd` is mapped from container paths to host paths using `build.path_mapping.*`, then must resolve under the host workspace root.
+- `-C`/`--directory` and `-f`/`--file` args are resolved relative to the mapped cwd and must stay under the host workspace root.
 - Requests that escape the workspace are rejected.
 
 ## Timeout Handling
@@ -144,4 +148,4 @@ Logs are written using `tracing` in a plain-text format. Configure log directory
 
 ## Roadmap
 
-- Add configurable container-to-host path mapping for workspace mounts.
+- Support multiple workspace mappings for additional mounts.

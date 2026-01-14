@@ -25,7 +25,7 @@ struct Args {
     #[arg(required = true)]
     command: String,
 
-    #[arg(trailing_var_arg = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
 
@@ -179,6 +179,25 @@ mod tests {
         assert_eq!(normalize_exit_code(0), 0);
         assert_eq!(normalize_exit_code(255), 255);
         assert_eq!(normalize_exit_code(300), 255);
+    }
+
+    #[test]
+    fn parse_args_allows_make_flags_without_double_dash() {
+        let args = Args::try_parse_from(["build-cli", "make", "-f", "Makefile.local", "-j4"])
+            .expect("parse args");
+
+        assert_eq!(args.command, "make");
+        assert_eq!(
+            args.args,
+            vec![
+                "-f".to_string(),
+                "Makefile.local".to_string(),
+                "-j4".to_string()
+            ]
+        );
+        assert_eq!(args.timeout, None);
+        assert_eq!(args.socket, None);
+        assert_eq!(args.request_id, None);
     }
 
     #[test]

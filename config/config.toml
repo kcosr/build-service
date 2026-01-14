@@ -9,6 +9,15 @@ socket_mode = "0660"
 # The workspace root is expanded as <workspace_root>/<username>/workspace.
 workspace_root = "/home"
 
+[build.path_mapping]
+# Template placeholders: {user}, {workspace_root}
+# Defaults keep host and container paths identical.
+# Example mapping when the container sees /home/<user> but host uses /home/<user>/workspace:
+# container_template = "/home/{user}"
+# host_template = "/home/{user}/workspace"
+container_template = "{workspace_root}/{user}/workspace"
+host_template = "{workspace_root}/{user}/workspace"
+
 [build.commands]
 make = "/usr/bin/make"
 

@@ -119,6 +119,10 @@ impl Config {
             ));
         }
 
+        self.build
+            .path_mapping
+            .validate(&self.build.workspace_root)?;
+
         if self.build.timeouts.default_sec == 0 || self.build.timeouts.max_sec == 0 {
             return Err(ConfigError::Invalid(
                 "build.timeouts values must be greater than zero".to_string(),
@@ -220,6 +224,9 @@ pub struct BuildConfig {
     #[serde(default = "default_workspace_root")]
     pub workspace_root: PathBuf,
 
+    #[serde(default)]
+    pub path_mapping: PathMappingConfig,
+
     #[serde(default = "default_build_commands")]
     pub commands: HashMap<String, PathBuf>,
 
@@ -234,6 +241,7 @@ impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             workspace_root: default_workspace_root(),
+            path_mapping: PathMappingConfig::default(),
             commands: default_build_commands(),
             timeouts: BuildTimeoutsConfig::default(),
             environment: BuildEnvironmentConfig::default(),
@@ -243,6 +251,91 @@ impl Default for BuildConfig {
 
 fn default_workspace_root() -> PathBuf {
     PathBuf::from("/home")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathMappingConfig {
+    #[serde(default = "default_container_template")]
+    pub container_template: String,
+
+    #[serde(default = "default_host_template")]
+    pub host_template: String,
+}
+
+impl Default for PathMappingConfig {
+    fn default() -> Self {
+        Self {
+            container_template: default_container_template(),
+            host_template: default_host_template(),
+        }
+    }
+}
+
+fn default_container_template() -> String {
+    "{workspace_root}/{user}/workspace".to_string()
+}
+
+fn default_host_template() -> String {
+    "{workspace_root}/{user}/workspace".to_string()
+}
+
+impl PathMappingConfig {
+    pub(crate) fn validate(&self, workspace_root: &Path) -> Result<(), ConfigError> {
+        validate_path_template(
+            &self.container_template,
+            workspace_root,
+            false,
+            "build.path_mapping.container_template",
+        )?;
+        validate_path_template(
+            &self.host_template,
+            workspace_root,
+            true,
+            "build.path_mapping.host_template",
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn resolve_container_root(&self, user: &str, workspace_root: &Path) -> PathBuf {
+        resolve_path_template(&self.container_template, user, workspace_root)
+    }
+
+    pub(crate) fn resolve_host_root(&self, user: &str, workspace_root: &Path) -> PathBuf {
+        resolve_path_template(&self.host_template, user, workspace_root)
+    }
+}
+
+fn resolve_path_template(template: &str, user: &str, workspace_root: &Path) -> PathBuf {
+    let mut resolved = template.replace("{user}", user);
+    let workspace_root = workspace_root.to_string_lossy();
+    resolved = resolved.replace("{workspace_root}", &workspace_root);
+    PathBuf::from(resolved)
+}
+
+fn validate_path_template(
+    template: &str,
+    workspace_root: &Path,
+    require_user: bool,
+    field: &str,
+) -> Result<(), ConfigError> {
+    if template.trim().is_empty() {
+        return Err(ConfigError::Invalid(format!("{field} must not be empty")));
+    }
+
+    if require_user && !template.contains("{user}") {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must include {{user}}"
+        )));
+    }
+
+    let resolved = resolve_path_template(template, "user", workspace_root);
+    if !resolved.is_absolute() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must resolve to an absolute path"
+        )));
+    }
+
+    Ok(())
 }
 
 fn default_build_commands() -> HashMap<String, PathBuf> {
@@ -397,6 +490,7 @@ mod tests {
             service: ServiceConfig::default(),
             build: BuildConfig {
                 workspace_root: PathBuf::from("/tmp"),
+                path_mapping: PathMappingConfig::default(),
                 commands,
                 timeouts: BuildTimeoutsConfig::default(),
                 environment: BuildEnvironmentConfig::default(),
@@ -476,5 +570,31 @@ mod tests {
         config.build.environment.allow.push(String::new());
         let err = config.validate().expect_err("should fail");
         assert!(err.to_string().contains("environment.allow"));
+    }
+
+    #[test]
+    fn validate_rejects_relative_container_template() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cmd = temp.path().join("make");
+        std::fs::write(&cmd, "").expect("write");
+
+        let mut config = base_config(cmd);
+        config.build.path_mapping.container_template = "workspace".to_string();
+        let err = config.validate().expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("build.path_mapping.container_template"));
+    }
+
+    #[test]
+    fn validate_rejects_host_template_missing_user() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cmd = temp.path().join("make");
+        std::fs::write(&cmd, "").expect("write");
+
+        let mut config = base_config(cmd);
+        config.build.path_mapping.host_template = "/srv/workspaces".to_string();
+        let err = config.validate().expect_err("should fail");
+        assert!(err.to_string().contains("build.path_mapping.host_template"));
     }
 }
