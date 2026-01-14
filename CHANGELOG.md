@@ -5,6 +5,9 @@
 ### Documentation
 - Make `CLAUDE.md` a symlink to `AGENTS.md`.
 
+### Changed
+- Sync `Cargo.toml` version with `VERSION` during releases.
+
 _No unreleased changes._
 
 ## [0.0.2] - 2026-01-14

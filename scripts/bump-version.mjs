@@ -12,13 +12,15 @@
  *   node scripts/bump-version.mjs           # Show current version
  */
 
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 const versionFilePath = join(ROOT, "VERSION");
+const cargoTomlPath = join(ROOT, "Cargo.toml");
+const cargoLockPath = join(ROOT, "Cargo.lock");
 
 function readVersion() {
 	try {
@@ -43,6 +45,37 @@ function parseVersion(version) {
 
 function formatVersion(parts) {
 	return `${parts.major}.${parts.minor}.${parts.patch}${parts.suffix}`;
+}
+
+function updateCargoTomlVersion(newVersion) {
+	let content = readFileSync(cargoTomlPath, "utf8");
+	const versionRegex =
+		/(\[package\][\s\S]*?\nversion\s*=\s*")[^"]*(")/;
+	if (!versionRegex.test(content)) {
+		console.error("Cargo.toml [package] version not found");
+		process.exit(1);
+	}
+
+	content = content.replace(versionRegex, `$1${newVersion}$2`);
+	writeFileSync(cargoTomlPath, content, "utf8");
+}
+
+function updateCargoLockVersion(newVersion) {
+	if (!existsSync(cargoLockPath)) {
+		return;
+	}
+
+	let content = readFileSync(cargoLockPath, "utf8");
+	const versionRegex =
+		/(\[\[package\]\]\nname = "build-service"\nversion = ")[^"]*(")/;
+	if (!versionRegex.test(content)) {
+		console.error("Cargo.lock package entry not found for build-service");
+		process.exit(1);
+	}
+
+	const updated = content.replace(versionRegex, `$1${newVersion}$2`);
+	content = updated;
+	writeFileSync(cargoLockPath, content, "utf8");
 }
 
 const currentVersion = readVersion();
@@ -91,4 +124,6 @@ switch (arg.toLowerCase()) {
 }
 
 writeFileSync(versionFilePath, `${newVersion}\n`, "utf8");
+updateCargoTomlVersion(newVersion);
+updateCargoLockVersion(newVersion);
 console.log(`Version updated: ${currentVersion} -> ${newVersion}`);
