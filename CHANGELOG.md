@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Documentation
+- Make `CLAUDE.md` a symlink to `AGENTS.md`.
+
 _No unreleased changes._
 
 ## [0.0.2] - 2026-01-14
