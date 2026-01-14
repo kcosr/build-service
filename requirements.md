@@ -375,3 +375,11 @@ fi
 - Build caching integration
 - Optional request/response version negotiation (`schema_version`)
 
+## Amendments (Post-Initial Requirements)
+
+- Config now uses a command allowlist (`build.commands`) instead of a single `make_path`.
+- Container-to-host workspace path mapping is configurable via `build.path_mapping` templates.
+- Requests map container paths before validation to support non-identical mounts.
+- Supplementary groups are preserved using peer group discovery for accurate permissions.
+- Exit status mapping follows 128 + signal conventions for signal terminations.
+- Added tests across config, protocol, validation, daemon, and CLI behavior.
