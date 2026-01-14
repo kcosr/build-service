@@ -209,6 +209,7 @@ struct PreparedRequest {
     command_path: PathBuf,
     cwd: PathBuf,
     timeout_sec: u64,
+    args: Vec<String>,
 }
 
 fn prepare_request(
@@ -229,13 +230,12 @@ fn prepare_request(
         .cloned()
         .ok_or_else(|| RequestError::CommandNotAllowed(request.command.clone()))?;
 
-    let allowed_root = config
-        .build
-        .workspace_root
-        .join(&user.username)
-        .join("workspace");
-    let cwd = validate_cwd(Path::new(&request.cwd), &allowed_root)?;
-    validate_make_args(&request.args, &cwd, &allowed_root)?;
+    let container_root = config.build.workspace_root.join(&user.username);
+    let allowed_root = container_root.join("workspace");
+    let mapped_cwd = map_container_path(Path::new(&request.cwd), &container_root, &allowed_root);
+    let cwd = validate_cwd(&mapped_cwd, &allowed_root)?;
+    let mapped_args = map_request_args(&request.args, &container_root, &allowed_root);
+    validate_make_args(&mapped_args, &cwd, &allowed_root)?;
 
     let timeout = request
         .timeout_sec
@@ -246,6 +246,7 @@ fn prepare_request(
         command_path,
         cwd,
         timeout_sec: timeout,
+        args: mapped_args,
     })
 }
 
@@ -264,6 +265,84 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> Result<Request, RequestEr
     Ok(serde_json::from_str(trimmed)?)
 }
 
+fn map_container_path(path: &Path, container_root: &Path, host_root: &Path) -> PathBuf {
+    if path.starts_with(host_root) {
+        return path.to_path_buf();
+    }
+    if let Ok(stripped) = path.strip_prefix(container_root) {
+        return host_root.join(stripped);
+    }
+    path.to_path_buf()
+}
+
+fn map_request_args(args: &[String], container_root: &Path, host_root: &Path) -> Vec<String> {
+    let mut mapped = Vec::with_capacity(args.len());
+    let mut iter = args.iter().peekable();
+    let mut options_done = false;
+
+    while let Some(arg) = iter.next() {
+        if options_done {
+            mapped.push(arg.clone());
+            continue;
+        }
+
+        if arg == "--" {
+            options_done = true;
+            mapped.push(arg.clone());
+            continue;
+        }
+
+        if arg == "-C" || arg == "--directory" || arg == "-f" || arg == "--file" {
+            mapped.push(arg.clone());
+            if let Some(value) = iter.next() {
+                mapped.push(map_container_arg(value, container_root, host_root));
+            }
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("-C") {
+            if !value.is_empty() {
+                let mapped_value = map_container_arg(value, container_root, host_root);
+                mapped.push(format!("-C{mapped_value}"));
+                continue;
+            }
+        }
+
+        if let Some(value) = arg.strip_prefix("--directory=") {
+            let mapped_value = map_container_arg(value, container_root, host_root);
+            mapped.push(format!("--directory={mapped_value}"));
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("-f") {
+            if !value.is_empty() {
+                let mapped_value = map_container_arg(value, container_root, host_root);
+                mapped.push(format!("-f{mapped_value}"));
+                continue;
+            }
+        }
+
+        if let Some(value) = arg.strip_prefix("--file=") {
+            let mapped_value = map_container_arg(value, container_root, host_root);
+            mapped.push(format!("--file={mapped_value}"));
+            continue;
+        }
+
+        mapped.push(arg.clone());
+    }
+
+    mapped
+}
+
+fn map_container_arg(value: &str, container_root: &Path, host_root: &Path) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        let mapped = map_container_path(path, container_root, host_root);
+        return mapped.to_string_lossy().into_owned();
+    }
+    value.to_string()
+}
+
 fn run_build(
     mut writer: BufWriter<UnixStream>,
     request: &Request,
@@ -279,7 +358,7 @@ fn run_build(
 
     let mut command = Command::new(&prepared.command_path);
     command
-        .args(&request.args)
+        .args(&prepared.args)
         .current_dir(&prepared.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
