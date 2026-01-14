@@ -2,13 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+- Use `Cargo.toml` as single source of truth for versioning, remove `VERSION` file.
+
 ### Documentation
 - Make `CLAUDE.md` a symlink to `AGENTS.md`.
-
-### Changed
-- Sync `Cargo.toml` version with `VERSION` during releases.
-
-_No unreleased changes._
 
 ## [0.0.2] - 2026-01-14
 
