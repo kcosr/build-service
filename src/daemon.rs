@@ -230,8 +230,14 @@ fn prepare_request(
         .cloned()
         .ok_or_else(|| RequestError::CommandNotAllowed(request.command.clone()))?;
 
-    let container_root = config.build.workspace_root.join(&user.username);
-    let allowed_root = container_root.join("workspace");
+    let container_root = config
+        .build
+        .path_mapping
+        .resolve_container_root(&user.username, &config.build.workspace_root);
+    let allowed_root = config
+        .build
+        .path_mapping
+        .resolve_host_root(&user.username, &config.build.workspace_root);
     let mapped_cwd = map_container_path(Path::new(&request.cwd), &container_root, &allowed_root);
     let cwd = validate_cwd(&mapped_cwd, &allowed_root)?;
     let mapped_args = map_request_args(&request.args, &container_root, &allowed_root);
@@ -345,7 +351,7 @@ fn map_container_arg(value: &str, container_root: &Path, host_root: &Path) -> St
 
 fn run_build(
     mut writer: BufWriter<UnixStream>,
-    request: &Request,
+    _request: &Request,
     prepared: &PreparedRequest,
     config: &Config,
     user: &UserInfo,
