@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.2] - 2026-01-14
 
 ### Added
 - Configurable container-to-host path mapping for workspace mounts. (#1)
