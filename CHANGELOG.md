@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.3] - 2026-01-14
 
 ### Changed
 - Use `Cargo.toml` as single source of truth for versioning, remove `VERSION` file.
