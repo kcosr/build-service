@@ -1,0 +1,39 @@
+schema_version = "1"
+
+[service]
+socket_path = "/run/build-service.sock"
+socket_group = "users"
+socket_mode = "0660"
+
+[build]
+# The workspace root is expanded as <workspace_root>/<username>/workspace.
+workspace_root = "/home"
+
+[build.commands]
+make = "/usr/bin/make"
+
+[build.timeouts]
+default_sec = 600
+max_sec = 1800
+
+[build.environment]
+allow = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "CC",
+    "CXX",
+    "CFLAGS",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "PKG_CONFIG_PATH",
+    "MAKEFLAGS",
+]
+
+[logging]
+level = "info"
+directory = "/var/log/build-service"
+max_bytes = 104857600
+max_files = 5
+console = false
