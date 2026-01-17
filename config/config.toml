@@ -1,22 +1,40 @@
-schema_version = "1"
+schema_version = "2"
 
 [service]
-socket_path = "/run/build-service.sock"
-socket_group = "users"
-socket_mode = "0660"
+# At least one of service.socket.enabled or service.http.enabled must be true.
+
+[service.socket]
+enabled = true
+path = "/run/build-service.sock"
+group = "users"
+mode = "0660"
+
+[service.socket.auth]
+# Optional: require a token even on the Unix socket.
+required = false
+# tokens = ["<optional token>"]
+
+[service.http]
+enabled = false
+listen_addr = "0.0.0.0:8080"
+
+[service.http.auth]
+type = "bearer"
+# If false, tokens are ignored and no auth is required.
+required = false
+# tokens = ["<secret token>"]
+
+[service.http.tls]
+enabled = false
+# cert_path = "/etc/build-service/tls/server.crt"
+# key_path = "/etc/build-service/tls/server.key"
+# ca_path = "/etc/build-service/tls/ca.crt"
 
 [build]
-# The workspace root is expanded as <workspace_root>/<username>/workspace.
 workspace_root = "/home"
-
-[build.path_mapping]
-# Template placeholders: {user}, {workspace_root}
-# Defaults keep host and container paths identical.
-# Example mapping when the container sees /home/<user> but host uses /home/<user>/workspace:
-# container_template = "/home/{user}"
-# host_template = "/home/{user}/workspace"
-container_template = "{workspace_root}/{user}/workspace"
-host_template = "{workspace_root}/{user}/workspace"
+# optional: run builds as this user/group (default: service process user)
+# run_as_user = "build"
+# run_as_group = "build"
 
 [build.commands]
 make = "/usr/bin/make"
@@ -39,6 +57,29 @@ allow = [
     "PKG_CONFIG_PATH",
     "MAKEFLAGS",
 ]
+
+[artifacts]
+storage_root = "/var/lib/build-service/artifacts"
+public_base_url = "https://builds.example.com/artifacts"
+# ttl_sec = 86400
+# gc_interval_sec = 3600
+# max_bytes = 1073741824
+
+[[projects]]
+id = "sip-stack"
+type = "repo"
+repo_url = "https://github.com/org/sip-stack.git"
+repo_ref = "main"
+repo_subdir = "./"
+commands = ["make"]
+artifacts = ["bin/app", "dist/*.tar.gz"]
+
+[[projects]]
+id = "nfs-tooling"
+type = "path"
+path_root = "/mnt/nfs/tooling"
+commands = ["make", "ninja"]
+artifacts = ["out/tool"]
 
 [logging]
 level = "info"

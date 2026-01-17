@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::logging::LoggingSettings;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/build-service/config.toml";
-const DEFAULT_SCHEMA_VERSION: &str = "1";
+const DEFAULT_SCHEMA_VERSION: &str = "2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -47,6 +48,12 @@ pub struct Config {
 
     #[serde(default)]
     pub build: BuildConfig,
+
+    #[serde(default)]
+    pub artifacts: ArtifactsConfig,
+
+    #[serde(default)]
+    pub projects: Vec<ProjectConfig>,
 
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -97,51 +104,459 @@ impl Config {
             )));
         }
 
-        if self.service.socket_group.trim().is_empty() {
+        if !self.service.socket.enabled && !self.service.http.enabled {
             return Err(ConfigError::Invalid(
-                "service.socket_group must not be empty".to_string(),
+                "at least one of service.socket.enabled or service.http.enabled must be true"
+                    .to_string(),
             ));
         }
 
-        if !self.service.socket_path.is_absolute() {
+        self.service.validate()?;
+        self.build.validate()?;
+        self.artifacts.validate()?;
+        self.validate_projects()?;
+
+        if let Err(err) = LoggingSettings::from_config(&self.logging) {
+            return Err(ConfigError::Invalid(format!("{err}")));
+        }
+
+        Ok(())
+    }
+
+    fn validate_projects(&self) -> Result<(), ConfigError> {
+        if self.projects.is_empty() {
             return Err(ConfigError::Invalid(
-                "service.socket_path must be an absolute path".to_string(),
+                "projects must include at least one project".to_string(),
             ));
         }
 
-        self.service
-            .parse_socket_mode()
+        let mut seen = HashSet::new();
+        for project in &self.projects {
+            let id = project.id().trim();
+            if id.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "projects contains an empty id".to_string(),
+                ));
+            }
+            if !seen.insert(id.to_string()) {
+                return Err(ConfigError::Invalid(format!(
+                    "projects contains duplicate id {id}"
+                )));
+            }
+
+            if project.commands().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "project {id} must allow at least one command"
+                )));
+            }
+
+            for command in project.commands() {
+                if command.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "project {id} contains an empty command name"
+                    )));
+                }
+                if !self.build.commands.contains_key(command) {
+                    return Err(ConfigError::Invalid(format!(
+                        "project {id} references undefined command {command}"
+                    )));
+                }
+            }
+
+            for pattern in project.artifacts() {
+                validate_artifact_pattern(pattern)
+                    .map_err(|err| ConfigError::Invalid(format!("project {id}: {err}")))?;
+            }
+
+            match project {
+                ProjectConfig::Repo {
+                    repo_url,
+                    repo_ref,
+                    repo_subdir,
+                    ..
+                } => {
+                    if repo_url.trim().is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "project {id} repo_url must not be empty"
+                        )));
+                    }
+                    if repo_ref.trim().is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "project {id} repo_ref must not be empty"
+                        )));
+                    }
+                    validate_relative_path(repo_subdir).map_err(|err| {
+                        ConfigError::Invalid(format!("project {id} repo_subdir {err}"))
+                    })?;
+                }
+                ProjectConfig::Path { path_root, .. } => {
+                    if !path_root.is_absolute() {
+                        return Err(ConfigError::Invalid(format!(
+                            "project {id} path_root must be an absolute path"
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn default_schema_version() -> String {
+    DEFAULT_SCHEMA_VERSION.to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceConfig {
+    #[serde(default)]
+    pub socket: SocketConfig,
+
+    #[serde(default)]
+    pub http: HttpConfig,
+}
+
+impl ServiceConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.socket.enabled {
+            self.socket.validate()?;
+        }
+
+        if self.http.enabled {
+            self.http.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocketConfig {
+    #[serde(default = "default_socket_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_socket_path")]
+    pub path: PathBuf,
+
+    #[serde(default = "default_socket_group")]
+    pub group: String,
+
+    #[serde(default = "default_socket_mode")]
+    pub mode: String,
+
+    #[serde(default)]
+    pub auth: TokenAuthConfig,
+}
+
+impl Default for SocketConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_socket_enabled(),
+            path: default_socket_path(),
+            group: default_socket_group(),
+            mode: default_socket_mode(),
+            auth: TokenAuthConfig::default(),
+        }
+    }
+}
+
+impl SocketConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.group.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "service.socket.group must not be empty".to_string(),
+            ));
+        }
+
+        if !self.path.is_absolute() {
+            return Err(ConfigError::Invalid(
+                "service.socket.path must be an absolute path".to_string(),
+            ));
+        }
+
+        self.parse_mode()
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
 
-        if !self.build.workspace_root.is_absolute() {
+        self.auth
+            .validate("service.socket.auth")
+            .map_err(ConfigError::Invalid)?;
+
+        Ok(())
+    }
+
+    pub fn parse_mode(&self) -> Result<u32, SocketModeError> {
+        parse_socket_mode(&self.mode)
+    }
+}
+
+fn default_socket_enabled() -> bool {
+    true
+}
+
+fn default_socket_path() -> PathBuf {
+    PathBuf::from("/run/build-service.sock")
+}
+
+fn default_socket_group() -> String {
+    "users".to_string()
+}
+
+fn default_socket_mode() -> String {
+    "0660".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpConfig {
+    #[serde(default = "default_http_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_http_listen_addr")]
+    pub listen_addr: String,
+
+    #[serde(default)]
+    pub auth: HttpAuthConfig,
+
+    #[serde(default)]
+    pub tls: HttpTlsConfig,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_http_enabled(),
+            listen_addr: default_http_listen_addr(),
+            auth: HttpAuthConfig::default(),
+            tls: HttpTlsConfig::default(),
+        }
+    }
+}
+
+impl HttpConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.listen_addr.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "service.http.listen_addr must not be empty".to_string(),
+            ));
+        }
+
+        if self.listen_addr.parse::<SocketAddr>().is_err() {
+            return Err(ConfigError::Invalid(
+                "service.http.listen_addr must be a valid socket address".to_string(),
+            ));
+        }
+
+        self.auth
+            .validate("service.http.auth")
+            .map_err(ConfigError::Invalid)?;
+
+        if self.auth.r#type != "bearer" {
+            return Err(ConfigError::Invalid(
+                "service.http.auth.type must be bearer".to_string(),
+            ));
+        }
+
+        if self.tls.enabled {
+            let cert = self.tls.cert_path.as_ref().ok_or_else(|| {
+                ConfigError::Invalid(
+                    "service.http.tls.cert_path must be set when tls is enabled".to_string(),
+                )
+            })?;
+            let key = self.tls.key_path.as_ref().ok_or_else(|| {
+                ConfigError::Invalid(
+                    "service.http.tls.key_path must be set when tls is enabled".to_string(),
+                )
+            })?;
+
+            if !cert.is_absolute() {
+                return Err(ConfigError::Invalid(
+                    "service.http.tls.cert_path must be an absolute path".to_string(),
+                ));
+            }
+            if !key.is_absolute() {
+                return Err(ConfigError::Invalid(
+                    "service.http.tls.key_path must be an absolute path".to_string(),
+                ));
+            }
+            if let Some(ca_path) = &self.tls.ca_path {
+                if !ca_path.is_absolute() {
+                    return Err(ConfigError::Invalid(
+                        "service.http.tls.ca_path must be an absolute path".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn default_http_enabled() -> bool {
+    false
+}
+
+fn default_http_listen_addr() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpAuthConfig {
+    #[serde(default = "default_http_auth_type")]
+    pub r#type: String,
+
+    #[serde(default)]
+    pub required: bool,
+
+    #[serde(default)]
+    pub tokens: Vec<String>,
+}
+
+impl Default for HttpAuthConfig {
+    fn default() -> Self {
+        Self {
+            r#type: default_http_auth_type(),
+            required: false,
+            tokens: Vec::new(),
+        }
+    }
+}
+
+impl HttpAuthConfig {
+    fn validate(&self, label: &str) -> Result<(), String> {
+        if self.required && self.tokens.is_empty() {
+            return Err(format!("{label}.tokens must not be empty when required"));
+        }
+
+        for token in &self.tokens {
+            if token.trim().is_empty() {
+                return Err(format!("{label}.tokens must not include empty values"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn default_http_auth_type() -> String {
+    "bearer".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HttpTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+
+    #[serde(default)]
+    pub ca_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenAuthConfig {
+    #[serde(default)]
+    pub required: bool,
+
+    #[serde(default)]
+    pub tokens: Vec<String>,
+}
+
+impl TokenAuthConfig {
+    fn validate(&self, label: &str) -> Result<(), String> {
+        if self.required && self.tokens.is_empty() {
+            return Err(format!("{label}.tokens must not be empty when required"));
+        }
+
+        for token in &self.tokens {
+            if token.trim().is_empty() {
+                return Err(format!("{label}.tokens must not include empty values"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildConfig {
+    #[serde(default = "default_workspace_root")]
+    pub workspace_root: PathBuf,
+
+    #[serde(default)]
+    pub run_as_user: Option<String>,
+
+    #[serde(default)]
+    pub run_as_group: Option<String>,
+
+    #[serde(default = "default_build_commands")]
+    pub commands: HashMap<String, PathBuf>,
+
+    #[serde(default)]
+    pub timeouts: BuildTimeoutsConfig,
+
+    #[serde(default)]
+    pub environment: BuildEnvironmentConfig,
+}
+
+impl Default for BuildConfig {
+    fn default() -> Self {
+        Self {
+            workspace_root: default_workspace_root(),
+            run_as_user: None,
+            run_as_group: None,
+            commands: default_build_commands(),
+            timeouts: BuildTimeoutsConfig::default(),
+            environment: BuildEnvironmentConfig::default(),
+        }
+    }
+}
+
+impl BuildConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.workspace_root.is_absolute() {
             return Err(ConfigError::Invalid(
                 "build.workspace_root must be an absolute path".to_string(),
             ));
         }
 
-        self.build
-            .path_mapping
-            .validate(&self.build.workspace_root)?;
-
-        if self.build.timeouts.default_sec == 0 || self.build.timeouts.max_sec == 0 {
+        if self.timeouts.default_sec == 0 || self.timeouts.max_sec == 0 {
             return Err(ConfigError::Invalid(
                 "build.timeouts values must be greater than zero".to_string(),
             ));
         }
 
-        if self.build.timeouts.default_sec > self.build.timeouts.max_sec {
+        if self.timeouts.default_sec > self.timeouts.max_sec {
             return Err(ConfigError::Invalid(
                 "build.timeouts.default_sec must be <= build.timeouts.max_sec".to_string(),
             ));
         }
 
-        if self.build.commands.is_empty() {
+        if let Some(user) = &self.run_as_user {
+            if user.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "build.run_as_user must not be empty".to_string(),
+                ));
+            }
+        }
+
+        if let Some(group) = &self.run_as_group {
+            if group.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "build.run_as_group must not be empty".to_string(),
+                ));
+            }
+        }
+
+        if self.commands.is_empty() {
             return Err(ConfigError::Invalid(
                 "build.commands must include at least one command".to_string(),
             ));
         }
 
-        for (name, path) in &self.build.commands {
+        for (name, path) in &self.commands {
             if name.trim().is_empty() {
                 return Err(ConfigError::Invalid(
                     "build.commands contains an empty command name".to_string(),
@@ -159,7 +574,7 @@ impl Config {
             }
         }
 
-        for entry in &self.build.environment.allow {
+        for entry in &self.environment.allow {
             if entry.trim().is_empty() {
                 return Err(ConfigError::Invalid(
                     "build.environment.allow must not contain empty entries".to_string(),
@@ -167,175 +582,12 @@ impl Config {
             }
         }
 
-        if let Err(err) = LoggingSettings::from_config(&self.logging) {
-            return Err(ConfigError::Invalid(format!("{err}")));
-        }
-
         Ok(())
-    }
-}
-
-fn default_schema_version() -> String {
-    DEFAULT_SCHEMA_VERSION.to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceConfig {
-    #[serde(default = "default_socket_path")]
-    pub socket_path: PathBuf,
-
-    #[serde(default = "default_socket_group")]
-    pub socket_group: String,
-
-    #[serde(default = "default_socket_mode")]
-    pub socket_mode: String,
-}
-
-impl Default for ServiceConfig {
-    fn default() -> Self {
-        Self {
-            socket_path: default_socket_path(),
-            socket_group: default_socket_group(),
-            socket_mode: default_socket_mode(),
-        }
-    }
-}
-
-impl ServiceConfig {
-    pub fn parse_socket_mode(&self) -> Result<u32, SocketModeError> {
-        parse_socket_mode(&self.socket_mode)
-    }
-}
-
-fn default_socket_path() -> PathBuf {
-    PathBuf::from("/run/build-service.sock")
-}
-
-fn default_socket_group() -> String {
-    "users".to_string()
-}
-
-fn default_socket_mode() -> String {
-    "0660".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuildConfig {
-    #[serde(default = "default_workspace_root")]
-    pub workspace_root: PathBuf,
-
-    #[serde(default)]
-    pub path_mapping: PathMappingConfig,
-
-    #[serde(default = "default_build_commands")]
-    pub commands: HashMap<String, PathBuf>,
-
-    #[serde(default)]
-    pub timeouts: BuildTimeoutsConfig,
-
-    #[serde(default)]
-    pub environment: BuildEnvironmentConfig,
-}
-
-impl Default for BuildConfig {
-    fn default() -> Self {
-        Self {
-            workspace_root: default_workspace_root(),
-            path_mapping: PathMappingConfig::default(),
-            commands: default_build_commands(),
-            timeouts: BuildTimeoutsConfig::default(),
-            environment: BuildEnvironmentConfig::default(),
-        }
     }
 }
 
 fn default_workspace_root() -> PathBuf {
     PathBuf::from("/home")
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PathMappingConfig {
-    #[serde(default = "default_container_template")]
-    pub container_template: String,
-
-    #[serde(default = "default_host_template")]
-    pub host_template: String,
-}
-
-impl Default for PathMappingConfig {
-    fn default() -> Self {
-        Self {
-            container_template: default_container_template(),
-            host_template: default_host_template(),
-        }
-    }
-}
-
-fn default_container_template() -> String {
-    "{workspace_root}/{user}/workspace".to_string()
-}
-
-fn default_host_template() -> String {
-    "{workspace_root}/{user}/workspace".to_string()
-}
-
-impl PathMappingConfig {
-    pub(crate) fn validate(&self, workspace_root: &Path) -> Result<(), ConfigError> {
-        validate_path_template(
-            &self.container_template,
-            workspace_root,
-            false,
-            "build.path_mapping.container_template",
-        )?;
-        validate_path_template(
-            &self.host_template,
-            workspace_root,
-            true,
-            "build.path_mapping.host_template",
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn resolve_container_root(&self, user: &str, workspace_root: &Path) -> PathBuf {
-        resolve_path_template(&self.container_template, user, workspace_root)
-    }
-
-    pub(crate) fn resolve_host_root(&self, user: &str, workspace_root: &Path) -> PathBuf {
-        resolve_path_template(&self.host_template, user, workspace_root)
-    }
-}
-
-fn resolve_path_template(template: &str, user: &str, workspace_root: &Path) -> PathBuf {
-    let mut resolved = template.replace("{user}", user);
-    let workspace_root = workspace_root.to_string_lossy();
-    resolved = resolved.replace("{workspace_root}", &workspace_root);
-    PathBuf::from(resolved)
-}
-
-fn validate_path_template(
-    template: &str,
-    workspace_root: &Path,
-    require_user: bool,
-    field: &str,
-) -> Result<(), ConfigError> {
-    if template.trim().is_empty() {
-        return Err(ConfigError::Invalid(format!("{field} must not be empty")));
-    }
-
-    if require_user && !template.contains("{user}") {
-        return Err(ConfigError::Invalid(format!(
-            "{field} must include {{user}}"
-        )));
-    }
-
-    let resolved = resolve_path_template(template, "user", workspace_root);
-    if !resolved.is_absolute() {
-        return Err(ConfigError::Invalid(format!(
-            "{field} must resolve to an absolute path"
-        )));
-    }
-
-    Ok(())
 }
 
 fn default_build_commands() -> HashMap<String, PathBuf> {
@@ -398,6 +650,148 @@ fn default_env_allow() -> Vec<String> {
         "PKG_CONFIG_PATH".to_string(),
         "MAKEFLAGS".to_string(),
     ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactsConfig {
+    #[serde(default)]
+    pub storage_root: PathBuf,
+
+    #[serde(default)]
+    pub public_base_url: String,
+
+    #[serde(default)]
+    pub ttl_sec: Option<u64>,
+
+    #[serde(default)]
+    pub gc_interval_sec: Option<u64>,
+
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+impl Default for ArtifactsConfig {
+    fn default() -> Self {
+        Self {
+            storage_root: PathBuf::new(),
+            public_base_url: String::new(),
+            ttl_sec: None,
+            gc_interval_sec: None,
+            max_bytes: None,
+        }
+    }
+}
+
+impl ArtifactsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.storage_root.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "artifacts.storage_root must not be empty".to_string(),
+            ));
+        }
+
+        if !self.storage_root.is_absolute() {
+            return Err(ConfigError::Invalid(
+                "artifacts.storage_root must be an absolute path".to_string(),
+            ));
+        }
+
+        if self.public_base_url.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "artifacts.public_base_url must not be empty".to_string(),
+            ));
+        }
+
+        match url::Url::parse(&self.public_base_url) {
+            Ok(url) => {
+                let scheme = url.scheme();
+                if scheme != "http" && scheme != "https" {
+                    return Err(ConfigError::Invalid(
+                        "artifacts.public_base_url must use http or https".to_string(),
+                    ));
+                }
+            }
+            Err(err) => {
+                return Err(ConfigError::Invalid(format!(
+                    "artifacts.public_base_url is invalid: {err}"
+                )));
+            }
+        }
+
+        if let Some(ttl) = self.ttl_sec {
+            if ttl == 0 {
+                return Err(ConfigError::Invalid(
+                    "artifacts.ttl_sec must be greater than zero".to_string(),
+                ));
+            }
+        }
+
+        if let Some(interval) = self.gc_interval_sec {
+            if interval == 0 {
+                return Err(ConfigError::Invalid(
+                    "artifacts.gc_interval_sec must be greater than zero".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ProjectConfig {
+    Repo {
+        id: String,
+        repo_url: String,
+        #[serde(default = "default_repo_ref")]
+        repo_ref: String,
+        #[serde(default = "default_repo_subdir")]
+        repo_subdir: String,
+        #[serde(default)]
+        commands: Vec<String>,
+        #[serde(default)]
+        artifacts: Vec<String>,
+    },
+    Path {
+        id: String,
+        path_root: PathBuf,
+        #[serde(default)]
+        commands: Vec<String>,
+        #[serde(default)]
+        artifacts: Vec<String>,
+    },
+}
+
+impl ProjectConfig {
+    pub fn id(&self) -> &str {
+        match self {
+            ProjectConfig::Repo { id, .. } => id,
+            ProjectConfig::Path { id, .. } => id,
+        }
+    }
+
+    pub fn commands(&self) -> &[String] {
+        match self {
+            ProjectConfig::Repo { commands, .. } => commands,
+            ProjectConfig::Path { commands, .. } => commands,
+        }
+    }
+
+    pub fn artifacts(&self) -> &[String] {
+        match self {
+            ProjectConfig::Repo { artifacts, .. } => artifacts,
+            ProjectConfig::Path { artifacts, .. } => artifacts,
+        }
+    }
+}
+
+fn default_repo_ref() -> String {
+    "main".to_string()
+}
+
+fn default_repo_subdir() -> String {
+    "./".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,10 +870,47 @@ fn parse_socket_mode(value: &str) -> Result<u32, SocketModeError> {
     Ok(parsed)
 }
 
+fn validate_artifact_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.trim().is_empty() {
+        return Err("artifact pattern must not be empty".to_string());
+    }
+
+    let path = Path::new(pattern);
+    if path.is_absolute() {
+        return Err("artifact pattern must be relative".to_string());
+    }
+
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err("artifact pattern must not include ..".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_relative_path(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("must not be empty".to_string());
+    }
+
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        return Err("must be relative".to_string());
+    }
+
+    for component in rel.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err("must not include ..".to_string());
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn base_config(command_path: PathBuf) -> Config {
         let mut commands = HashMap::new();
@@ -490,11 +921,25 @@ mod tests {
             service: ServiceConfig::default(),
             build: BuildConfig {
                 workspace_root: PathBuf::from("/tmp"),
-                path_mapping: PathMappingConfig::default(),
+                run_as_user: None,
+                run_as_group: None,
                 commands,
                 timeouts: BuildTimeoutsConfig::default(),
                 environment: BuildEnvironmentConfig::default(),
             },
+            artifacts: ArtifactsConfig {
+                storage_root: PathBuf::from("/tmp/artifacts"),
+                public_base_url: "https://example.com/artifacts".to_string(),
+                ttl_sec: None,
+                gc_interval_sec: None,
+                max_bytes: None,
+            },
+            projects: vec![ProjectConfig::Path {
+                id: "project".to_string(),
+                path_root: PathBuf::from("/tmp/workspace"),
+                commands: vec!["make".to_string()],
+                artifacts: vec!["out/bin".to_string()],
+            }],
             logging: LoggingConfig::default(),
         }
     }
@@ -521,9 +966,22 @@ mod tests {
         std::fs::write(&cmd, "").expect("write");
 
         let mut config = base_config(cmd);
-        config.schema_version = "2".to_string();
+        config.schema_version = "1".to_string();
         let err = config.validate().expect_err("should fail");
         assert!(err.to_string().contains("unsupported schema_version"));
+    }
+
+    #[test]
+    fn validate_rejects_no_transport_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cmd = temp.path().join("make");
+        std::fs::write(&cmd, "").expect("write");
+
+        let mut config = base_config(cmd);
+        config.service.socket.enabled = false;
+        config.service.http.enabled = false;
+        let err = config.validate().expect_err("should fail");
+        assert!(err.to_string().contains("service.socket.enabled"));
     }
 
     #[test]
@@ -533,9 +991,9 @@ mod tests {
         std::fs::write(&cmd, "").expect("write");
 
         let mut config = base_config(cmd);
-        config.service.socket_path = PathBuf::from("relative.sock");
+        config.service.socket.path = PathBuf::from("relative.sock");
         let err = config.validate().expect_err("should fail");
-        assert!(err.to_string().contains("socket_path"));
+        assert!(err.to_string().contains("socket.path"));
     }
 
     #[test]
@@ -573,28 +1031,53 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_relative_container_template() {
+    fn validate_rejects_invalid_artifact_pattern() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cmd = temp.path().join("make");
         std::fs::write(&cmd, "").expect("write");
 
         let mut config = base_config(cmd);
-        config.build.path_mapping.container_template = "workspace".to_string();
+        config.projects = vec![ProjectConfig::Path {
+            id: "project".to_string(),
+            path_root: PathBuf::from("/tmp/workspace"),
+            commands: vec!["make".to_string()],
+            artifacts: vec!["../oops".to_string()],
+        }];
+
         let err = config.validate().expect_err("should fail");
-        assert!(err
-            .to_string()
-            .contains("build.path_mapping.container_template"));
+        assert!(err.to_string().contains("artifact pattern"));
     }
 
     #[test]
-    fn validate_rejects_host_template_missing_user() {
+    fn validate_rejects_project_missing_command() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cmd = temp.path().join("make");
         std::fs::write(&cmd, "").expect("write");
 
         let mut config = base_config(cmd);
-        config.build.path_mapping.host_template = "/srv/workspaces".to_string();
+        config.projects = vec![ProjectConfig::Path {
+            id: "project".to_string(),
+            path_root: PathBuf::from("/tmp/workspace"),
+            commands: vec!["ninja".to_string()],
+            artifacts: vec![],
+        }];
+
         let err = config.validate().expect_err("should fail");
-        assert!(err.to_string().contains("build.path_mapping.host_template"));
+        assert!(err.to_string().contains("undefined command"));
+    }
+
+    #[test]
+    fn validate_rejects_http_auth_without_tokens() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cmd = temp.path().join("make");
+        std::fs::write(&cmd, "").expect("write");
+
+        let mut config = base_config(cmd);
+        config.service.http.enabled = true;
+        config.service.http.auth.required = true;
+        config.service.http.auth.tokens.clear();
+
+        let err = config.validate().expect_err("should fail");
+        assert!(err.to_string().contains("service.http.auth.tokens"));
     }
 }

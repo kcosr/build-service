@@ -1,5 +1,8 @@
+pub mod artifacts;
+pub mod build;
 pub mod config;
 pub mod daemon;
+pub mod http;
 pub mod logging;
 pub mod protocol;
 pub mod user;

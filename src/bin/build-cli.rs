@@ -1,10 +1,11 @@
 use std::env;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use url::Url;
 
 use build_service::protocol::{Request, ResponseEvent, SCHEMA_VERSION};
 
@@ -20,7 +21,22 @@ struct Args {
     socket: Option<PathBuf>,
 
     #[arg(long)]
+    endpoint: Option<String>,
+
+    #[arg(long)]
+    token: Option<String>,
+
+    #[arg(long)]
     request_id: Option<String>,
+
+    #[arg(long)]
+    project: Option<String>,
+
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+
+    #[arg(long = "ref")]
+    ref_override: Option<String>,
 
     #[arg(required = true)]
     command: String,
@@ -32,29 +48,19 @@ struct Args {
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    let cwd = match env::current_dir() {
+    let endpoint = resolve_endpoint(args.endpoint.clone());
+    let cwd = match resolve_cwd(&args, endpoint.is_none()) {
         Ok(path) => path,
         Err(err) => {
             eprintln!("failed to resolve cwd: {err}");
             return ExitCode::from(1);
         }
     };
-
-    let socket_path = resolve_socket_path(args.socket);
-    let mut stream = match UnixStream::connect(&socket_path) {
-        Ok(stream) => stream,
-        Err(err) => {
-            let message = match err.kind() {
-                io::ErrorKind::NotFound => {
-                    format!(
-                        "build-service socket not found at {}",
-                        socket_path.display()
-                    )
-                }
-                io::ErrorKind::ConnectionRefused => "cannot connect to build-service".to_string(),
-                _ => format!("cannot connect to build-service: {err}"),
-            };
-            eprintln!("{message}");
+    let token = resolve_token(args.token);
+    let project = match resolve_project(args.project) {
+        Some(project) => project,
+        None => {
+            eprintln!("project is required (set --project or BUILD_SERVICE_PROJECT)");
             return ExitCode::from(1);
         }
     };
@@ -62,24 +68,48 @@ fn main() -> ExitCode {
     let request = Request {
         schema_version: Some(SCHEMA_VERSION.to_string()),
         request_id: args.request_id,
+        project_id: project,
         command: args.command,
         args: args.args,
-        cwd: cwd.to_string_lossy().into_owned(),
+        cwd,
         timeout_sec: args.timeout,
+        ref_override: args.ref_override,
+        auth_token: None,
     };
 
-    if let Err(err) = send_request(&mut stream, &request) {
-        eprintln!("failed to send request: {err}");
-        return ExitCode::from(1);
+    if let Some(endpoint) = endpoint {
+        match run_http(&endpoint, token.as_deref(), &request) {
+            Ok(code) => return to_exit_code(code),
+            Err(err) => {
+                eprintln!("http request failed: {err}");
+                return ExitCode::from(1);
+            }
+        }
     }
 
-    match read_responses(stream) {
+    let socket_path = resolve_socket_path(args.socket);
+    match run_socket(&socket_path, token.as_deref(), &request) {
         Ok(code) => to_exit_code(code),
         Err(err) => {
-            eprintln!("invalid response from build-service: {err}");
+            eprintln!("socket request failed: {err}");
             ExitCode::from(1)
         }
     }
+}
+
+fn resolve_cwd(args: &Args, use_current_dir: bool) -> io::Result<Option<String>> {
+    let path = match &args.cwd {
+        Some(path) => Some(path.clone()),
+        None => {
+            if use_current_dir {
+                Some(env::current_dir()?)
+            } else {
+                None
+            }
+        }
+    };
+
+    Ok(path.map(|path| path.to_string_lossy().into_owned()))
 }
 
 fn resolve_socket_path(explicit: Option<PathBuf>) -> PathBuf {
@@ -96,6 +126,124 @@ fn resolve_socket_path(explicit: Option<PathBuf>) -> PathBuf {
     PathBuf::from(DEFAULT_SOCKET_PATH)
 }
 
+fn resolve_endpoint(explicit: Option<String>) -> Option<String> {
+    if let Some(endpoint) = explicit {
+        if !endpoint.trim().is_empty() {
+            return Some(endpoint);
+        }
+    }
+
+    if let Ok(env_endpoint) = env::var("BUILD_SERVICE_ENDPOINT") {
+        if !env_endpoint.trim().is_empty() {
+            return Some(env_endpoint);
+        }
+    }
+
+    None
+}
+
+fn resolve_project(explicit: Option<String>) -> Option<String> {
+    if let Some(project) = explicit {
+        if !project.trim().is_empty() {
+            return Some(project);
+        }
+    }
+
+    if let Ok(env_project) = env::var("BUILD_SERVICE_PROJECT") {
+        if !env_project.trim().is_empty() {
+            return Some(env_project);
+        }
+    }
+
+    None
+}
+
+fn resolve_token(explicit: Option<String>) -> Option<String> {
+    if let Some(token) = explicit {
+        if !token.trim().is_empty() {
+            return Some(token);
+        }
+    }
+
+    if let Ok(env_token) = env::var("BUILD_SERVICE_TOKEN") {
+        if !env_token.trim().is_empty() {
+            return Some(env_token);
+        }
+    }
+
+    None
+}
+
+fn run_socket(socket_path: &PathBuf, token: Option<&str>, request: &Request) -> io::Result<i32> {
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(stream) => stream,
+        Err(err) => {
+            let message = match err.kind() {
+                io::ErrorKind::NotFound => {
+                    format!(
+                        "build-service socket not found at {}",
+                        socket_path.display()
+                    )
+                }
+                io::ErrorKind::ConnectionRefused => "cannot connect to build-service".to_string(),
+                _ => format!("cannot connect to build-service: {err}"),
+            };
+            return Err(io::Error::new(err.kind(), message));
+        }
+    };
+
+    let mut socket_request = request.clone();
+    if let Some(token) = token {
+        socket_request.auth_token = Some(token.to_string());
+    }
+
+    send_request(&mut stream, &socket_request)?;
+
+    let reader = BufReader::new(stream);
+    read_responses(reader)
+}
+
+fn run_http(endpoint: &str, token: Option<&str>, request: &Request) -> io::Result<i32> {
+    let url = build_endpoint_url(endpoint)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+
+    let client = reqwest::blocking::Client::new();
+    let mut builder = client.post(url).json(request);
+    if let Some(token) = token {
+        builder = builder.bearer_auth(token);
+    }
+
+    let response = builder
+        .send()
+        .map_err(|err| io::Error::other(format!("http request failed: {err}")))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let mut body = String::new();
+        let mut reader = BufReader::new(response);
+        let _ = reader.read_to_string(&mut body);
+        let message = if body.trim().is_empty() {
+            format!("http request failed with status {status}")
+        } else {
+            format!("http request failed with status {status}: {body}")
+        };
+        return Err(io::Error::other(message));
+    }
+
+    let reader = BufReader::new(response);
+    read_responses(reader)
+}
+
+fn build_endpoint_url(endpoint: &str) -> Result<Url, String> {
+    let mut base = endpoint.trim().to_string();
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+
+    let base = Url::parse(&base).map_err(|err| err.to_string())?;
+    base.join("v1/builds").map_err(|err| err.to_string())
+}
+
 fn send_request(stream: &mut UnixStream, request: &Request) -> io::Result<()> {
     let payload = serde_json::to_vec(request).map_err(io::Error::other)?;
     stream.write_all(&payload)?;
@@ -104,8 +252,7 @@ fn send_request(stream: &mut UnixStream, request: &Request) -> io::Result<()> {
     Ok(())
 }
 
-fn read_responses(stream: UnixStream) -> io::Result<i32> {
-    let mut reader = BufReader::new(stream);
+fn read_responses<R: BufRead>(mut reader: R) -> io::Result<i32> {
     let mut line = String::new();
     let mut exit_code: Option<i32> = None;
 
@@ -124,6 +271,9 @@ fn read_responses(stream: UnixStream) -> io::Result<i32> {
         let event: ResponseEvent = serde_json::from_str(trimmed).map_err(io::Error::other)?;
 
         match event {
+            ResponseEvent::Build { id, status } => {
+                eprintln!("build {id} {status}");
+            }
             ResponseEvent::Stdout { data } => {
                 let mut stdout = io::stdout();
                 stdout.write_all(data.as_bytes())?;
@@ -134,7 +284,43 @@ fn read_responses(stream: UnixStream) -> io::Result<i32> {
                 stderr.write_all(data.as_bytes())?;
                 stderr.flush()?;
             }
-            ResponseEvent::Exit { code, timed_out } => {
+            ResponseEvent::Warning {
+                code,
+                message,
+                pattern,
+            } => {
+                eprintln!(
+                    "warning {code}{}{}",
+                    message
+                        .as_ref()
+                        .map(|msg| format!(": {msg}"))
+                        .unwrap_or_default(),
+                    pattern
+                        .as_ref()
+                        .map(|pat| format!(" (pattern: {pat})"))
+                        .unwrap_or_default()
+                );
+            }
+            ResponseEvent::Error {
+                code,
+                message,
+                pattern,
+            } => {
+                eprintln!(
+                    "error {code}{}{}",
+                    message
+                        .as_ref()
+                        .map(|msg| format!(": {msg}"))
+                        .unwrap_or_default(),
+                    pattern
+                        .as_ref()
+                        .map(|pat| format!(" (pattern: {pat})"))
+                        .unwrap_or_default()
+                );
+            }
+            ResponseEvent::Exit {
+                code, timed_out, ..
+            } => {
                 exit_code = Some(if timed_out { 124 } else { code });
                 break;
             }
@@ -183,8 +369,16 @@ mod tests {
 
     #[test]
     fn parse_args_allows_make_flags_without_double_dash() {
-        let args = Args::try_parse_from(["build-cli", "make", "-f", "Makefile.local", "-j4"])
-            .expect("parse args");
+        let args = Args::try_parse_from([
+            "build-cli",
+            "--project",
+            "demo",
+            "make",
+            "-f",
+            "Makefile.local",
+            "-j4",
+        ])
+        .expect("parse args");
 
         assert_eq!(args.command, "make");
         assert_eq!(
@@ -198,6 +392,7 @@ mod tests {
         assert_eq!(args.timeout, None);
         assert_eq!(args.socket, None);
         assert_eq!(args.request_id, None);
+        assert_eq!(args.project, Some("demo".to_string()));
     }
 
     #[test]
@@ -225,19 +420,36 @@ mod tests {
     }
 
     #[test]
+    fn resolve_endpoint_prefers_explicit() {
+        let endpoint = resolve_endpoint(Some("http://localhost:8080".to_string()));
+        assert_eq!(endpoint, Some("http://localhost:8080".to_string()));
+    }
+
+    #[test]
+    fn resolve_endpoint_uses_env() {
+        let _guard = ENV_LOCK.lock().expect("lock");
+        env::set_var("BUILD_SERVICE_ENDPOINT", "http://env:8080");
+        let endpoint = resolve_endpoint(None);
+        env::remove_var("BUILD_SERVICE_ENDPOINT");
+        assert_eq!(endpoint, Some("http://env:8080".to_string()));
+    }
+
+    #[test]
     fn read_responses_returns_exit_code() {
         let (client, mut server) = UnixStream::pair().expect("pair");
         let handle = thread::spawn(move || {
             let event = ResponseEvent::Exit {
                 code: 7,
                 timed_out: false,
+                artifacts: None,
             };
             let line = serde_json::to_string(&event).expect("json");
             server.write_all(line.as_bytes()).expect("write");
             server.write_all(b"\n").expect("newline");
         });
 
-        let code = read_responses(client).expect("read");
+        let reader = BufReader::new(client);
+        let code = read_responses(reader).expect("read");
         assert_eq!(code, 7);
         handle.join().expect("join");
     }
@@ -249,13 +461,15 @@ mod tests {
             let event = ResponseEvent::Exit {
                 code: 2,
                 timed_out: true,
+                artifacts: None,
             };
             let line = serde_json::to_string(&event).expect("json");
             server.write_all(line.as_bytes()).expect("write");
             server.write_all(b"\n").expect("newline");
         });
 
-        let code = read_responses(client).expect("read");
+        let reader = BufReader::new(client);
+        let code = read_responses(reader).expect("read");
         assert_eq!(code, 124);
         handle.join().expect("join");
     }

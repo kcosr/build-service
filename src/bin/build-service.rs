@@ -1,11 +1,14 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::thread;
 
 use clap::Parser;
 
+use build_service::artifacts;
 use build_service::config::Config;
-use build_service::daemon;
 use build_service::logging::LoggingSettings;
+use build_service::{daemon, http};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Host-side build daemon")]
@@ -43,9 +46,42 @@ fn main() -> ExitCode {
 
     tracing::info!("build-service starting");
 
-    if let Err(err) = daemon::run(config) {
-        eprintln!("build-service failed: {err}");
-        return ExitCode::from(1);
+    artifacts::spawn_gc_task(config.clone());
+
+    if config.service.http.enabled {
+        let shared = Arc::new(config);
+        if shared.service.socket.enabled {
+            let socket_config = (*shared).clone();
+            thread::spawn(move || {
+                if let Err(err) = daemon::run(socket_config) {
+                    eprintln!("build-service socket failed: {err}");
+                }
+            });
+        }
+
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("failed to start runtime: {err}");
+                return ExitCode::from(1);
+            }
+        };
+
+        if let Err(err) = runtime.block_on(http::run(shared)) {
+            eprintln!("build-service http failed: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if config.service.socket.enabled {
+        if let Err(err) = daemon::run(config) {
+            eprintln!("build-service socket failed: {err}");
+            return ExitCode::from(1);
+        }
     }
 
     ExitCode::SUCCESS

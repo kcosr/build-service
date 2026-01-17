@@ -1,6 +1,6 @@
 # Build Service
 
-A host-side build service that executes `make` on the host when triggered from containers, while preserving the caller’s identity via Unix socket peer credentials.
+A host-side build service that executes configured commands for defined projects when triggered via Unix socket or HTTP, streaming NDJSON output and providing artifact downloads.
 
 ## Reference Implementation
 
@@ -36,123 +36,122 @@ Key patterns to follow from acl-proxy:
 
 ## Purpose
 
-- Run SIP stack builds on the host (dependent libraries remain on host)
-- Allow AI coding agents to trigger builds from within containers
-- Maintain user identity via Unix socket peer credentials (`SO_PEERCRED`)
+- Run host builds for projects defined in config (`repo` and `path`)
+- Allow container and HTTP clients to trigger builds
+- Stream stdout/stderr and structured exit status
+- Provide artifact downloads via URLs in the NDJSON stream
 
 ## Environment
 
 - Host OS: Rocky Linux
 - Container runtime: Podman (rootless)
-- Workspace bind mount: `/home/<user>/workspace` (identical path on host and container)
-- Socket access group: configurable (e.g., `users`), must include all developers/agents that need to build
+- Socket access group: configurable (e.g., `users`)
 
 ## Architecture
 
 ```
-┌─────────────────────┐         ┌──────────────────────┐
-│  Container          │         │  Host                │
-│                     │         │                      │
-│  make (wrapper)     │─────────│  build-service       │
-│       │             │  Unix   │       │              │
-│       ▼             │  Socket │       ▼              │
-│  build-cli ─────────┼────────►│  Validate request    │
-│                     │         │       │              │
-│  Streams stdout/err │◄────────┼───────┤              │
-│                     │         │       ▼              │
-└─────────────────────┘         │  Drop privs (peer)   │
-                                │       │              │
-                                │       ▼              │
-                                │  exec /usr/bin/make  │
-                                │                      │
-                                └──────────────────────┘
++---------------------+         +----------------------+
+|  Client             |         |  Host                |
+|                     |         |                      |
+|  build-cli          |---------|  build-service       |
+|   (socket/HTTP)     |         |   validate request   |
+|                     |         |          |           |
+|  Streams stdout/err |<--------+----------+           |
+|                     |         |          v           |
++---------------------+         |   exec allowed cmd   |
+                                |                      |
+                                +----------------------+
 ```
 
 ## Components
 
 ### 1. build-service (Host Daemon)
 
-Rust binary running as root under systemd.
+Rust binary running under systemd.
 
 **Responsibilities:**
-- Listen on Unix socket `/run/build-service.sock`
-- Extract caller UID/GID from `SO_PEERCRED`
-- Validate requests (paths, args, timeouts)
-- Drop privileges to caller’s user (UID/GID + supplementary groups)
-- Execute `/usr/bin/make` directly (no shell)
-- Stream output back as NDJSON
-- Enforce timeouts and terminate process groups cleanly
+- Listen on Unix socket and/or HTTP (configurable)
+- Authenticate requests when enabled (bearer tokens)
+- Resolve project roots (repo clone or path root)
+- Validate request and arguments
+- Execute allowed commands
+- Stream NDJSON output and exit status
+- Collect artifacts and expose download URLs
+- Enforce timeouts
 
-### 2. build-cli (Container Client)
+### 2. build-cli (Client)
 
-Rust binary installed in container images.
+Rust binary for container/host usage.
 
 **Responsibilities:**
-- Connect to `/run/build-service.sock`
-- Send build request (cwd, args, timeout)
+- Connect to socket or HTTP endpoint
+- Send build request
 - Receive NDJSON stream, write to stdout/stderr
 - Exit with build’s exit code
 
 ### 3. make wrapper (Container)
 
-Shell script installed earlier in `PATH` than `/usr/bin/make`.
+Shell shim installed earlier in `PATH` than `/usr/bin/make`:
 
 ```sh
 #!/bin/sh
-exec build-cli make "$@"
+
+if [ -z "$BUILD_SERVICE_PROJECT" ]; then
+  echo "BUILD_SERVICE_PROJECT is not set" >&2
+  exit 1
+fi
+
+exec build-cli --project "$BUILD_SERVICE_PROJECT" make "$@"
 ```
 
-> Note: Keeping this wrapper POSIX (`/bin/sh`) avoids relying on bash being present in minimal images.
-
 ## Configuration
-
-Follow acl-proxy conventions: TOML config with schema versioning.
 
 **Location:** `/etc/build-service/config.toml`
 
 ```toml
-schema_version = "1"
+schema_version = "2"
 
-[service]
-socket_path = "/run/build-service.sock"
-socket_group = "users"
-socket_mode = "0660"
+[service.socket]
+enabled = true
+path = "/run/build-service.sock"
+group = "users"
+mode = "0660"
+
+[service.http]
+enabled = false
+listen_addr = "0.0.0.0:8080"
 
 [build]
 workspace_root = "/home"
-make_path = "/usr/bin/make"
+# run_as_user = "build"
+# run_as_group = "build"
 
-[build.timeouts]
-default_sec = 600       # 10 minutes
-max_sec = 1800          # 30 minutes (cap client requests)
+[build.commands]
+make = "/usr/bin/make"
 
-[build.environment]
-# Strict allowlist - only these env vars passed to make
-allow = [
-    "PATH",
-    "HOME",
-    "USER",
-    "LANG",
-    "CC",
-    "CXX",
-    "CFLAGS",
-    "CXXFLAGS",
-    "LDFLAGS",
-    "PKG_CONFIG_PATH",
-    "MAKEFLAGS",
-]
+[artifacts]
+storage_root = "/var/lib/build-service/artifacts"
+public_base_url = "https://builds.example.com/artifacts"
+# ttl_sec = 86400
+# gc_interval_sec = 3600
+# max_bytes = 1073741824
 
-[logging]
-level = "info"
-directory = "/var/log/build-service"
-max_bytes = 104857600   # 100MB
-max_files = 5
-console = false
+[[projects]]
+id = "sip-stack"
+type = "repo"
+repo_url = "https://github.com/org/sip-stack.git"
+repo_ref = "main"
+repo_subdir = "./"
+commands = ["make"]
+artifacts = ["bin/app", "dist/*.tar.gz"]
+
+[[projects]]
+id = "nfs-tooling"
+type = "path"
+path_root = "/mnt/nfs/tooling"
+commands = ["make", "ninja"]
+artifacts = ["out/tool"]
 ```
-
-**Implementation note (socket permissions):**
-- The daemon should create the socket with a restrictive umask (e.g., `0077`), bind it, then apply `chgrp`/`chmod` based on `socket_group`/`socket_mode`.
-- Alternatively, place the socket under a systemd-managed runtime directory (see Deployment notes) to make permissions more predictable.
 
 ## Protocol
 
@@ -160,110 +159,81 @@ console = false
 
 ```json
 {
-    "command": "make",
-    "args": ["-j4", "all"],
-    "cwd": "/home/kevin/workspace/app",
-    "timeout_sec": 600
+  "schema_version": "2",
+  "request_id": "<optional>",
+  "project_id": "sip-stack",
+  "command": "make",
+  "args": ["-j4", "all"],
+  "cwd": "subdir",
+  "timeout_sec": 600,
+  "ref": "feature/foo"
 }
 ```
-
-**Recommended additions (forward compatibility):**
-- `schema_version`: match config schema (e.g., `"1"`)
-- `request_id`: client-generated UUID for log correlation
 
 ### Response Stream (NDJSON)
 
 ```json
-{"type": "stdout", "data": "gcc -c ..."}
-{"type": "stderr", "data": "warning: ..."}
-{"type": "exit", "code": 0, "timed_out": false}
+{"type":"build","id":"bld_123","status":"started"}
+{"type":"stdout","data":"gcc -c ..."}
+{"type":"stderr","data":"warning: ..."}
+{"type":"exit","code":0,"timed_out":false,
+ "artifacts":[
+   {"name":"bin/app","url":"https://builds.example.com/artifacts/bld_123/bin/app",
+    "content_type":"application/octet-stream","size":123456}
+ ]}
 ```
 
-**Binary/invalid UTF-8 output:** if the implementation must be lossless, add optional fields such as:
-- `encoding`: `"utf-8"` or `"base64"`
-- `data_b64`: base64-encoded bytes when output is not valid UTF-8
+## Project Resolution
 
-(If you keep `data` as a JSON string only, ensure invalid UTF-8 bytes are either rejected or converted in a clearly documented way.)
+### Repo Project
+
+1. Create a workspace under `build.workspace_root/builds/<build_id>`.
+2. Clone `repo_url` and checkout `repo_ref` or request `ref` override.
+3. Set project root to clone path + `repo_subdir`.
+4. Validate `cwd` (if provided) is within project root.
+
+### Path Project
+
+1. Use `path_root` as project root.
+2. Validate `cwd` (if provided) is within project root.
+
+## Artifacts
+
+- Artifact patterns are resolved relative to the project root.
+- If any configured pattern matches nothing, artifact collection fails and the build exits non-zero.
+- Directory matches are zipped and stored as `path.zip`.
+- Stored artifacts live under `artifacts.storage_root/<build_id>/...`.
+- Download URLs are `artifacts.public_base_url/<build_id>/<path>`.
 
 ## Security
 
+### Auth
+
+- HTTP uses bearer tokens (`Authorization: Bearer <token>`) when required.
+- Unix socket can optionally require a token in the request body.
+- Tokens are shared secrets; they do not map to user identities.
+
 ### Path Validation
 
-- `cwd` must resolve under `/home/<peer_user>/workspace`
-- `-C` / `--directory` directory args must not escape workspace
-- `-f` / `--file` makefile args must not escape workspace
-- Reject traversal that would escape (e.g., `..` components)
-- Prefer validation using a canonicalized path rooted in the user’s workspace:
-  - Use `std::fs::canonicalize()` for existing paths and reject anything that resolves outside the allowed root
-  - Be explicit about symlink handling (canonicalization closes common symlink-escape issues)
+- `cwd` must resolve under the project root.
+- `-C` / `--directory` and `-f` / `--file` make args must not escape the project root.
 
 ### Privilege Drop
 
-```rust
-// After validation, before exec:
-// 1. Get peer credentials
-let cred = socket.peer_cred()?;
-
-// 2. Initialize supplementary groups
-initgroups(username, cred.gid)?;
-
-// 3. Set GID then UID (order matters)
-setgid(cred.gid)?;
-setuid(cred.uid)?;
-
-// 4. Exec make (never returns on success)
-exec(make_path, args, env)?;
-```
-
-**Process-group handling (for reliable timeouts):**
-- Spawn `make` into its own process group (e.g., via `setsid()` or `setpgid()` in a pre-exec hook)
-- On timeout, signal the process group so child processes are terminated too
-
-### No Shell Execution
-
-```rust
-// Direct exec, never:
-//   Command::new("sh").arg("-c").arg(...)
-// Always:
-//   Command::new("/usr/bin/make").args(validated_args)
-```
-
-## Integration with aw-exec
-
-Auto-mount the socket and workspace in containers:
-
-```bash
-# In aw-exec start_container()
-podman run -d --replace     --name "$container_name"     --userns=keep-id     -v "$HOME/workspace:$HOME:Z"     -v /etc/localtime:/etc/localtime:ro     -v /etc/bashrc:/etc/bashrc:ro     -v /run/build-service.sock:/run/build-service.sock     "$image" sleep infinity
-```
+- Builds run as the service process user by default.
+- Optional `build.run_as_user`/`build.run_as_group` override the execution user/group.
 
 ## Timeout Handling
 
-| Source | Value | Description |
-|--------|-------|-------------|
-| Client | `--timeout` | CLI flag, passed in request |
-| Config | `default_sec` | Used if client omits timeout |
-| Config | `max_sec` | Hard cap on any client value |
-
 On timeout:
-1. Send `SIGTERM` to the **process group**
+1. Send `SIGTERM` to the process group
 2. Wait 5 seconds
 3. Send `SIGKILL` if still running
-4. Emit: `{"type": "exit", "code": 124, "timed_out": true}`
-5. Log: `build timed out after {N}s user={user} cwd={cwd}`
+4. Emit `{"type":"exit","code":124,"timed_out":true}`
 
 ## Logging
 
-Plain text format via `tracing` (matching acl-proxy style):
-
-```
-2026-01-14T12:00:00.000Z  INFO build_service: build started user=kevin cwd=/home/kevin/workspace/app args=["-j4","all"]
-2026-01-14T12:00:30.000Z  INFO build_service: build completed user=kevin exit_code=0 duration_sec=30
-2026-01-14T12:00:30.000Z ERROR build_service: build completed user=kevin exit_code=2 duration_sec=30
-2026-01-14T12:01:00.000Z  WARN build_service: build timed out user=kevin duration_sec=600
-```
-
-> Note: log levels are a policy choice; this suggests non-zero exit codes as `ERROR` for easier alerting.
+Plain text format via `tracing`.
 
 ## Deployment
 
@@ -283,38 +253,21 @@ ExecStart=/usr/local/bin/build-service --config /etc/build-service/config.toml
 Restart=on-failure
 User=root
 
-# Optional hardening (tune as needed):
-# NoNewPrivileges=true
-# PrivateTmp=true
-
 [Install]
 WantedBy=multi-user.target
 ```
 
-**Operational note:** If you want systemd to manage a runtime directory for the socket (recommended), consider updating `socket_path` to something like `/run/build-service/build-service.sock` and then add:
-
-```ini
-RuntimeDirectory=build-service
-RuntimeDirectoryMode=0750
-```
-
-The daemon would then bind the socket within that directory and apply the configured group/mode to the socket file.
-
 ### Installation
 
 ```bash
-# Install binary
 sudo cp build-service /usr/local/bin/
 sudo chmod 755 /usr/local/bin/build-service
 
-# Install config
 sudo mkdir -p /etc/build-service
 sudo cp config.toml /etc/build-service/
 
-# Create log directory
 sudo mkdir -p /var/log/build-service
 
-# Enable and start
 sudo systemctl daemon-reload
 sudo systemctl enable build-service
 sudo systemctl start build-service
@@ -325,61 +278,13 @@ sudo systemctl start build-service
 Add to base Dockerfiles:
 
 ```dockerfile
-# Build CLI and make wrapper
 COPY build-cli /usr/local/bin/build-cli
 COPY make-wrapper.sh /usr/local/bin/make
 RUN chmod 755 /usr/local/bin/build-cli /usr/local/bin/make
 ```
 
-## CLI Usage
-
-```bash
-# From within container - transparent via wrapper
-make -j4 all
-
-# Explicit CLI usage
-build-cli make -j4 all
-build-cli --timeout 1800 make clean all
-
-# Check service status (from host)
-systemctl status build-service
-```
-
-### Optional: sample .bashrc aliases
-
-If you want an easy “always route through the service” behavior (even if the wrapper isn’t installed), add to the container image or user profile:
-
-```bash
-# Route make through build-cli if available
-if command -v build-cli >/dev/null 2>&1; then
-  alias make='build-cli make'
-fi
-```
-
-## Error Handling
-
-| Error | CLI Exit Code | Message |
-|-------|---------------|---------|
-| Socket not found | 1 | `build-service socket not found at /run/build-service.sock` |
-| Connection refused | 1 | `cannot connect to build-service` |
-| Protocol/serialization error | 1 | `invalid response from build-service` |
-| Path validation | 1 | `cwd must be under workspace` |
-| Build failure | N | (exit code from make) |
-| Timeout | 124 | `build timed out after {N}s` |
-
 ## Future Considerations
 
-- Additional commands beyond `make` (cmake, ninja) if needed
+- Per-project resource limits (cgroups)
 - Build queue with concurrency limits
-- Resource limits (cgroups) per build
-- Build caching integration
-- Optional request/response version negotiation (`schema_version`)
-
-## Amendments (Post-Initial Requirements)
-
-- Config now uses a command allowlist (`build.commands`) instead of a single `make_path`.
-- Container-to-host workspace path mapping is configurable via `build.path_mapping` templates.
-- Requests map container paths before validation to support non-identical mounts.
-- Supplementary groups are preserved using peer group discovery for accurate permissions.
-- Exit status mapping follows 128 + signal conventions for signal terminations.
-- Added tests across config, protocol, validation, daemon, and CLI behavior.
+- Auth-to-user mapping for per-user builds
