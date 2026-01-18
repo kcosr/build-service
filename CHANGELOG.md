@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.0] - 2026-01-18
 
 ### Breaking Changes
 - Replace project/path-based builds with source uploads and temp workspaces; `.build-service/config.toml` is now required and artifacts are returned as a single zip extracted by the CLI ([#3](https://github.com/kcosr/build-service/pull/3)).
