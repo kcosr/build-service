@@ -144,12 +144,13 @@ fn main() -> ExitCode {
         .map(|request| request.env.clone())
         .filter(|env| !env.is_empty());
 
-    let timeout_sec = args.timeout.or_else(|| {
-        client_config
-            .request
-            .as_ref()
-            .and_then(|request| request.timeout_sec)
-    });
+    let timeout_sec = match resolve_timeout(args.timeout, client_config.request.as_ref()) {
+        Ok(timeout) => timeout,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
 
     let request = Request {
         schema_version: Some(SCHEMA_VERSION.to_string()),
@@ -500,6 +501,54 @@ fn resolve_endpoint(
 
     let default_endpoint = format!("unix://{DEFAULT_SOCKET_PATH}");
     parse_endpoint(&default_endpoint)
+}
+
+fn resolve_timeout(
+    explicit: Option<u64>,
+    request: Option<&RequestConfig>,
+) -> io::Result<Option<u64>> {
+    if let Some(timeout) = explicit {
+        if timeout == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "timeout must be greater than zero",
+            ));
+        }
+        return Ok(Some(timeout));
+    }
+
+    if let Ok(env_timeout) = env::var("BUILD_SERVICE_TIMEOUT") {
+        let trimmed = env_timeout.trim();
+        if !trimmed.is_empty() {
+            let parsed: u64 = trimmed.parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("BUILD_SERVICE_TIMEOUT must be a positive integer, got {trimmed}"),
+                )
+            })?;
+            if parsed == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "BUILD_SERVICE_TIMEOUT must be greater than zero",
+                ));
+            }
+            return Ok(Some(parsed));
+        }
+    }
+
+    if let Some(request) = request {
+        if let Some(timeout) = request.timeout_sec {
+            if timeout == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "request.timeout_sec must be greater than zero",
+                ));
+            }
+            return Ok(Some(timeout));
+        }
+    }
+
+    Ok(None)
 }
 
 fn resolve_token(explicit: Option<String>, config: Option<&ConnectionConfig>) -> Option<String> {
