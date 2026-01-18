@@ -155,6 +155,7 @@ Notes:
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
 - Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`.
+- The wrapper falls back to the local command when `.build-service/config.toml` is missing.
 
 ## Protocol
 

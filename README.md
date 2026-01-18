@@ -90,6 +90,7 @@ CFLAGS = "-O2 -g"
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
+- The wrapper falls back to the local command when `.build-service/config.toml` is missing.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
 - Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`.
@@ -198,6 +199,8 @@ Install the wrapper earlier in `PATH` than `/usr/bin/make`:
 cp scripts/make-wrapper.sh /usr/local/bin/make
 chmod 755 /usr/local/bin/make
 ```
+
+The wrapper runs `build-cli` with the command name it was invoked as (typically `make`). If no repo-local config is found, it executes the local command instead.
 
 ## Logging
 
