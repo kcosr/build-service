@@ -497,6 +497,171 @@ mod tests {
         server_handle.abort();
     }
 
+    #[tokio::test]
+    async fn uds_build_returns_artifacts_zip() {
+        let temp = tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let artifacts_root = temp.path().join("artifacts");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&workspace_root).expect("workspace root");
+        std::fs::create_dir_all(&artifacts_root).expect("artifacts root");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+
+        let script_path = bin_dir.join("build.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nmkdir -p out\necho hello > out/hello.txt\n",
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let mut config = Config {
+            schema_version: "3".to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        config.service.http.enabled = false;
+        config.service.socket.enabled = true;
+        config.build.workspace_root = workspace_root.clone();
+        config
+            .build
+            .commands
+            .insert("build".to_string(), script_path);
+        config.artifacts.storage_root = artifacts_root;
+
+        let max_upload_bytes = config.build.max_upload_bytes;
+        let state = AppState {
+            config: Arc::new(config),
+            auth_required: false,
+        };
+        let app = build_router(state, max_upload_bytes);
+
+        let socket_path = temp.path().join("build-service.sock");
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).expect("remove socket");
+        }
+        let listener = UnixListener::bind(&socket_path).expect("bind uds");
+        let server_handle = tokio::spawn({
+            let app = app.clone();
+            async move {
+                loop {
+                    let (stream, _) = match listener.accept().await {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    let service = TowerToHyperService::new(app.clone());
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let _ = http1::Builder::new().serve_connection(io, service).await;
+                    });
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let source_archive = create_source_zip().expect("source zip");
+        let request = Request {
+            schema_version: Some(SCHEMA_VERSION.to_string()),
+            request_id: Some("test".to_string()),
+            command: "build".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_sec: Some(60),
+            artifacts: ArtifactSpec {
+                include: vec!["out/**".to_string()],
+                exclude: Vec::new(),
+            },
+            env: Some(HashMap::new()),
+        };
+
+        let socket_for_client = socket_path.clone();
+        let (archive_path, _) = tokio::task::spawn_blocking(move || {
+            let client = Client::builder()
+                .unix_socket(socket_for_client)
+                .build()
+                .expect("client");
+            let metadata = serde_json::to_string(&request).expect("metadata");
+            let form = Form::new()
+                .part(
+                    "metadata",
+                    Part::text(metadata)
+                        .mime_str("application/json")
+                        .expect("metadata mime"),
+                )
+                .part(
+                    "source",
+                    Part::file(source_archive.path())
+                        .expect("source part")
+                        .mime_str("application/zip")
+                        .expect("source mime"),
+                );
+
+            let response = client
+                .post("http://localhost/v1/builds")
+                .multipart(form)
+                .send()
+                .expect("send");
+            assert!(response.status().is_success());
+
+            let mut reader = BufReader::new(response);
+            let mut line = String::new();
+            let mut artifacts = None;
+            loop {
+                line.clear();
+                let bytes = reader.read_line(&mut line).expect("read line");
+                if bytes == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let event: ResponseEvent = serde_json::from_str(trimmed).expect("event parse");
+                if let ResponseEvent::Exit {
+                    artifacts: exit, ..
+                } = event
+                {
+                    artifacts = exit;
+                    break;
+                }
+            }
+            let archive = artifacts.expect("missing artifacts");
+            (archive.path, archive.size)
+        })
+        .await
+        .expect("build task");
+
+        let socket_for_download = socket_path.clone();
+        let zip_bytes = tokio::task::spawn_blocking(move || {
+            let client = Client::builder()
+                .unix_socket(socket_for_download)
+                .build()
+                .expect("client");
+            let url = format!("http://localhost{archive_path}");
+            let mut response = client.get(url).send().expect("get");
+            assert!(response.status().is_success());
+            let mut buf = Vec::new();
+            response.copy_to(&mut buf).expect("read zip");
+            buf
+        })
+        .await
+        .expect("download task");
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).expect("zip");
+        let mut file = archive.by_name("out/hello.txt").expect("zip entry");
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).expect("read entry");
+        assert_eq!(contents.trim(), "hello");
+
+        server_handle.abort();
+    }
+
     fn create_source_zip() -> std::io::Result<NamedTempFile> {
         let temp = tempfile::Builder::new()
             .prefix("build-service-test-src-")
