@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.1] - 2026-01-18
 
 ### Changed
 - Artifact patterns that match no files are now skipped instead of failing the build. This allows `make clean` and similar builds that don't produce artifacts to succeed ([#4](https://github.com/kcosr/build-service/pull/4)).
