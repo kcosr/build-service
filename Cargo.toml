@@ -22,11 +22,25 @@ toml = "0.8"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal", "process"] }
+tokio = { version = "1.39", features = ["fs", "macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal", "process"] }
 libc = "0.2"
+axum = { version = "0.7", features = ["multipart"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+bytes = "1.6"
+glob = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["http1"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+rustls = "0.23"
+rustls-pemfile = "2.1"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+uuid = { version = "1.8", features = ["v4"] }
+walkdir = "2.5"
+zip = "0.6"
+tempfile = "3.10"
 
 [dev-dependencies]
-tempfile = "3.10"
 
 [profile.release]
 opt-level = 3

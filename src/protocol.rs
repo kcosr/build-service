@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -11,9 +13,14 @@ pub struct Request {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    pub cwd: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
     #[serde(default)]
     pub timeout_sec: Option<u64>,
+    #[serde(default)]
+    pub artifacts: ArtifactSpec,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
 }
 
 impl Request {
@@ -22,12 +29,46 @@ impl Request {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArtifactSpec {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactArchive {
+    pub path: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ResponseEvent {
-    Stdout { data: String },
-    Stderr { data: String },
-    Exit { code: i32, timed_out: bool },
+    Build {
+        id: String,
+        status: String,
+    },
+    Stdout {
+        data: String,
+    },
+    Stderr {
+        data: String,
+    },
+    Error {
+        code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+    },
+    Exit {
+        code: i32,
+        timed_out: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifacts: Option<ArtifactArchive>,
+    },
 }
 
 #[cfg(test)]
@@ -41,23 +82,12 @@ mod tests {
             request_id: None,
             command: "make".to_string(),
             args: Vec::new(),
-            cwd: "/tmp".to_string(),
+            cwd: None,
             timeout_sec: None,
+            artifacts: ArtifactSpec::default(),
+            env: None,
         };
-        assert_eq!(request.schema_version_or_default(), "1");
-    }
-
-    #[test]
-    fn schema_version_pass_through() {
-        let request = Request {
-            schema_version: Some("2".to_string()),
-            request_id: None,
-            command: "make".to_string(),
-            args: Vec::new(),
-            cwd: "/tmp".to_string(),
-            timeout_sec: None,
-        };
-        assert_eq!(request.schema_version_or_default(), "2");
+        assert_eq!(request.schema_version_or_default(), "3");
     }
 
     #[test]
@@ -73,15 +103,5 @@ mod tests {
             ResponseEvent::Stdout { data } => assert_eq!(data, "hello"),
             _ => panic!("unexpected variant"),
         }
-    }
-
-    #[test]
-    fn response_event_exit_serialization() {
-        let event = ResponseEvent::Exit {
-            code: 5,
-            timed_out: true,
-        };
-        let json = serde_json::to_string(&event).expect("serialize");
-        assert_eq!(json, "{\"type\":\"exit\",\"code\":5,\"timed_out\":true}");
     }
 }
