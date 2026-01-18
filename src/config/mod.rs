@@ -10,6 +10,7 @@ use crate::logging::LoggingSettings;
 const DEFAULT_CONFIG_PATH: &str = "/etc/build-service/config.toml";
 const DEFAULT_SCHEMA_VERSION: &str = "3";
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 134_217_728;
+const DEFAULT_MAX_EXTRACTED_BYTES: u64 = DEFAULT_MAX_UPLOAD_BYTES * 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -156,6 +157,12 @@ impl Config {
         if self.build.max_upload_bytes == 0 {
             return Err(ConfigError::Invalid(
                 "build.max_upload_bytes must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.build.max_extracted_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "build.max_extracted_bytes must be greater than zero".to_string(),
             ));
         }
 
@@ -379,6 +386,9 @@ pub struct BuildConfig {
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: u64,
 
+    #[serde(default = "default_max_extracted_bytes")]
+    pub max_extracted_bytes: u64,
+
     #[serde(default)]
     pub commands: HashMap<String, PathBuf>,
 
@@ -396,6 +406,7 @@ impl Default for BuildConfig {
             run_as_user: None,
             run_as_group: None,
             max_upload_bytes: default_max_upload_bytes(),
+            max_extracted_bytes: default_max_extracted_bytes(),
             commands: HashMap::new(),
             timeouts: TimeoutConfig::default(),
             environment: EnvironmentConfig::default(),
@@ -409,6 +420,10 @@ fn default_workspace_root() -> PathBuf {
 
 fn default_max_upload_bytes() -> u64 {
     DEFAULT_MAX_UPLOAD_BYTES
+}
+
+fn default_max_extracted_bytes() -> u64 {
+    DEFAULT_MAX_EXTRACTED_BYTES
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

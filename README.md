@@ -58,6 +58,7 @@ Key fields:
 - `service.http.*`: HTTP enablement, listen address, auth, and optional TLS.
 - `build.workspace_root`: base directory for temp workspaces.
 - `build.max_upload_bytes`: max source upload size (default 128MB).
+- `build.max_extracted_bytes`: max total extracted source size (default 10x upload limit).
 - `build.run_as_user` / `build.run_as_group`: optional run-as user/group.
 - `build.commands`: allowlist mapping `command` -> absolute binary path.
 - `build.timeouts.*`: default timeout and max timeout.

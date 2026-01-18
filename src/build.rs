@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -397,7 +397,9 @@ fn prepare_workspace(
         )
     })?;
 
-    if let Err(err) = extract_source_archive(source_archive, &workspace) {
+    if let Err(err) =
+        extract_source_archive(source_archive, &workspace, config.build.max_extracted_bytes)
+    {
         let _ = std::fs::remove_dir_all(&workspace);
         return Err(err);
     }
@@ -405,7 +407,11 @@ fn prepare_workspace(
     Ok(workspace)
 }
 
-fn extract_source_archive(source_archive: &Path, dest: &Path) -> Result<(), BuildError> {
+fn extract_source_archive(
+    source_archive: &Path,
+    dest: &Path,
+    max_extracted_bytes: u64,
+) -> Result<(), BuildError> {
     let file = std::fs::File::open(source_archive).map_err(|err| {
         BuildError::new(
             "source_archive",
@@ -418,6 +424,9 @@ fn extract_source_archive(source_archive: &Path, dest: &Path) -> Result<(), Buil
             format!("failed to read source archive: {err}"),
         )
     })?;
+
+    let mut extracted_bytes = 0u64;
+    let mut buffer = vec![0u8; 8192];
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|err| {
@@ -447,9 +456,28 @@ fn extract_source_archive(source_archive: &Path, dest: &Path) -> Result<(), Buil
         let mut outfile = std::fs::File::create(&out_path).map_err(|err| {
             BuildError::new("source_archive", format!("create file failed: {err}"))
         })?;
-        io::copy(&mut file, &mut outfile).map_err(|err| {
-            BuildError::new("source_archive", format!("write file failed: {err}"))
-        })?;
+        loop {
+            let bytes = file.read(&mut buffer).map_err(|err| {
+                BuildError::new("source_archive", format!("read zip entry failed: {err}"))
+            })?;
+            if bytes == 0 {
+                break;
+            }
+
+            extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
+            if extracted_bytes > max_extracted_bytes {
+                return Err(BuildError::new(
+                    "source_archive",
+                    format!(
+                        "extracted size exceeds max_extracted_bytes ({max_extracted_bytes} bytes)"
+                    ),
+                ));
+            }
+
+            outfile.write_all(&buffer[..bytes]).map_err(|err| {
+                BuildError::new("source_archive", format!("write file failed: {err}"))
+            })?;
+        }
     }
 
     Ok(())
@@ -617,7 +645,13 @@ fn wait_with_timeout(child: &mut Child, timeout_sec: u64) -> io::Result<(i32, bo
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = child.kill();
+    if let Err(err) = child.kill() {
+        warn!(
+            "failed to kill timed-out process (pid {}): {}",
+            child.id(),
+            err
+        );
+    }
     let start_kill = Instant::now();
 
     loop {
@@ -636,7 +670,13 @@ fn wait_with_timeout(child: &mut Child, timeout_sec: u64) -> io::Result<(i32, bo
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = child.kill();
+    if let Err(err) = child.kill() {
+        warn!(
+            "failed to force kill timed-out process (pid {}): {}",
+            child.id(),
+            err
+        );
+    }
     Ok((TIMEOUT_EXIT_CODE, true))
 }
 
@@ -656,4 +696,39 @@ pub fn artifacts_for_build(build_id: &str, config: &Config) -> Option<ArtifactAr
         path: format!("/v1/builds/{build_id}/artifacts.zip"),
         size,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::{tempdir, NamedTempFile};
+    use zip::write::FileOptions;
+    use zip::ZipWriter;
+
+    #[test]
+    fn extract_source_archive_enforces_max_extracted_bytes() {
+        let temp = tempdir().expect("tempdir");
+        let source = create_test_zip("input.txt", b"0123456789").expect("zip");
+        let dest = temp.path().join("workspace");
+        std::fs::create_dir_all(&dest).expect("dest dir");
+
+        let err = extract_source_archive(source.path(), &dest, 5).unwrap_err();
+        assert_eq!(err.code, "source_archive");
+        assert!(
+            err.message.contains("max_extracted_bytes"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    fn create_test_zip(name: &str, contents: &[u8]) -> io::Result<NamedTempFile> {
+        let temp = NamedTempFile::new()?;
+        let file = temp.reopen()?;
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(name, options)?;
+        zip.write_all(contents)?;
+        zip.finish()?;
+        Ok(temp)
+    }
 }

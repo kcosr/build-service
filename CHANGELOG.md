@@ -10,6 +10,7 @@
 - HTTP and Unix socket transports for multipart source uploads with NDJSON streaming and artifact download endpoints ([#3](https://github.com/kcosr/build-service/pull/3)).
 - Generic build wrapper with local fallback; deploy via symlinks per build tool name ([#3](https://github.com/kcosr/build-service/pull/3)).
 - Integration tests for HTTP/UDS build flows plus unit tests for endpoint/timeout parsing ([#3](https://github.com/kcosr/build-service/pull/3)).
+- Add `build.max_extracted_bytes` to cap source extraction size ([#3](https://github.com/kcosr/build-service/pull/3)).
 
 ### Changed
 - Build artifacts are packaged into a single `artifacts.zip` and automatically extracted by the client ([#3](https://github.com/kcosr/build-service/pull/3)).

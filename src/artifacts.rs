@@ -418,6 +418,8 @@ fn scan_entry(path: &Path) -> Result<(u64, SystemTime), ArtifactError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     #[test]
@@ -464,5 +466,34 @@ mod tests {
         assert!(archive.path.ends_with("artifacts.zip"));
         let zip_path = config.storage_root.join("bld").join("artifacts.zip");
         assert!(zip_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_artifacts_rejects_symlink_outside_root() {
+        let root = tempdir().expect("tempdir");
+        let outside = tempdir().expect("tempdir");
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret").expect("write");
+
+        let link_path = root.path().join("link.txt");
+        symlink(&outside_file, &link_path).expect("symlink");
+
+        let config = ArtifactsConfig {
+            storage_root: root.path().join("artifacts"),
+            ttl_sec: None,
+            gc_interval_sec: None,
+            max_bytes: None,
+        };
+        let spec = ArtifactSpec {
+            include: vec!["link.txt".to_string()],
+            exclude: vec![],
+        };
+
+        let err = collect_artifacts_zip(root.path(), &spec, &config, "bld").unwrap_err();
+        match err {
+            ArtifactError::OutsideRoot { .. } => {}
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }

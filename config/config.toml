@@ -29,6 +29,7 @@ workspace_root = "/var/lib/build-service/workspaces"
 # run_as_user = "build"
 # run_as_group = "build"
 max_upload_bytes = 134217728
+max_extracted_bytes = 1342177280
 
 [build.commands]
 make = "/usr/bin/make"
