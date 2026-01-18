@@ -119,7 +119,11 @@ async fn run_uds(config: Arc<Config>) -> Result<(), HttpError> {
         let service = TowerToHyperService::new(app.clone());
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+            if let Err(err) = http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(io, service)
+                .await
+            {
                 warn!("uds connection failed: {err}");
             }
         });
@@ -394,6 +398,234 @@ mod tests {
         server_handle.abort();
     }
 
+    #[tokio::test]
+    #[ignore] // Long-running test (~90s) - run with `cargo test -- --ignored`
+    async fn http_slow_build_streams_output() {
+        let env = setup_slow_env();
+        let (addr, server_handle) = start_http_server(env.app).await;
+
+        let result = tokio::task::spawn_blocking(move || {
+            let source_archive = create_source_zip().expect("source zip");
+            let request = Request {
+                schema_version: Some(SCHEMA_VERSION.to_string()),
+                request_id: Some("slow-test".to_string()),
+                command: "slow".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                timeout_sec: Some(120),
+                artifacts: ArtifactSpec {
+                    include: vec!["out/hello.txt".to_string()],
+                    exclude: Vec::new(),
+                },
+                env: None,
+            };
+
+            let client = Client::builder().timeout(None).build().expect("client");
+            let base_url = format!("http://{addr}");
+            let metadata = serde_json::to_string(&request).expect("metadata");
+            let form = Form::new()
+                .part(
+                    "metadata",
+                    Part::text(metadata)
+                        .mime_str("application/json")
+                        .expect("metadata mime"),
+                )
+                .part(
+                    "source",
+                    Part::file(source_archive.path())
+                        .expect("source part")
+                        .mime_str("application/zip")
+                        .expect("source mime"),
+                );
+
+            let url = format!("{base_url}/v1/builds");
+            let response = client.post(url).multipart(form).send().expect("send");
+            assert!(response.status().is_success());
+
+            let mut reader = BufReader::new(response);
+            let mut line = String::new();
+            let mut stdout_lines = Vec::new();
+            let mut exit_code = None;
+
+            loop {
+                line.clear();
+                let bytes = reader.read_line(&mut line).expect("read line");
+                if bytes == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let event: ResponseEvent = serde_json::from_str(trimmed).expect("event parse");
+                match event {
+                    ResponseEvent::Stdout { data } => stdout_lines.push(data),
+                    ResponseEvent::Exit { code, .. } => {
+                        exit_code = Some(code);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            (exit_code, stdout_lines)
+        })
+        .await
+        .expect("build task");
+
+        let (exit_code, stdout_lines) = result;
+        assert_eq!(exit_code, Some(0), "build should succeed");
+        assert!(
+            stdout_lines.len() >= 30,
+            "should have received multiple output chunks, got {}",
+            stdout_lines.len()
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore] // Long-running test (~90s) - run with `cargo test -- --ignored`
+    async fn uds_slow_build_streams_output() {
+        let env = setup_slow_env();
+        let socket_path = env.temp.path().join("build-service.sock");
+        let server_handle = start_uds_server(env.app, &socket_path).await;
+
+        let socket_path_clone = socket_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let source_archive = create_source_zip().expect("source zip");
+            let request = Request {
+                schema_version: Some(SCHEMA_VERSION.to_string()),
+                request_id: Some("slow-test-uds".to_string()),
+                command: "slow".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                timeout_sec: Some(120),
+                artifacts: ArtifactSpec {
+                    include: vec!["out/hello.txt".to_string()],
+                    exclude: Vec::new(),
+                },
+                env: None,
+            };
+
+            let client = Client::builder()
+                .unix_socket(socket_path_clone)
+                .timeout(None)
+                .build()
+                .expect("client");
+            let metadata = serde_json::to_string(&request).expect("metadata");
+            let form = Form::new()
+                .part(
+                    "metadata",
+                    Part::text(metadata)
+                        .mime_str("application/json")
+                        .expect("metadata mime"),
+                )
+                .part(
+                    "source",
+                    Part::file(source_archive.path())
+                        .expect("source part")
+                        .mime_str("application/zip")
+                        .expect("source mime"),
+                );
+
+            let url = "http://localhost/v1/builds";
+            let response = client.post(url).multipart(form).send().expect("send");
+            assert!(response.status().is_success());
+
+            let mut reader = BufReader::new(response);
+            let mut line = String::new();
+            let mut stdout_lines = Vec::new();
+            let mut exit_code = None;
+
+            loop {
+                line.clear();
+                let bytes = reader.read_line(&mut line).expect("read line");
+                if bytes == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let event: ResponseEvent = serde_json::from_str(trimmed).expect("event parse");
+                match event {
+                    ResponseEvent::Stdout { data } => stdout_lines.push(data),
+                    ResponseEvent::Exit { code, .. } => {
+                        exit_code = Some(code);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            (exit_code, stdout_lines)
+        })
+        .await
+        .expect("build task");
+
+        let (exit_code, stdout_lines) = result;
+        assert_eq!(exit_code, Some(0), "build should succeed");
+        assert!(
+            stdout_lines.len() >= 30,
+            "should have received multiple output chunks, got {}",
+            stdout_lines.len()
+        );
+
+        server_handle.abort();
+    }
+
+    fn setup_slow_env() -> TestEnv {
+        let temp = tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let artifacts_root = temp.path().join("artifacts");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&workspace_root).expect("workspace root");
+        std::fs::create_dir_all(&artifacts_root).expect("artifacts root");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+
+        // Script that outputs text with delays - simulates long build (~90 seconds)
+        let script_path = bin_dir.join("slow.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+echo "Starting build..."
+for i in $(seq 1 45); do
+    sleep 2
+    echo "Compiling file $i of 45..."
+    # Output some longer lines to simulate compiler output
+    echo "gcc -c -I/usr/include -I/usr/local/include -Wall -Werror -O2 -DVERSION=\"1.0\" file$i.c -o file$i.o"
+done
+mkdir -p out
+echo hello > out/hello.txt
+echo "Build finished successfully"
+"#,
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let mut config = Config {
+            schema_version: "3".to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        config.build.workspace_root = workspace_root.clone();
+        config
+            .build
+            .commands
+            .insert("slow".to_string(), script_path);
+        config.artifacts.storage_root = artifacts_root;
+
+        let app = build_app(config);
+        TestEnv { temp, app }
+    }
+
     fn setup_env() -> TestEnv {
         let temp = tempdir().expect("tempdir");
         let workspace_root = temp.path().join("workspace");
@@ -474,7 +706,10 @@ mod tests {
                     let service = TowerToHyperService::new(app.clone());
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
-                        let _ = http1::Builder::new().serve_connection(io, service).await;
+                        let _ = http1::Builder::new()
+                            .keep_alive(false)
+                            .serve_connection(io, service)
+                            .await;
                     });
                 }
             }
@@ -578,7 +813,7 @@ mod tests {
             command: "build".to_string(),
             args: Vec::new(),
             cwd: None,
-            timeout_sec: Some(60),
+            timeout_sec: Some(120),
             artifacts: ArtifactSpec {
                 include: vec!["out/**".to_string()],
                 exclude: Vec::new(),

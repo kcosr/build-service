@@ -412,6 +412,8 @@ fn extract_source_archive(
     dest: &Path,
     max_extracted_bytes: u64,
 ) -> Result<(), BuildError> {
+    use std::os::unix::fs::PermissionsExt;
+
     let file = std::fs::File::open(source_archive).map_err(|err| {
         BuildError::new(
             "source_archive",
@@ -441,6 +443,7 @@ fn extract_source_archive(
         };
 
         let out_path = dest.join(enclosed);
+        let unix_mode = file.unix_mode();
 
         if file.is_dir() {
             std::fs::create_dir_all(&out_path)
@@ -477,6 +480,13 @@ fn extract_source_archive(
             outfile.write_all(&buffer[..bytes]).map_err(|err| {
                 BuildError::new("source_archive", format!("write file failed: {err}"))
             })?;
+        }
+
+        // Restore Unix permissions if present in zip
+        if let Some(mode) = unix_mode {
+            std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode)).map_err(
+                |err| BuildError::new("source_archive", format!("set permissions failed: {err}")),
+            )?;
         }
     }
 

@@ -74,6 +74,10 @@ pub fn collect_artifacts_zip(
         })?;
 
         let pattern_root = root.join(pattern).to_string_lossy().into_owned();
+        info!(
+            "artifact glob: pattern={:?} root={:?} full_path={:?}",
+            pattern, root, pattern_root
+        );
         let entries = glob(&pattern_root).map_err(|source| ArtifactError::GlobPattern {
             pattern: pattern.to_string(),
             source,
@@ -89,6 +93,7 @@ pub fn collect_artifacts_zip(
                 context: "expand artifact glob",
                 source: io::Error::other(source.to_string()),
             })?;
+            info!("artifact glob matched: {:?}", path);
             found = true;
             let canonical = fs::canonicalize(&path).map_err(|source| ArtifactError::Io {
                 context: "canonicalize artifact path",
@@ -115,10 +120,17 @@ pub fn collect_artifacts_zip(
         }
 
         if !found {
-            return Err(ArtifactError::GlobMiss {
-                pattern: pattern.to_string(),
-            });
+            info!(
+                "artifact pattern matched nothing, skipping: pattern={:?} checked_path={:?}",
+                pattern, pattern_root
+            );
         }
+    }
+
+    // If no files matched any patterns, return None
+    if matched_files.is_empty() {
+        info!("no artifacts matched any patterns");
+        return Ok(None);
     }
 
     let dest_dir = config.storage_root.join(build_id);
@@ -251,18 +263,31 @@ fn write_artifacts_zip(
     dest: &Path,
     matched_files: &HashMap<PathBuf, PathBuf>,
 ) -> Result<(), ArtifactError> {
+    use std::os::unix::fs::PermissionsExt;
+
     let file = File::create(dest).map_err(|source| ArtifactError::Io {
         context: "create artifacts.zip",
         source,
     })?;
     let mut zip = ZipWriter::new(file);
-    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     let mut items: Vec<_> = matched_files.iter().collect();
     items.sort_by(|a, b| a.1.cmp(b.1));
 
     for (source, rel) in items {
         let name = rel.to_string_lossy().replace('\\', "/");
+
+        // Get file permissions and preserve them in the zip
+        let metadata = fs::metadata(source).map_err(|source| ArtifactError::Io {
+            context: "stat artifact for permissions",
+            source,
+        })?;
+        let mode = metadata.permissions().mode();
+
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(mode);
+
         zip.start_file(name, options)
             .map_err(|source| ArtifactError::Zip { source })?;
         let mut input = File::open(source).map_err(|source| ArtifactError::Io {
@@ -423,7 +448,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn collect_artifacts_glob_miss() {
+    fn collect_artifacts_no_match_returns_none() {
         let root = tempdir().expect("tempdir");
         let config = ArtifactsConfig {
             storage_root: root.path().join("artifacts"),
@@ -436,11 +461,9 @@ mod tests {
             exclude: vec![],
         };
 
-        let err = collect_artifacts_zip(root.path(), &spec, &config, "bld").unwrap_err();
-        match err {
-            ArtifactError::GlobMiss { .. } => {}
-            other => panic!("unexpected error: {other}"),
-        }
+        // Glob miss no longer fails - just returns None if no files matched
+        let result = collect_artifacts_zip(root.path(), &spec, &config, "bld").unwrap();
+        assert!(result.is_none(), "expected None when no files match");
     }
 
     #[test]

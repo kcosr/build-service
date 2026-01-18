@@ -412,15 +412,25 @@ fn is_excluded(path: &Path, patterns: &[glob::Pattern]) -> bool {
 }
 
 fn write_zip(temp: &NamedTempFile, matched_files: &HashMap<PathBuf, PathBuf>) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let file = temp.reopen()?;
     let mut zip = ZipWriter::new(file);
-    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     let mut items: Vec<_> = matched_files.iter().collect();
     items.sort_by(|a, b| a.1.cmp(b.1));
 
     for (source, rel) in items {
         let name = rel.to_string_lossy().replace('\\', "/");
+
+        // Preserve file permissions in the zip
+        let metadata = fs::metadata(source)?;
+        let mode = metadata.permissions().mode();
+
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(mode);
+
         zip.start_file(name, options).map_err(io::Error::other)?;
         let mut input = fs::File::open(source)?;
         io::copy(&mut input, &mut zip)?;
@@ -589,13 +599,17 @@ fn run_build(
 ) -> io::Result<BuildResult> {
     let (client, url, send_auth) = match endpoint {
         Endpoint::Http { base } => (
-            Client::builder().build().map_err(io::Error::other)?,
+            Client::builder()
+                .timeout(None)
+                .build()
+                .map_err(io::Error::other)?,
             format!("{base}/v1/builds"),
             true,
         ),
         Endpoint::Unix { path } => {
             let client = Client::builder()
                 .unix_socket(path.clone())
+                .timeout(None)
                 .build()
                 .map_err(io::Error::other)?;
             (client, "http://localhost/v1/builds".to_string(), false)
@@ -759,6 +773,8 @@ fn build_artifact_url(base: &str, path: &str) -> String {
 }
 
 fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let file = fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -775,6 +791,7 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
         };
 
         let out_path = dest.join(enclosed);
+        let unix_mode = file.unix_mode();
 
         if file.is_dir() {
             fs::create_dir_all(&out_path)?;
@@ -787,6 +804,11 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
 
         let mut outfile = fs::File::create(&out_path)?;
         io::copy(&mut file, &mut outfile)?;
+
+        // Restore Unix permissions if present in zip
+        if let Some(mode) = unix_mode {
+            fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))?;
+        }
     }
 
     Ok(())
