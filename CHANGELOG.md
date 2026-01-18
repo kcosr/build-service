@@ -2,7 +2,14 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+- Artifact patterns that match no files are now skipped instead of failing the build. This allows `make clean` and similar builds that don't produce artifacts to succeed.
+
+### Fixed
+- Fixed "error decoding response body" on Unix socket connections by disabling HTTP keep-alive for streaming responses.
+
+### Added
+- Unix file permissions are now preserved in source and artifact archives.
 
 ## [0.1.0] - 2026-01-18
 

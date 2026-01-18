@@ -141,12 +141,7 @@ Streamed as `application/x-ndjson` until exit.
  "artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":123456}}
 ```
 
-On artifact collection failure:
-
-```json
-{"type":"error","code":"artifact_glob_miss","pattern":"dist/*.tar.gz"}
-{"type":"exit","code":1,"timed_out":false}
-```
+Artifact patterns that match no files are skipped (logged at info level). If no files match any pattern, `artifacts` is `null` in the exit event.
 
 ### Artifact Download
 `GET /v1/builds/{build_id}/artifacts.zip`
@@ -229,3 +224,4 @@ Logs are written using `tracing` in a plain-text format. Configure log directory
 
 - Builds run as the service process user by default, or `build.run_as_user`/`build.run_as_group` if set.
 - Artifacts are bundled into `artifacts.zip` and extracted by the client into the repo root.
+- Unix file permissions are preserved in both source and artifact archives.
