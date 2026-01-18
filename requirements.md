@@ -138,6 +138,11 @@ exclude = [".git/**", ".build-service/**", "target/**"]
 include = ["out/**", "dist/*.tar.gz"]
 exclude = ["**/*.tmp"]
 
+[connection]
+# endpoint = "https://build.example.com"
+# socket = "/run/build-service.sock"
+# token = "..."
+
 [request]
 # timeout_sec = 900
 
@@ -145,6 +150,10 @@ exclude = ["**/*.tmp"]
 CC = "clang"
 CFLAGS = "-O2 -g"
 ```
+
+Notes:
+- Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default socket path.
+- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_SOCKET`, `BUILD_SERVICE_TOKEN`.
 
 ## Protocol
 

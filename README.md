@@ -72,6 +72,12 @@ exclude = [".git/**", ".build-service/**", "target/**"]
 include = ["out/**", "dist/*.tar.gz"]
 exclude = ["**/*.tmp"]
 
+[connection]
+# Choose one; endpoint is preferred when both are set.
+# endpoint = "https://build.example.com"
+# socket = "/run/build-service.sock"
+# token = "..."
+
 [request]
 # optional defaults
 # timeout_sec = 900
@@ -84,6 +90,8 @@ CFLAGS = "-O2 -g"
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
+- Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default socket path.
+- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_SOCKET`, `BUILD_SERVICE_TOKEN`.
 
 ## Protocol
 

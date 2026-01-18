@@ -53,6 +53,8 @@ struct ClientConfig {
     artifacts: PatternConfig,
     #[serde(default)]
     request: Option<RequestConfig>,
+    #[serde(default)]
+    connection: Option<ConnectionConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -69,6 +71,16 @@ struct RequestConfig {
     timeout_sec: Option<u64>,
     #[serde(default)]
     env: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConnectionConfig {
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    socket: Option<PathBuf>,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -149,9 +161,10 @@ fn main() -> ExitCode {
         env,
     };
 
-    let endpoint = resolve_endpoint(args.endpoint);
-    let socket_path = resolve_socket_path(args.socket);
-    let token = resolve_token(args.token);
+    let connection = client_config.connection.as_ref();
+    let endpoint = resolve_endpoint(args.endpoint, connection);
+    let socket_path = resolve_socket_path(args.socket, connection);
+    let token = resolve_token(args.token, connection);
 
     let build = match run_build(
         &request,
@@ -318,12 +331,10 @@ fn collect_recursive_prefix(
 ) -> io::Result<bool> {
     let base = if pattern == "**" {
         Some("")
-    } else if let Some(stripped) = pattern.strip_suffix("/**") {
-        Some(stripped)
-    } else if let Some(stripped) = pattern.strip_suffix("\\**") {
-        Some(stripped)
     } else {
-        None
+        pattern
+            .strip_suffix("/**")
+            .or_else(|| pattern.strip_suffix("\\**"))
     };
 
     let Some(base) = base else {
@@ -424,7 +435,7 @@ fn write_zip(temp: &NamedTempFile, matched_files: &HashMap<PathBuf, PathBuf>) ->
     Ok(())
 }
 
-fn resolve_socket_path(explicit: Option<PathBuf>) -> PathBuf {
+fn resolve_socket_path(explicit: Option<PathBuf>, config: Option<&ConnectionConfig>) -> PathBuf {
     if let Some(path) = explicit {
         return path;
     }
@@ -435,10 +446,18 @@ fn resolve_socket_path(explicit: Option<PathBuf>) -> PathBuf {
         }
     }
 
+    if let Some(connection) = config {
+        if let Some(path) = &connection.socket {
+            if !path.as_os_str().is_empty() {
+                return path.clone();
+            }
+        }
+    }
+
     PathBuf::from(DEFAULT_SOCKET_PATH)
 }
 
-fn resolve_endpoint(explicit: Option<String>) -> Option<String> {
+fn resolve_endpoint(explicit: Option<String>, config: Option<&ConnectionConfig>) -> Option<String> {
     if let Some(endpoint) = explicit {
         if !endpoint.trim().is_empty() {
             return Some(endpoint);
@@ -451,10 +470,18 @@ fn resolve_endpoint(explicit: Option<String>) -> Option<String> {
         }
     }
 
+    if let Some(connection) = config {
+        if let Some(endpoint) = &connection.endpoint {
+            if !endpoint.trim().is_empty() {
+                return Some(endpoint.clone());
+            }
+        }
+    }
+
     None
 }
 
-fn resolve_token(explicit: Option<String>) -> Option<String> {
+fn resolve_token(explicit: Option<String>, config: Option<&ConnectionConfig>) -> Option<String> {
     if let Some(token) = explicit {
         if !token.trim().is_empty() {
             return Some(token);
@@ -464,6 +491,14 @@ fn resolve_token(explicit: Option<String>) -> Option<String> {
     if let Ok(env_token) = env::var("BUILD_SERVICE_TOKEN") {
         if !env_token.trim().is_empty() {
             return Some(env_token);
+        }
+    }
+
+    if let Some(connection) = config {
+        if let Some(token) = &connection.token {
+            if !token.trim().is_empty() {
+                return Some(token.clone());
+            }
         }
     }
 

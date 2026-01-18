@@ -149,12 +149,10 @@ fn collect_recursive_prefix(
 ) -> Result<bool, ArtifactError> {
     let base = if pattern == "**" {
         Some("")
-    } else if let Some(stripped) = pattern.strip_suffix("/**") {
-        Some(stripped)
-    } else if let Some(stripped) = pattern.strip_suffix("\\**") {
-        Some(stripped)
     } else {
-        None
+        pattern
+            .strip_suffix("/**")
+            .or_else(|| pattern.strip_suffix("\\**"))
     };
 
     let Some(base) = base else {
