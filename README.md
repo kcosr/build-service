@@ -1,20 +1,21 @@
 # Build Service
 
-A host-side build service that accepts source uploads from clients, runs an allowed command on the host, streams NDJSON output, and returns a single `artifacts.zip` that the client automatically extracts into the local workspace.
+A build service that accepts source uploads from clients, runs an allowed command on the host, streams NDJSON output, and returns a single `artifacts.zip` that the client automatically extracts into the local workspace.
 
-This exists to support builds that depend on proprietary host libraries that cannot be exposed inside containers used by coding agents or third-party hosted models.
+It can be used for builds that depend on proprietary host libraries that cannot be exposed inside containers, as well as for offloading builds to remote, more powerful servers or centralizing build tooling.
 
 ## ⚠️ Security Considerations
 
-This service intentionally bridges a container isolation boundary. Any process that can submit source archives and invoke build commands can run code on the host with the service's privileges (or the configured run-as user).
+This service executes build commands on the host (or the configured run-as user). It includes basic guardrails, but it does not provide strong sandboxing. A build can still read or copy files outside the workspace if the service user has access. If that is a concern, run the service inside a container or a dedicated VM.
 
-Before deploying, consider:
-- **Who can reach the socket or HTTP endpoint** (group permissions, network exposure, reverse proxy rules)
-- **Whether HTTP auth tokens are required** (`service.http.auth`)
-- **What host resources** the run-as user can access (files, network, credentials)
-- **Whether audit logging** and timeouts provide sufficient visibility and limits
+Built-in protections to review and tune:
+- **Command allowlist** (`build.commands`)
+- **Environment allowlist** (`build.environment.allow`)
+- **Workspace isolation** (temp workspace per build, with relative path validation for sources/artifacts/cwd)
+- **Upload size and timeouts** (`build.max_upload_bytes`, `build.timeouts`)
+- **Transport controls** (socket permissions, optional HTTP auth)
 
-If your environment includes untrusted or semi-trusted workloads, this service may not be appropriate.
+If your environment includes untrusted or semi-trusted workloads, consider additional isolation around the service.
 
 ## Components
 
@@ -28,11 +29,11 @@ If your environment includes untrusted or semi-trusted workloads, this service m
 +---------------------+         +----------------------+
 |  Client             |         |  Host                |
 |                     |         |                      |
-|  build-cli          |---------|  build-service       |
+|  build-cli          |-- source.zip --> build-service |
 |   (HTTP / UDS)      |         |   validate request   |
-|                     |         |          |           |
-|  Streams stdout/err |<--------+----------+           |
-|                     |         |          v           |
+|                     |<- NDJSON ------+               |
+|                     |<- artifacts.zip+               |
+|                     |         |      v               |
 +---------------------+         |   exec allowed cmd   |
                                 |                      |
                                 +----------------------+
