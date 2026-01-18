@@ -6,7 +6,7 @@ It can be used for builds that depend on proprietary host libraries that cannot 
 
 ## ⚠️ Security Considerations
 
-This service executes build commands on the host (or the configured run-as user). It includes basic guardrails, but it does not provide strong sandboxing. A build can still read or copy files outside the workspace if the service user has access. If that is a concern, run the service inside a container or a dedicated VM.
+This service executes build commands on the host (or the configured run-as user). It includes basic guardrails, but it does not provide strong sandboxing. If a build script or Makefile reads or copies files outside the workspace and the service user has access, it can still access them. If that is a concern, run the service inside a container or a dedicated VM.
 
 Built-in protections to review and tune:
 - **Command allowlist** (`build.commands`)
