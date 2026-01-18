@@ -812,6 +812,7 @@ fn normalize_exit_code(code: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn normalize_exit_code_clamps() {
@@ -819,5 +820,58 @@ mod tests {
         assert_eq!(normalize_exit_code(0), 0);
         assert_eq!(normalize_exit_code(255), 255);
         assert_eq!(normalize_exit_code(300), 255);
+    }
+
+    #[test]
+    fn parse_endpoint_requires_scheme() {
+        assert!(parse_endpoint("localhost:8080").is_err());
+        assert!(parse_endpoint("unix://relative/path").is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_accepts_http_https_unix() {
+        let http = parse_endpoint("http://example.com:8080").unwrap();
+        match http {
+            Endpoint::Http { base } => assert_eq!(base, "http://example.com:8080"),
+            _ => panic!("expected http endpoint"),
+        }
+
+        let https = parse_endpoint("https://example.com/").unwrap();
+        match https {
+            Endpoint::Http { base } => assert_eq!(base, "https://example.com"),
+            _ => panic!("expected https endpoint"),
+        }
+
+        let unix = parse_endpoint("unix:///run/build-service.sock").unwrap();
+        match unix {
+            Endpoint::Unix { path } => {
+                assert_eq!(path, PathBuf::from("/run/build-service.sock"))
+            }
+            _ => panic!("expected unix endpoint"),
+        }
+    }
+
+    #[test]
+    fn resolve_timeout_prefers_explicit_then_env_then_config() {
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = env::var("BUILD_SERVICE_TIMEOUT").ok();
+
+        env::remove_var("BUILD_SERVICE_TIMEOUT");
+        let request = RequestConfig {
+            timeout_sec: Some(12),
+            env: HashMap::new(),
+        };
+        assert_eq!(resolve_timeout(None, Some(&request)).unwrap(), Some(12));
+        assert_eq!(resolve_timeout(Some(5), Some(&request)).unwrap(), Some(5));
+
+        env::set_var("BUILD_SERVICE_TIMEOUT", "9");
+        assert_eq!(resolve_timeout(None, Some(&request)).unwrap(), Some(9));
+
+        if let Some(prev) = prev {
+            env::set_var("BUILD_SERVICE_TIMEOUT", prev);
+        } else {
+            env::remove_var("BUILD_SERVICE_TIMEOUT");
+        }
     }
 }
