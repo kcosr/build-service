@@ -21,7 +21,7 @@ If your environment includes untrusted or semi-trusted workloads, consider addit
 
 - **build-service**: host daemon. Validates requests, extracts uploaded sources to a temp workspace, runs the configured command, streams output, and packages artifacts.
 - **build-cli**: client that packages sources, sends requests (HTTP or UDS), relays NDJSON output, and extracts artifacts.
-- **make wrapper**: a POSIX shell shim that replaces `make` in containers.
+- **build wrapper**: a POSIX shell shim that replaces build tools in containers.
 
 ## Architecture
 
@@ -191,16 +191,16 @@ Environment:
 - `BUILD_SERVICE_TOKEN`: bearer token (HTTP only)
 - `BUILD_SERVICE_TIMEOUT`: timeout in seconds
 
-## Make Wrapper
+## Build Wrapper
 
-Install the wrapper earlier in `PATH` than `/usr/bin/make`:
+Install the wrapper earlier in `PATH` than the real build tools:
 
 ```
-cp scripts/make-wrapper.sh /usr/local/bin/make
-chmod 755 /usr/local/bin/make
+cp scripts/build-wrapper.sh /usr/local/bin/build-wrapper
+chmod 755 /usr/local/bin/build-wrapper
 ```
 
-The wrapper runs `build-cli` with the command name it was invoked as (typically `make`). If no repo-local config is found, it executes the local command instead.
+The wrapper runs `build-cli` with the command name it was invoked as (for example `make` or `cargo`). If no repo-local config is found, it executes the local command instead.
 
 ## Logging
 
