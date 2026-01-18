@@ -43,10 +43,10 @@ If your environment includes untrusted or semi-trusted workloads, consider addit
 
 - You run `make` (or another tool) through the wrapper (typically via a symlink so it is transparent); it looks for `.build-service/config.toml` up the tree.
 - If config exists, the wrapper execs `build-cli <tool> ...`; otherwise it falls back to the local tool.
-- `build-cli` validates patterns, zips sources, and posts `metadata` + `source.zip` to the endpoint.
+- `build-cli` applies `[sources]` include/exclude globs from the repo config, zips matching files, and posts `metadata` + `source.zip` to the endpoint.
 - The server validates the request, extracts into a temp workspace, and runs the allowlisted command.
 - The client streams stdout/stderr from NDJSON; on success the server emits `artifacts.zip` info.
-- `build-cli` downloads and extracts `artifacts.zip` back into the repo root.
+- `build-cli` downloads and extracts `artifacts.zip` back into the repo root, using `[artifacts]` include/exclude globs to decide what the server packages.
 
 ## Configuration
 
