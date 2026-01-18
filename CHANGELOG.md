@@ -2,7 +2,21 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Breaking Changes
+- Replace project/path-based builds with source uploads and temp workspaces; `.build-service/config.toml` is now required and artifacts are returned as a single zip extracted by the CLI ([#3](https://github.com/kcosr/build-service/pull/3)).
+- Require explicit endpoint schemes (`http://`, `https://`, `unix://`) and drop `--socket`/`BUILD_SERVICE_SOCKET` in favor of `BUILD_SERVICE_ENDPOINT` ([#3](https://github.com/kcosr/build-service/pull/3)).
+
+### Added
+- HTTP and Unix socket transports for multipart source uploads with NDJSON streaming and artifact download endpoints ([#3](https://github.com/kcosr/build-service/pull/3)).
+- Generic build wrapper with local fallback; deploy via symlinks per build tool name ([#3](https://github.com/kcosr/build-service/pull/3)).
+- Integration tests for HTTP/UDS build flows plus unit tests for endpoint/timeout parsing ([#3](https://github.com/kcosr/build-service/pull/3)).
+
+### Changed
+- Build artifacts are packaged into a single `artifacts.zip` and automatically extracted by the client ([#3](https://github.com/kcosr/build-service/pull/3)).
+- Client configuration supports explicit connection settings and timeout overrides via `BUILD_SERVICE_TIMEOUT` ([#3](https://github.com/kcosr/build-service/pull/3)).
+
+### Removed
+- Project-based build configuration and container-to-host path mapping mode ([#3](https://github.com/kcosr/build-service/pull/3)).
 
 ## [0.0.3] - 2026-01-14
 
