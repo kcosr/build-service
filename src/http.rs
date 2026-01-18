@@ -347,16 +347,54 @@ mod tests {
     use reqwest::blocking::multipart::{Form, Part};
     use reqwest::blocking::Client;
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{BufRead, BufReader, Cursor, Read, Write};
+    use std::net::SocketAddr;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
-    use tempfile::{tempdir, NamedTempFile};
+    use tempfile::{tempdir, NamedTempFile, TempDir};
     use zip::write::FileOptions;
     use zip::ZipWriter;
 
+    enum Transport {
+        Http { base_url: String },
+        Unix { socket_path: PathBuf },
+    }
+
+    struct TestEnv {
+        temp: TempDir,
+        app: Router,
+    }
+
     #[tokio::test]
     async fn http_build_returns_artifacts_zip() {
+        let env = setup_env();
+        let (addr, server_handle) = start_http_server(env.app).await;
+        let transport = Transport::Http {
+            base_url: format!("http://{addr}"),
+        };
+
+        let zip_bytes = run_build_and_fetch(transport).await;
+        assert_zip_contains(&zip_bytes, "out/hello.txt", "hello");
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn uds_build_returns_artifacts_zip() {
+        let env = setup_env();
+        let socket_path = env.temp.path().join("build-service.sock");
+        let server_handle = start_uds_server(env.app, &socket_path).await;
+        let transport = Transport::Unix { socket_path };
+
+        let zip_bytes = run_build_and_fetch(transport).await;
+        assert_zip_contains(&zip_bytes, "out/hello.txt", "hello");
+
+        server_handle.abort();
+    }
+
+    fn setup_env() -> TestEnv {
         let temp = tempdir().expect("tempdir");
         let workspace_root = temp.path().join("workspace");
         let artifacts_root = temp.path().join("artifacts");
@@ -384,8 +422,6 @@ mod tests {
             artifacts: ArtifactsConfig::default(),
             logging: LoggingConfig::default(),
         };
-        config.service.http.enabled = true;
-        config.service.socket.enabled = false;
         config.build.workspace_root = workspace_root.clone();
         config
             .build
@@ -393,13 +429,20 @@ mod tests {
             .insert("build".to_string(), script_path);
         config.artifacts.storage_root = artifacts_root;
 
+        let app = build_app(config);
+        TestEnv { temp, app }
+    }
+
+    fn build_app(config: Config) -> Router {
         let max_upload_bytes = config.build.max_upload_bytes;
         let state = AppState {
             config: Arc::new(config),
             auth_required: false,
         };
-        let app = build_router(state, max_upload_bytes);
+        build_router(state, max_upload_bytes)
+    }
 
+    async fn start_http_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         listener
             .set_nonblocking(true)
@@ -408,146 +451,19 @@ mod tests {
         let server = axum_server::from_tcp(listener)
             .expect("server")
             .serve(app.into_make_service());
-        let server_handle = tokio::spawn(server);
+        let handle = tokio::spawn(async move {
+            let _ = server.await;
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let source_archive = create_source_zip().expect("source zip");
-        let request = Request {
-            schema_version: Some(SCHEMA_VERSION.to_string()),
-            request_id: Some("test".to_string()),
-            command: "build".to_string(),
-            args: Vec::new(),
-            cwd: None,
-            timeout_sec: Some(60),
-            artifacts: ArtifactSpec {
-                include: vec!["out/**".to_string()],
-                exclude: Vec::new(),
-            },
-            env: Some(HashMap::new()),
-        };
-
-        let (archive_path, _) = tokio::task::spawn_blocking(move || {
-            let client = Client::new();
-            let metadata = serde_json::to_string(&request).expect("metadata");
-            let form = Form::new()
-                .part(
-                    "metadata",
-                    Part::text(metadata)
-                        .mime_str("application/json")
-                        .expect("metadata mime"),
-                )
-                .part(
-                    "source",
-                    Part::file(source_archive.path())
-                        .expect("source part")
-                        .mime_str("application/zip")
-                        .expect("source mime"),
-                );
-
-            let url = format!("http://{addr}/v1/builds");
-            let response = client.post(url).multipart(form).send().expect("send");
-            assert!(response.status().is_success());
-
-            let mut reader = BufReader::new(response);
-            let mut line = String::new();
-            let mut artifacts = None;
-            loop {
-                line.clear();
-                let bytes = reader.read_line(&mut line).expect("read line");
-                if bytes == 0 {
-                    break;
-                }
-                let trimmed = line.trim_end();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let event: ResponseEvent = serde_json::from_str(trimmed).expect("event parse");
-                if let ResponseEvent::Exit {
-                    artifacts: exit, ..
-                } = event
-                {
-                    artifacts = exit;
-                    break;
-                }
-            }
-            let archive = artifacts.expect("missing artifacts");
-            (archive.path, archive.size)
-        })
-        .await
-        .expect("build task");
-
-        let zip_bytes = tokio::task::spawn_blocking(move || {
-            let client = Client::new();
-            let url = format!("http://{addr}{archive_path}");
-            let mut response = client.get(url).send().expect("get");
-            assert!(response.status().is_success());
-            let mut buf = Vec::new();
-            response.copy_to(&mut buf).expect("read zip");
-            buf
-        })
-        .await
-        .expect("download task");
-
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).expect("zip");
-        let mut file = archive.by_name("out/hello.txt").expect("zip entry");
-        let mut contents = String::new();
-        file.read_to_string(&mut contents).expect("read entry");
-        assert_eq!(contents.trim(), "hello");
-
-        server_handle.abort();
+        (addr, handle)
     }
 
-    #[tokio::test]
-    async fn uds_build_returns_artifacts_zip() {
-        let temp = tempdir().expect("tempdir");
-        let workspace_root = temp.path().join("workspace");
-        let artifacts_root = temp.path().join("artifacts");
-        let bin_dir = temp.path().join("bin");
-        std::fs::create_dir_all(&workspace_root).expect("workspace root");
-        std::fs::create_dir_all(&artifacts_root).expect("artifacts root");
-        std::fs::create_dir_all(&bin_dir).expect("bin dir");
-
-        let script_path = bin_dir.join("build.sh");
-        std::fs::write(
-            &script_path,
-            "#!/bin/sh\nmkdir -p out\necho hello > out/hello.txt\n",
-        )
-        .expect("write script");
-        let mut perms = std::fs::metadata(&script_path)
-            .expect("stat script")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).expect("chmod");
-
-        let mut config = Config {
-            schema_version: "3".to_string(),
-            service: ServiceConfig::default(),
-            build: BuildConfig::default(),
-            artifacts: ArtifactsConfig::default(),
-            logging: LoggingConfig::default(),
-        };
-        config.service.http.enabled = false;
-        config.service.socket.enabled = true;
-        config.build.workspace_root = workspace_root.clone();
-        config
-            .build
-            .commands
-            .insert("build".to_string(), script_path);
-        config.artifacts.storage_root = artifacts_root;
-
-        let max_upload_bytes = config.build.max_upload_bytes;
-        let state = AppState {
-            config: Arc::new(config),
-            auth_required: false,
-        };
-        let app = build_router(state, max_upload_bytes);
-
-        let socket_path = temp.path().join("build-service.sock");
+    async fn start_uds_server(app: Router, socket_path: &Path) -> tokio::task::JoinHandle<()> {
         if socket_path.exists() {
-            std::fs::remove_file(&socket_path).expect("remove socket");
+            std::fs::remove_file(socket_path).expect("remove socket");
         }
-        let listener = UnixListener::bind(&socket_path).expect("bind uds");
-        let server_handle = tokio::spawn({
+        let listener = UnixListener::bind(socket_path).expect("bind uds");
+        let handle = tokio::spawn({
             let app = app.clone();
             async move {
                 loop {
@@ -564,9 +480,99 @@ mod tests {
             }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
+        handle
+    }
 
-        let source_archive = create_source_zip().expect("source zip");
-        let request = Request {
+    async fn run_build_and_fetch(transport: Transport) -> Vec<u8> {
+        tokio::task::spawn_blocking(move || {
+            let source_archive = create_source_zip().expect("source zip");
+            let request = build_request();
+            let (client, base_url) = build_client(&transport);
+            let archive_path = post_build(&client, &base_url, &request, &source_archive);
+            fetch_zip(&client, &base_url, &archive_path)
+        })
+        .await
+        .expect("build task")
+    }
+
+    fn build_client(transport: &Transport) -> (Client, String) {
+        match transport {
+            Transport::Http { base_url } => (Client::new(), base_url.clone()),
+            Transport::Unix { socket_path } => (
+                Client::builder()
+                    .unix_socket(socket_path.clone())
+                    .build()
+                    .expect("client"),
+                "http://localhost".to_string(),
+            ),
+        }
+    }
+
+    fn post_build(
+        client: &Client,
+        base_url: &str,
+        request: &Request,
+        source_archive: &NamedTempFile,
+    ) -> String {
+        let metadata = serde_json::to_string(request).expect("metadata");
+        let form = Form::new()
+            .part(
+                "metadata",
+                Part::text(metadata)
+                    .mime_str("application/json")
+                    .expect("metadata mime"),
+            )
+            .part(
+                "source",
+                Part::file(source_archive.path())
+                    .expect("source part")
+                    .mime_str("application/zip")
+                    .expect("source mime"),
+            );
+
+        let base = base_url.trim_end_matches('/');
+        let url = format!("{base}/v1/builds");
+        let response = client.post(url).multipart(form).send().expect("send");
+        assert!(response.status().is_success());
+
+        let mut reader = BufReader::new(response);
+        let mut line = String::new();
+        let mut artifacts = None;
+        loop {
+            line.clear();
+            let bytes = reader.read_line(&mut line).expect("read line");
+            if bytes == 0 {
+                break;
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let event: ResponseEvent = serde_json::from_str(trimmed).expect("event parse");
+            if let ResponseEvent::Exit {
+                artifacts: exit, ..
+            } = event
+            {
+                artifacts = exit;
+                break;
+            }
+        }
+        let archive = artifacts.expect("missing artifacts");
+        archive.path
+    }
+
+    fn fetch_zip(client: &Client, base_url: &str, archive_path: &str) -> Vec<u8> {
+        let base = base_url.trim_end_matches('/');
+        let url = format!("{base}{archive_path}");
+        let mut response = client.get(url).send().expect("get");
+        assert!(response.status().is_success());
+        let mut buf = Vec::new();
+        response.copy_to(&mut buf).expect("read zip");
+        buf
+    }
+
+    fn build_request() -> Request {
+        Request {
             schema_version: Some(SCHEMA_VERSION.to_string()),
             request_id: Some("test".to_string()),
             command: "build".to_string(),
@@ -578,88 +584,15 @@ mod tests {
                 exclude: Vec::new(),
             },
             env: Some(HashMap::new()),
-        };
+        }
+    }
 
-        let socket_for_client = socket_path.clone();
-        let (archive_path, _) = tokio::task::spawn_blocking(move || {
-            let client = Client::builder()
-                .unix_socket(socket_for_client)
-                .build()
-                .expect("client");
-            let metadata = serde_json::to_string(&request).expect("metadata");
-            let form = Form::new()
-                .part(
-                    "metadata",
-                    Part::text(metadata)
-                        .mime_str("application/json")
-                        .expect("metadata mime"),
-                )
-                .part(
-                    "source",
-                    Part::file(source_archive.path())
-                        .expect("source part")
-                        .mime_str("application/zip")
-                        .expect("source mime"),
-                );
-
-            let response = client
-                .post("http://localhost/v1/builds")
-                .multipart(form)
-                .send()
-                .expect("send");
-            assert!(response.status().is_success());
-
-            let mut reader = BufReader::new(response);
-            let mut line = String::new();
-            let mut artifacts = None;
-            loop {
-                line.clear();
-                let bytes = reader.read_line(&mut line).expect("read line");
-                if bytes == 0 {
-                    break;
-                }
-                let trimmed = line.trim_end();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let event: ResponseEvent = serde_json::from_str(trimmed).expect("event parse");
-                if let ResponseEvent::Exit {
-                    artifacts: exit, ..
-                } = event
-                {
-                    artifacts = exit;
-                    break;
-                }
-            }
-            let archive = artifacts.expect("missing artifacts");
-            (archive.path, archive.size)
-        })
-        .await
-        .expect("build task");
-
-        let socket_for_download = socket_path.clone();
-        let zip_bytes = tokio::task::spawn_blocking(move || {
-            let client = Client::builder()
-                .unix_socket(socket_for_download)
-                .build()
-                .expect("client");
-            let url = format!("http://localhost{archive_path}");
-            let mut response = client.get(url).send().expect("get");
-            assert!(response.status().is_success());
-            let mut buf = Vec::new();
-            response.copy_to(&mut buf).expect("read zip");
-            buf
-        })
-        .await
-        .expect("download task");
-
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).expect("zip");
-        let mut file = archive.by_name("out/hello.txt").expect("zip entry");
+    fn assert_zip_contains(zip_bytes: &[u8], name: &str, expected: &str) {
+        let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes)).expect("zip");
+        let mut file = archive.by_name(name).expect("zip entry");
         let mut contents = String::new();
         file.read_to_string(&mut contents).expect("read entry");
-        assert_eq!(contents.trim(), "hello");
-
-        server_handle.abort();
+        assert_eq!(contents.trim(), expected);
     }
 
     fn create_source_zip() -> std::io::Result<NamedTempFile> {
