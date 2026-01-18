@@ -200,6 +200,15 @@ cp scripts/build-wrapper.sh /usr/local/bin/build-wrapper
 chmod 755 /usr/local/bin/build-wrapper
 ```
 
+During deployment, symlink each build tool name to the wrapper (so the wrapper can detect the command name from `argv[0]`):
+
+```
+ln -s /usr/local/bin/build-wrapper /usr/local/bin/make
+ln -s /usr/local/bin/build-wrapper /usr/local/bin/cargo
+```
+
+Ensure the real tools are still available later in `PATH` (for example in `/usr/bin`). The wrapper removes its own directory from `PATH` before falling back, so it will pick the system tool instead of re-invoking itself.
+
 The wrapper runs `build-cli` with the command name it was invoked as (for example `make` or `cargo`). If no repo-local config is found, it executes the local command instead.
 
 ## Logging
