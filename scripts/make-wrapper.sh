@@ -1,2 +1,3 @@
 #!/bin/sh
-exec build-cli make "$@"
+
+exec build-cli "$@"

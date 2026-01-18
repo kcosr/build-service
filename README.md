@@ -1,45 +1,39 @@
 # Build Service
 
-A host-side build service that executes `make` on the host when triggered from containers, while preserving the caller's identity via Unix socket peer credentials.
+A host-side build service that accepts source uploads from clients, runs an allowed command on the host, streams NDJSON output, and returns a single `artifacts.zip` that the client automatically extracts into the local workspace.
 
 This exists to support builds that depend on proprietary host libraries that cannot be exposed inside containers used by coding agents or third-party hosted models.
 
 ## ⚠️ Security Considerations
 
-This service intentionally bridges a container isolation boundary. Any process with write access to the mounted workspace directory can create a Makefile (or modify an existing one) and trigger its execution on the host via this service. Build commands run with the peer user's privileges, meaning they could use a deliberately constructed Makefile to access files and resources on the host that are not exposed inside the container.
-
-This is a trade-off. The alternative—exposing proprietary libraries inside containers accessible to third-party models—may carry greater risk depending on your threat model. If you trust the code and agents operating within your containers, or have other controls in place (network isolation, restricted user permissions, auditing), this service provides a pragmatic way to support host-dependent builds without broadening container access.
+This service intentionally bridges a container isolation boundary. Any process that can submit source archives and invoke build commands can run code on the host with the service's privileges (or the configured run-as user).
 
 Before deploying, consider:
-- **Who has write access** to workspace directories mounted into containers
-- **What host resources** the peer user can reach (files, network, credentials)
+- **Who can reach the socket or HTTP endpoint** (group permissions, network exposure, reverse proxy rules)
+- **Whether HTTP auth tokens are required** (`service.http.auth`)
+- **What host resources** the run-as user can access (files, network, credentials)
 - **Whether audit logging** and timeouts provide sufficient visibility and limits
 
-If your environment includes untrusted or semi-trusted workloads with write access to mounted paths, this service may not be appropriate.
+If your environment includes untrusted or semi-trusted workloads, this service may not be appropriate.
 
 ## Components
 
-- **build-service**: host daemon running as root under systemd. Validates requests, drops privileges, runs the configured command, and streams output.
-- **build-cli**: container client that sends requests and relays NDJSON output to stdout/stderr.
+- **build-service**: host daemon. Validates requests, extracts uploaded sources to a temp workspace, runs the configured command, streams output, and packages artifacts.
+- **build-cli**: client that packages sources, sends requests (HTTP or UDS), relays NDJSON output, and extracts artifacts.
 - **make wrapper**: a POSIX shell shim that replaces `make` in containers.
 
 ## Architecture
 
 ```
 +---------------------+         +----------------------+
-|  Container          |         |  Host                |
+|  Client             |         |  Host                |
 |                     |         |                      |
-|  make (wrapper)     |---------|  build-service       |
-|       |             |  Unix   |       |              |
-|       v             |  Socket |       v              |
-|  build-cli ---------+-------->|  Validate request    |
-|                     |         |       |              |
-|  Streams stdout/err |<--------+-------+              |
-|                     |         |       v              |
-+---------------------+         |  Drop privs (peer)   |
-                                |       |              |
-                                |       v              |
-                                |  exec configured cmd |
+|  build-cli          |---------|  build-service       |
+|   (HTTP / UDS)      |         |   validate request   |
+|                     |         |          |           |
+|  Streams stdout/err |<--------+----------+           |
+|                     |         |          v           |
++---------------------+         |   exec allowed cmd   |
                                 |                      |
                                 +----------------------+
 ```
@@ -49,55 +43,99 @@ If your environment includes untrusted or semi-trusted workloads with write acce
 Sample config: `config/config.toml`
 
 Key fields:
-- `schema_version`: config schema version (currently "1").
-- `service.socket_path`: Unix socket path.
-- `service.socket_group`: group that can access the socket.
-- `service.socket_mode`: octal permissions (e.g., "0660").
-- `build.workspace_root`: base path used by `{workspace_root}` in path templates.
-- `build.path_mapping.container_template`: container-side workspace root template (`{user}`, `{workspace_root}`).
-- `build.path_mapping.host_template`: host-side workspace root template (`{user}`, `{workspace_root}`).
+- `schema_version`: config schema version (currently "3").
+- `service.socket.*`: Unix socket enablement, path, group, mode.
+- `service.http.*`: HTTP enablement, listen address, auth, and optional TLS.
+- `build.workspace_root`: base directory for temp workspaces.
+- `build.max_upload_bytes`: max source upload size (default 128MB).
+- `build.run_as_user` / `build.run_as_group`: optional run-as user/group.
 - `build.commands`: allowlist mapping `command` -> absolute binary path.
-- `build.timeouts.default_sec`: default timeout.
-- `build.timeouts.max_sec`: hard cap for client requests.
+- `build.timeouts.*`: default timeout and max timeout.
 - `build.environment.allow`: allowlist of environment variables passed to the build.
-- `logging.*`: log level and rotation settings.
+- `artifacts.storage_root`: artifact storage root (per-build subdirs).
+- `artifacts.*`: TTL/GC settings for artifact retention.
 
 Environment overrides:
 - `BUILD_SERVICE_CONFIG`: alternate config path.
 - `BUILD_SERVICE_LOG_LEVEL`: override `logging.level`.
 
-Path mapping templates support `{user}` and `{workspace_root}` (`host_template` must include `{user}`). Defaults keep host and container paths identical; to map container `/home/<user>` to host `/home/<user>/workspace`, set `build.path_mapping.container_template = "/home/{user}"` and keep `build.path_mapping.host_template = "{workspace_root}/{user}/workspace"`.
+## Repo-local Client Config
+
+File: `.build-service/config.toml`
+
+```toml
+[sources]
+include = ["**/*"]
+exclude = [".git/**", ".build-service/**", "target/**"]
+
+[artifacts]
+include = ["out/**", "dist/*.tar.gz"]
+exclude = ["**/*.tmp"]
+
+[request]
+# optional defaults
+# timeout_sec = 900
+
+[request.env]
+CC = "clang"
+CFLAGS = "-O2 -g"
+```
+
+Notes:
+- `sources` and `artifacts` patterns must be relative and cannot use `..`.
+- The CLI refuses to run if `.build-service/config.toml` is missing.
 
 ## Protocol
 
-### Request (JSON)
+### Start Build (multipart)
+`POST /v1/builds` over TCP or Unix socket (HTTP over UDS)
+`Authorization: Bearer <token>` when HTTP auth is enabled.
 
-```
+`multipart/form-data` parts:
+- `metadata` (application/json)
+- `source` (application/zip)
+
+Metadata JSON:
+
+```json
 {
-  "schema_version": "1",
+  "schema_version": "3",
   "request_id": "<optional>",
   "command": "make",
   "args": ["-j4", "all"],
-  "cwd": "/home/user/workspace/project",
-  "timeout_sec": 600
+  "cwd": "subdir",
+  "timeout_sec": 600,
+  "artifacts": {"include": ["out/**"], "exclude": []},
+  "env": {"CC": "clang"}
 }
 ```
 
 ### Response Stream (NDJSON)
+Streamed as `application/x-ndjson` until exit.
 
-```
-{"type":"stdout","data":"gcc -c ..."}
-{"type":"stderr","data":"warning: ..."}
-{"type":"exit","code":0,"timed_out":false}
+```json
+{"type":"build","id":"bld_123","status":"started"}
+{"type":"stdout","data":"..."}
+{"type":"stderr","data":"..."}
+{"type":"exit","code":0,"timed_out":false,
+ "artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":123456}}
 ```
 
-Output is streamed as lossy UTF-8; invalid bytes are replaced.
+On artifact collection failure:
+
+```json
+{"type":"error","code":"artifact_glob_miss","pattern":"dist/*.tar.gz"}
+{"type":"exit","code":1,"timed_out":false}
+```
+
+### Artifact Download
+`GET /v1/builds/{build_id}/artifacts.zip`
 
 ## Path Validation
 
-- `cwd` is mapped from container paths to host paths using `build.path_mapping.*`, then must resolve under the host workspace root.
-- `-C`/`--directory` and `-f`/`--file` args are resolved relative to the mapped cwd and must stay under the host workspace root.
-- Requests that escape the workspace are rejected.
+- `cwd` and all glob patterns must be relative and cannot contain `..`.
+- `-C`/`--directory` and `-f`/`--file` args are validated for `make` to prevent escapes.
+- Source extraction and artifact paths are canonicalized to prevent traversal.
 
 ## Timeout Handling
 
@@ -130,16 +168,18 @@ sudo systemctl enable --now build-service
 ## CLI Usage
 
 ```
-# in container
+# Unix socket (default)
 build-cli make -j4 all
 build-cli --timeout 1800 make clean all
 
-# use a non-default socket path
-build-cli --socket /run/build-service.sock make -n
+# HTTP
+build-cli --endpoint https://builds.example.com --token <token> make -j4 all
 ```
 
 Environment:
 - `BUILD_SERVICE_SOCKET`: override socket path
+- `BUILD_SERVICE_ENDPOINT`: HTTP endpoint
+- `BUILD_SERVICE_TOKEN`: bearer token
 
 ## Make Wrapper
 
@@ -156,9 +196,5 @@ Logs are written using `tracing` in a plain-text format. Configure log directory
 
 ## Notes
 
-- The daemon must run as root to drop privileges to the calling user.
-- Commands are restricted by `build.commands` allowlist.
-
-## Roadmap
-
-- Support multiple workspace mappings for additional mounts.
+- Builds run as the service process user by default, or `build.run_as_user`/`build.run_as_group` if set.
+- Artifacts are bundled into `artifacts.zip` and extracted by the client into the repo root.

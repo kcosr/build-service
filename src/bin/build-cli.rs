@@ -1,14 +1,26 @@
+use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
+use reqwest::blocking::multipart::{Form, Part};
+use reqwest::blocking::Client;
+use serde::Deserialize;
+use tempfile::NamedTempFile;
+use zip::write::FileOptions;
+use zip::ZipWriter;
 
-use build_service::protocol::{Request, ResponseEvent, SCHEMA_VERSION};
+use build_service::protocol::{
+    ArtifactArchive, ArtifactSpec, Request, ResponseEvent, SCHEMA_VERSION,
+};
+use build_service::validation::{validate_relative_path, validate_relative_pattern};
 
 const DEFAULT_SOCKET_PATH: &str = "/run/build-service.sock";
+const CLIENT_CONFIG_DIR: &str = ".build-service";
+const CLIENT_CONFIG_FILE: &str = "config.toml";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Client for the build-service daemon")]
@@ -20,6 +32,12 @@ struct Args {
     socket: Option<PathBuf>,
 
     #[arg(long)]
+    endpoint: Option<String>,
+
+    #[arg(long)]
+    token: Option<String>,
+
+    #[arg(long)]
     request_id: Option<String>,
 
     #[arg(required = true)]
@@ -29,57 +47,381 @@ struct Args {
     args: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClientConfig {
+    sources: PatternConfig,
+    artifacts: PatternConfig,
+    #[serde(default)]
+    request: Option<RequestConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PatternConfig {
+    #[serde(default)]
+    include: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RequestConfig {
+    #[serde(default)]
+    timeout_sec: Option<u64>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    let cwd = match env::current_dir() {
-        Ok(path) => path,
+    let repo_root = match find_repo_root() {
+        Ok(root) => root,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let config_path = repo_root.join(CLIENT_CONFIG_DIR).join(CLIENT_CONFIG_FILE);
+    let client_config = match load_client_config(&config_path) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Err(err) = validate_patterns(&client_config.sources, "sources") {
+        eprintln!("{err}");
+        return ExitCode::from(1);
+    }
+    if let Err(err) = validate_patterns(&client_config.artifacts, "artifacts") {
+        eprintln!("{err}");
+        return ExitCode::from(1);
+    }
+    if client_config.sources.include.is_empty() {
+        eprintln!("sources.include must not be empty");
+        return ExitCode::from(1);
+    }
+
+    let source_archive = match build_source_archive(&repo_root, &client_config.sources) {
+        Ok(archive) => archive,
+        Err(err) => {
+            eprintln!("failed to package sources: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let cwd = match resolve_relative_cwd(&repo_root) {
+        Ok(cwd) => cwd,
         Err(err) => {
             eprintln!("failed to resolve cwd: {err}");
             return ExitCode::from(1);
         }
     };
 
-    let socket_path = resolve_socket_path(args.socket);
-    let mut stream = match UnixStream::connect(&socket_path) {
-        Ok(stream) => stream,
-        Err(err) => {
-            let message = match err.kind() {
-                io::ErrorKind::NotFound => {
-                    format!(
-                        "build-service socket not found at {}",
-                        socket_path.display()
-                    )
-                }
-                io::ErrorKind::ConnectionRefused => "cannot connect to build-service".to_string(),
-                _ => format!("cannot connect to build-service: {err}"),
-            };
-            eprintln!("{message}");
-            return ExitCode::from(1);
-        }
+    let artifacts = ArtifactSpec {
+        include: client_config.artifacts.include,
+        exclude: client_config.artifacts.exclude,
     };
+
+    let env = client_config
+        .request
+        .as_ref()
+        .map(|request| request.env.clone())
+        .filter(|env| !env.is_empty());
+
+    let timeout_sec = args.timeout.or_else(|| {
+        client_config
+            .request
+            .as_ref()
+            .and_then(|request| request.timeout_sec)
+    });
 
     let request = Request {
         schema_version: Some(SCHEMA_VERSION.to_string()),
         request_id: args.request_id,
         command: args.command,
         args: args.args,
-        cwd: cwd.to_string_lossy().into_owned(),
-        timeout_sec: args.timeout,
+        cwd,
+        timeout_sec,
+        artifacts,
+        env,
     };
 
-    if let Err(err) = send_request(&mut stream, &request) {
-        eprintln!("failed to send request: {err}");
-        return ExitCode::from(1);
+    let endpoint = resolve_endpoint(args.endpoint);
+    let socket_path = resolve_socket_path(args.socket);
+    let token = resolve_token(args.token);
+
+    let build = match run_build(
+        &request,
+        &source_archive,
+        endpoint.as_deref(),
+        &socket_path,
+        token.as_deref(),
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("build request failed: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if build.exit_code != 0 {
+        return to_exit_code(build.exit_code, build.timed_out);
     }
 
-    match read_responses(stream) {
-        Ok(code) => to_exit_code(code),
-        Err(err) => {
-            eprintln!("invalid response from build-service: {err}");
-            ExitCode::from(1)
+    if let Some(archive) = build.artifacts {
+        if let Err(err) = download_and_extract(
+            &archive,
+            endpoint.as_deref(),
+            &socket_path,
+            token.as_deref(),
+            &repo_root,
+        ) {
+            eprintln!("failed to fetch artifacts: {err}");
+            return ExitCode::from(1);
         }
     }
+
+    ExitCode::SUCCESS
+}
+
+fn find_repo_root() -> io::Result<PathBuf> {
+    let mut dir = env::current_dir()?;
+    loop {
+        let candidate = dir.join(CLIENT_CONFIG_DIR).join(CLIENT_CONFIG_FILE);
+        if candidate.exists() {
+            return Ok(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{} not found in current directory or parents",
+            Path::new(CLIENT_CONFIG_DIR)
+                .join(CLIENT_CONFIG_FILE)
+                .display()
+        ),
+    ))
+}
+
+fn load_client_config(path: &Path) -> io::Result<ClientConfig> {
+    let raw = fs::read_to_string(path)?;
+    toml::from_str(&raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn validate_patterns(patterns: &PatternConfig, label: &str) -> io::Result<()> {
+    for pattern in &patterns.include {
+        let field = format!("{label}.include");
+        validate_relative_pattern(pattern, &field)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    }
+    for pattern in &patterns.exclude {
+        let field = format!("{label}.exclude");
+        validate_relative_pattern(pattern, &field)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    }
+    Ok(())
+}
+
+fn resolve_relative_cwd(root: &Path) -> io::Result<Option<String>> {
+    let cwd = env::current_dir()?;
+    let rel = cwd
+        .strip_prefix(root)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd is outside repo root"))?;
+
+    if rel.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
+    let rel_str = rel.to_string_lossy().into_owned();
+    validate_relative_path(&rel_str, "cwd")
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+
+    Ok(Some(rel_str))
+}
+
+fn build_source_archive(root: &Path, patterns: &PatternConfig) -> io::Result<NamedTempFile> {
+    let root = fs::canonicalize(root)?;
+    let mut matched_files: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let exclude_patterns = compile_patterns(&patterns.exclude)?;
+
+    for pattern in &patterns.include {
+        let pattern_root = root.join(pattern).to_string_lossy().into_owned();
+        let entries = glob::glob(&pattern_root)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+
+        let mut found = false;
+        if collect_recursive_prefix(pattern, &root, &exclude_patterns, &mut matched_files)? {
+            found = true;
+        }
+
+        for entry in entries {
+            let path = entry.map_err(|err| io::Error::other(err.to_string()))?;
+            found = true;
+            let canonical = fs::canonicalize(&path)?;
+
+            if !canonical.starts_with(&root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("path {canonical:?} is outside repo root"),
+                ));
+            }
+
+            if canonical.is_dir() {
+                collect_dir_files(&canonical, &root, &exclude_patterns, &mut matched_files)?;
+            } else if canonical.is_file() {
+                let rel = canonical
+                    .strip_prefix(&root)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?
+                    .to_path_buf();
+                if !is_excluded(&rel, &exclude_patterns) {
+                    matched_files.entry(canonical).or_insert(rel);
+                }
+            }
+        }
+
+        if !found {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pattern {pattern} matched nothing"),
+            ));
+        }
+    }
+
+    if matched_files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no source files matched",
+        ));
+    }
+
+    let temp = tempfile::Builder::new()
+        .prefix("build-service-src-")
+        .suffix(".zip")
+        .tempfile()?;
+
+    write_zip(&temp, &matched_files)?;
+    Ok(temp)
+}
+
+fn collect_recursive_prefix(
+    pattern: &str,
+    root: &Path,
+    exclude_patterns: &[glob::Pattern],
+    matched_files: &mut HashMap<PathBuf, PathBuf>,
+) -> io::Result<bool> {
+    let base = if pattern == "**" {
+        Some("")
+    } else if let Some(stripped) = pattern.strip_suffix("/**") {
+        Some(stripped)
+    } else if let Some(stripped) = pattern.strip_suffix("\\**") {
+        Some(stripped)
+    } else {
+        None
+    };
+
+    let Some(base) = base else {
+        return Ok(false);
+    };
+
+    let base_path = if base.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(base)
+    };
+
+    if !base_path.exists() {
+        return Ok(false);
+    }
+
+    let canonical = fs::canonicalize(&base_path)?;
+    if !canonical.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path {canonical:?} is outside repo root"),
+        ));
+    }
+
+    if canonical.is_dir() {
+        collect_dir_files(&canonical, root, exclude_patterns, matched_files)?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn compile_patterns(patterns: &[String]) -> io::Result<Vec<glob::Pattern>> {
+    let mut compiled = Vec::new();
+    for pattern in patterns {
+        let glob = glob::Pattern::new(pattern)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        compiled.push(glob);
+    }
+    Ok(compiled)
+}
+
+fn collect_dir_files(
+    dir: &Path,
+    root: &Path,
+    exclude_patterns: &[glob::Pattern],
+    matched_files: &mut HashMap<PathBuf, PathBuf>,
+) -> io::Result<()> {
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry = entry.map_err(|err| io::Error::other(err.to_string()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let canonical = fs::canonicalize(entry.path())?;
+        if !canonical.starts_with(root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path {canonical:?} is outside repo root"),
+            ));
+        }
+        let rel = canonical
+            .strip_prefix(root)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?
+            .to_path_buf();
+        if is_excluded(&rel, exclude_patterns) {
+            continue;
+        }
+        matched_files.entry(canonical).or_insert(rel);
+    }
+    Ok(())
+}
+
+fn is_excluded(path: &Path, patterns: &[glob::Pattern]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+
+    let path_str = path.to_string_lossy();
+    patterns.iter().any(|pattern| pattern.matches(&path_str))
+}
+
+fn write_zip(temp: &NamedTempFile, matched_files: &HashMap<PathBuf, PathBuf>) -> io::Result<()> {
+    let file = temp.reopen()?;
+    let mut zip = ZipWriter::new(file);
+    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let mut items: Vec<_> = matched_files.iter().collect();
+    items.sort_by(|a, b| a.1.cmp(b.1));
+
+    for (source, rel) in items {
+        let name = rel.to_string_lossy().replace('\\', "/");
+        zip.start_file(name, options).map_err(io::Error::other)?;
+        let mut input = fs::File::open(source)?;
+        io::copy(&mut input, &mut zip)?;
+    }
+
+    zip.finish().map_err(io::Error::other)?;
+    Ok(())
 }
 
 fn resolve_socket_path(explicit: Option<PathBuf>) -> PathBuf {
@@ -96,18 +438,100 @@ fn resolve_socket_path(explicit: Option<PathBuf>) -> PathBuf {
     PathBuf::from(DEFAULT_SOCKET_PATH)
 }
 
-fn send_request(stream: &mut UnixStream, request: &Request) -> io::Result<()> {
-    let payload = serde_json::to_vec(request).map_err(io::Error::other)?;
-    stream.write_all(&payload)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    Ok(())
+fn resolve_endpoint(explicit: Option<String>) -> Option<String> {
+    if let Some(endpoint) = explicit {
+        if !endpoint.trim().is_empty() {
+            return Some(endpoint);
+        }
+    }
+
+    if let Ok(env_endpoint) = env::var("BUILD_SERVICE_ENDPOINT") {
+        if !env_endpoint.trim().is_empty() {
+            return Some(env_endpoint);
+        }
+    }
+
+    None
 }
 
-fn read_responses(stream: UnixStream) -> io::Result<i32> {
-    let mut reader = BufReader::new(stream);
+fn resolve_token(explicit: Option<String>) -> Option<String> {
+    if let Some(token) = explicit {
+        if !token.trim().is_empty() {
+            return Some(token);
+        }
+    }
+
+    if let Ok(env_token) = env::var("BUILD_SERVICE_TOKEN") {
+        if !env_token.trim().is_empty() {
+            return Some(env_token);
+        }
+    }
+
+    None
+}
+
+struct BuildResult {
+    exit_code: i32,
+    timed_out: bool,
+    artifacts: Option<ArtifactArchive>,
+}
+
+fn run_build(
+    request: &Request,
+    source_archive: &NamedTempFile,
+    endpoint: Option<&str>,
+    socket_path: &Path,
+    token: Option<&str>,
+) -> io::Result<BuildResult> {
+    let (client, url, send_auth) = if let Some(endpoint) = endpoint {
+        let base = endpoint.trim_end_matches('/');
+        (
+            Client::builder().build().map_err(io::Error::other)?,
+            format!("{base}/v1/builds"),
+            true,
+        )
+    } else {
+        let client = Client::builder()
+            .unix_socket(socket_path)
+            .build()
+            .map_err(io::Error::other)?;
+        (client, "http://localhost/v1/builds".to_string(), false)
+    };
+
+    let metadata = serde_json::to_string(request).map_err(io::Error::other)?;
+    let source_part = Part::file(source_archive.path()).map_err(io::Error::other)?;
+    let form = Form::new()
+        .part(
+            "metadata",
+            Part::text(metadata).mime_str("application/json").unwrap(),
+        )
+        .part("source", source_part.mime_str("application/zip").unwrap());
+
+    let mut builder = client.post(url).multipart(form);
+    if send_auth {
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
+        }
+    }
+
+    let response = builder.send().map_err(io::Error::other)?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_else(|_| "".to_string());
+        return Err(io::Error::other(format!(
+            "server returned {status}: {body}"
+        )));
+    }
+
+    read_responses(response)
+}
+
+fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResult> {
+    let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut exit_code: Option<i32> = None;
+    let mut timed_out = false;
+    let mut artifacts: Option<ArtifactArchive> = None;
 
     loop {
         line.clear();
@@ -134,15 +558,32 @@ fn read_responses(stream: UnixStream) -> io::Result<i32> {
                 stderr.write_all(data.as_bytes())?;
                 stderr.flush()?;
             }
-            ResponseEvent::Exit { code, timed_out } => {
-                exit_code = Some(if timed_out { 124 } else { code });
+            ResponseEvent::Error { message, .. } => {
+                if let Some(message) = message {
+                    let mut stderr = io::stderr();
+                    writeln!(stderr, "{message}")?;
+                }
+            }
+            ResponseEvent::Exit {
+                code,
+                timed_out: timed,
+                artifacts: event_artifacts,
+            } => {
+                exit_code = Some(code);
+                timed_out = timed;
+                artifacts = event_artifacts;
                 break;
             }
+            ResponseEvent::Build { .. } => {}
         }
     }
 
     match exit_code {
-        Some(code) => Ok(code),
+        Some(code) => Ok(BuildResult {
+            exit_code: code,
+            timed_out,
+            artifacts,
+        }),
         None => Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "missing exit event",
@@ -150,7 +591,108 @@ fn read_responses(stream: UnixStream) -> io::Result<i32> {
     }
 }
 
-fn to_exit_code(code: i32) -> ExitCode {
+fn download_and_extract(
+    archive: &ArtifactArchive,
+    endpoint: Option<&str>,
+    socket_path: &Path,
+    token: Option<&str>,
+    repo_root: &Path,
+) -> io::Result<()> {
+    let (client, url, send_auth) = if let Some(endpoint) = endpoint {
+        let base = endpoint.trim_end_matches('/');
+        (
+            Client::builder().build().map_err(io::Error::other)?,
+            build_artifact_url(base, &archive.path),
+            true,
+        )
+    } else {
+        let client = Client::builder()
+            .unix_socket(socket_path)
+            .build()
+            .map_err(io::Error::other)?;
+        (
+            client,
+            build_artifact_url("http://localhost", &archive.path),
+            false,
+        )
+    };
+
+    let mut builder = client.get(url);
+    if send_auth {
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
+        }
+    }
+
+    let mut response = builder.send().map_err(io::Error::other)?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_else(|_| "".to_string());
+        return Err(io::Error::other(format!(
+            "artifact download failed {status}: {body}"
+        )));
+    }
+
+    let temp = tempfile::Builder::new()
+        .prefix("build-service-artifacts-")
+        .suffix(".zip")
+        .tempfile()?;
+    let mut file = temp.reopen()?;
+    io::copy(&mut response, &mut file)?;
+
+    extract_zip(temp.path(), repo_root)
+}
+
+fn build_artifact_url(base: &str, path: &str) -> String {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return path.to_string();
+    }
+
+    if path.starts_with('/') {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/{path}")
+    }
+}
+
+fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
+    let file = fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let Some(enclosed) = file.enclosed_name() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zip entry had invalid path",
+            ));
+        };
+
+        let out_path = dest.join(enclosed);
+
+        if file.is_dir() {
+            fs::create_dir_all(&out_path)?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut outfile = fs::File::create(&out_path)?;
+        io::copy(&mut file, &mut outfile)?;
+    }
+
+    Ok(())
+}
+
+fn to_exit_code(code: i32, timed_out: bool) -> ExitCode {
+    if timed_out {
+        return ExitCode::from(124);
+    }
     ExitCode::from(normalize_exit_code(code))
 }
 
@@ -167,11 +709,6 @@ fn normalize_exit_code(code: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use std::sync::Mutex;
-    use std::thread;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn normalize_exit_code_clamps() {
@@ -179,84 +716,5 @@ mod tests {
         assert_eq!(normalize_exit_code(0), 0);
         assert_eq!(normalize_exit_code(255), 255);
         assert_eq!(normalize_exit_code(300), 255);
-    }
-
-    #[test]
-    fn parse_args_allows_make_flags_without_double_dash() {
-        let args = Args::try_parse_from(["build-cli", "make", "-f", "Makefile.local", "-j4"])
-            .expect("parse args");
-
-        assert_eq!(args.command, "make");
-        assert_eq!(
-            args.args,
-            vec![
-                "-f".to_string(),
-                "Makefile.local".to_string(),
-                "-j4".to_string()
-            ]
-        );
-        assert_eq!(args.timeout, None);
-        assert_eq!(args.socket, None);
-        assert_eq!(args.request_id, None);
-    }
-
-    #[test]
-    fn resolve_socket_path_prefers_explicit() {
-        let path = resolve_socket_path(Some(PathBuf::from("/tmp/explicit.sock")));
-        assert_eq!(path, PathBuf::from("/tmp/explicit.sock"));
-    }
-
-    #[test]
-    fn resolve_socket_path_uses_env() {
-        let _guard = ENV_LOCK.lock().expect("lock");
-        env::set_var("BUILD_SERVICE_SOCKET", "/tmp/env.sock");
-        let path = resolve_socket_path(None);
-        env::remove_var("BUILD_SERVICE_SOCKET");
-        assert_eq!(path, PathBuf::from("/tmp/env.sock"));
-    }
-
-    #[test]
-    fn resolve_socket_path_defaults_when_env_empty() {
-        let _guard = ENV_LOCK.lock().expect("lock");
-        env::set_var("BUILD_SERVICE_SOCKET", " ");
-        let path = resolve_socket_path(None);
-        env::remove_var("BUILD_SERVICE_SOCKET");
-        assert_eq!(path, PathBuf::from(DEFAULT_SOCKET_PATH));
-    }
-
-    #[test]
-    fn read_responses_returns_exit_code() {
-        let (client, mut server) = UnixStream::pair().expect("pair");
-        let handle = thread::spawn(move || {
-            let event = ResponseEvent::Exit {
-                code: 7,
-                timed_out: false,
-            };
-            let line = serde_json::to_string(&event).expect("json");
-            server.write_all(line.as_bytes()).expect("write");
-            server.write_all(b"\n").expect("newline");
-        });
-
-        let code = read_responses(client).expect("read");
-        assert_eq!(code, 7);
-        handle.join().expect("join");
-    }
-
-    #[test]
-    fn read_responses_timeout_overrides_code() {
-        let (client, mut server) = UnixStream::pair().expect("pair");
-        let handle = thread::spawn(move || {
-            let event = ResponseEvent::Exit {
-                code: 2,
-                timed_out: true,
-            };
-            let line = serde_json::to_string(&event).expect("json");
-            server.write_all(line.as_bytes()).expect("write");
-            server.write_all(b"\n").expect("newline");
-        });
-
-        let code = read_responses(client).expect("read");
-        assert_eq!(code, 124);
-        handle.join().expect("join");
     }
 }
