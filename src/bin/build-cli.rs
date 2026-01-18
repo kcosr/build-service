@@ -28,10 +28,7 @@ struct Args {
     #[arg(long)]
     timeout: Option<u64>,
 
-    #[arg(long)]
-    socket: Option<PathBuf>,
-
-    #[arg(long)]
+    #[arg(long, help = "Endpoint URL (http://, https://, or unix://)")]
     endpoint: Option<String>,
 
     #[arg(long)]
@@ -78,9 +75,13 @@ struct ConnectionConfig {
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
-    socket: Option<PathBuf>,
-    #[serde(default)]
     token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum Endpoint {
+    Http { base: String },
+    Unix { path: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -162,17 +163,16 @@ fn main() -> ExitCode {
     };
 
     let connection = client_config.connection.as_ref();
-    let endpoint = resolve_endpoint(args.endpoint, connection);
-    let socket_path = resolve_socket_path(args.socket, connection);
+    let endpoint = match resolve_endpoint(args.endpoint, connection) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
     let token = resolve_token(args.token, connection);
 
-    let build = match run_build(
-        &request,
-        &source_archive,
-        endpoint.as_deref(),
-        &socket_path,
-        token.as_deref(),
-    ) {
+    let build = match run_build(&request, &source_archive, &endpoint, token.as_deref()) {
         Ok(result) => result,
         Err(err) => {
             eprintln!("build request failed: {err}");
@@ -185,13 +185,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(archive) = build.artifacts {
-        if let Err(err) = download_and_extract(
-            &archive,
-            endpoint.as_deref(),
-            &socket_path,
-            token.as_deref(),
-            &repo_root,
-        ) {
+        if let Err(err) = download_and_extract(&archive, &endpoint, token.as_deref(), &repo_root) {
             eprintln!("failed to fetch artifacts: {err}");
             return ExitCode::from(1);
         }
@@ -435,50 +429,77 @@ fn write_zip(temp: &NamedTempFile, matched_files: &HashMap<PathBuf, PathBuf>) ->
     Ok(())
 }
 
-fn resolve_socket_path(explicit: Option<PathBuf>, config: Option<&ConnectionConfig>) -> PathBuf {
-    if let Some(path) = explicit {
-        return path;
+fn parse_endpoint(raw: &str) -> io::Result<Endpoint> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "endpoint must not be empty",
+        ));
     }
 
-    if let Ok(env_path) = env::var("BUILD_SERVICE_SOCKET") {
-        if !env_path.trim().is_empty() {
-            return PathBuf::from(env_path);
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let scheme_pos = trimmed.find("://").unwrap_or(0);
+        let after_scheme = &trimmed[scheme_pos + 3..];
+        if after_scheme.is_empty() || after_scheme.chars().all(|c| c == '/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "http endpoint must include a host",
+            ));
         }
+        let base = trimmed.trim_end_matches('/').to_string();
+        return Ok(Endpoint::Http { base });
     }
 
-    if let Some(connection) = config {
-        if let Some(path) = &connection.socket {
-            if !path.as_os_str().is_empty() {
-                return path.clone();
-            }
+    if let Some(path_str) = trimmed.strip_prefix("unix://") {
+        if path_str.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unix endpoint must include an absolute path",
+            ));
         }
+        let path = PathBuf::from(path_str);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unix endpoint path must be absolute",
+            ));
+        }
+        return Ok(Endpoint::Unix { path });
     }
 
-    PathBuf::from(DEFAULT_SOCKET_PATH)
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "endpoint must start with http://, https://, or unix://",
+    ))
 }
 
-fn resolve_endpoint(explicit: Option<String>, config: Option<&ConnectionConfig>) -> Option<String> {
+fn resolve_endpoint(
+    explicit: Option<String>,
+    config: Option<&ConnectionConfig>,
+) -> io::Result<Endpoint> {
     if let Some(endpoint) = explicit {
         if !endpoint.trim().is_empty() {
-            return Some(endpoint);
+            return parse_endpoint(&endpoint);
         }
     }
 
     if let Ok(env_endpoint) = env::var("BUILD_SERVICE_ENDPOINT") {
         if !env_endpoint.trim().is_empty() {
-            return Some(env_endpoint);
+            return parse_endpoint(&env_endpoint);
         }
     }
 
     if let Some(connection) = config {
         if let Some(endpoint) = &connection.endpoint {
             if !endpoint.trim().is_empty() {
-                return Some(endpoint.clone());
+                return parse_endpoint(endpoint);
             }
         }
     }
 
-    None
+    let default_endpoint = format!("unix://{DEFAULT_SOCKET_PATH}");
+    parse_endpoint(&default_endpoint)
 }
 
 fn resolve_token(explicit: Option<String>, config: Option<&ConnectionConfig>) -> Option<String> {
@@ -514,23 +535,22 @@ struct BuildResult {
 fn run_build(
     request: &Request,
     source_archive: &NamedTempFile,
-    endpoint: Option<&str>,
-    socket_path: &Path,
+    endpoint: &Endpoint,
     token: Option<&str>,
 ) -> io::Result<BuildResult> {
-    let (client, url, send_auth) = if let Some(endpoint) = endpoint {
-        let base = endpoint.trim_end_matches('/');
-        (
+    let (client, url, send_auth) = match endpoint {
+        Endpoint::Http { base } => (
             Client::builder().build().map_err(io::Error::other)?,
             format!("{base}/v1/builds"),
             true,
-        )
-    } else {
-        let client = Client::builder()
-            .unix_socket(socket_path)
-            .build()
-            .map_err(io::Error::other)?;
-        (client, "http://localhost/v1/builds".to_string(), false)
+        ),
+        Endpoint::Unix { path } => {
+            let client = Client::builder()
+                .unix_socket(path.clone())
+                .build()
+                .map_err(io::Error::other)?;
+            (client, "http://localhost/v1/builds".to_string(), false)
+        }
     };
 
     let metadata = serde_json::to_string(request).map_err(io::Error::other)?;
@@ -628,28 +648,27 @@ fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResu
 
 fn download_and_extract(
     archive: &ArtifactArchive,
-    endpoint: Option<&str>,
-    socket_path: &Path,
+    endpoint: &Endpoint,
     token: Option<&str>,
     repo_root: &Path,
 ) -> io::Result<()> {
-    let (client, url, send_auth) = if let Some(endpoint) = endpoint {
-        let base = endpoint.trim_end_matches('/');
-        (
+    let (client, url, send_auth) = match endpoint {
+        Endpoint::Http { base } => (
             Client::builder().build().map_err(io::Error::other)?,
             build_artifact_url(base, &archive.path),
             true,
-        )
-    } else {
-        let client = Client::builder()
-            .unix_socket(socket_path)
-            .build()
-            .map_err(io::Error::other)?;
-        (
-            client,
-            build_artifact_url("http://localhost", &archive.path),
-            false,
-        )
+        ),
+        Endpoint::Unix { path } => {
+            let client = Client::builder()
+                .unix_socket(path.clone())
+                .build()
+                .map_err(io::Error::other)?;
+            (
+                client,
+                build_artifact_url("http://localhost", &archive.path),
+                false,
+            )
+        }
     };
 
     let mut builder = client.get(url);

@@ -73,9 +73,8 @@ include = ["out/**", "dist/*.tar.gz"]
 exclude = ["**/*.tmp"]
 
 [connection]
-# Choose one; endpoint is preferred when both are set.
+# endpoint = "unix:///run/build-service.sock"
 # endpoint = "https://build.example.com"
-# socket = "/run/build-service.sock"
 # token = "..."
 
 [request]
@@ -90,8 +89,9 @@ CFLAGS = "-O2 -g"
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
-- Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default socket path.
-- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_SOCKET`, `BUILD_SERVICE_TOKEN`.
+- Endpoint must start with `http://`, `https://`, or `unix://`.
+- Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
+- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`.
 
 ## Protocol
 
@@ -185,9 +185,8 @@ build-cli --endpoint https://builds.example.com --token <token> make -j4 all
 ```
 
 Environment:
-- `BUILD_SERVICE_SOCKET`: override socket path
-- `BUILD_SERVICE_ENDPOINT`: HTTP endpoint
-- `BUILD_SERVICE_TOKEN`: bearer token
+- `BUILD_SERVICE_ENDPOINT`: endpoint URL (`http://`, `https://`, or `unix://`)
+- `BUILD_SERVICE_TOKEN`: bearer token (HTTP only)
 
 ## Make Wrapper
 
