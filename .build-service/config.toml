@@ -1,0 +1,18 @@
+[connection]
+endpoint = "http://pc:8882"
+local_fallback = true
+
+[sources]
+include = ["src/**", "Cargo.toml", "Cargo.lock"]
+exclude = []
+
+[artifacts]
+include = ["src/**", "Cargo.toml", "target/release/build-service", "target/release/build-cli"]
+exclude = []
+
+[request]
+timeout_sec = 900
+
+[request.env]
+RUSTUP_HOME = "/opt/rust"
+CARGO_HOME = "/opt/rust"

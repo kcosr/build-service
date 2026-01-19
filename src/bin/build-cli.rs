@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -108,6 +109,34 @@ fn connection_failure_exit_code(local_fallback: bool) -> u8 {
     } else {
         1
     }
+}
+
+fn is_connection_failure(err: &reqwest::Error) -> bool {
+    if err.is_connect() || err.is_timeout() {
+        return true;
+    }
+
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if let Some(io_err) = cause.downcast_ref::<io::Error>() {
+            match io_err.kind() {
+                io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::AddrNotAvailable
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::NotFound
+                | io::ErrorKind::PermissionDenied => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        source = cause.source();
+    }
+
+    false
 }
 
 fn main() -> ExitCode {
@@ -675,7 +704,7 @@ fn run_build(
         Ok(resp) => resp,
         Err(err) => {
             // Check if this is a connection error
-            if err.is_connect() || err.is_timeout() {
+            if is_connection_failure(&err) {
                 return Err(BuildError::ConnectionFailed(format!(
                     "cannot reach endpoint: {}",
                     err
@@ -895,7 +924,9 @@ fn normalize_exit_code(code: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[test]
     fn normalize_exit_code_clamps() {
@@ -912,6 +943,20 @@ mod tests {
             CONNECTION_FALLBACK_EXIT_CODE
         );
         assert_eq!(connection_failure_exit_code(false), 1);
+    }
+
+    #[test]
+    fn is_connection_failure_detects_refused_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let err = client.get(format!("http://{}", addr)).send().unwrap_err();
+        assert!(is_connection_failure(&err));
     }
 
     #[test]
