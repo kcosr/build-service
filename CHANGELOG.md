@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- Added `connection.local_fallback` option in client config. When `true`, the build wrapper falls back to local build tools if the build service endpoint is unreachable (connection refused, timeout, etc.). Defaults to `false`.
+- Added `connection.local_fallback` option in client config. When `true`, the build wrapper falls back to local build tools if the build service endpoint is unreachable (connection refused, timeout, etc.). Defaults to `false`. ([#5](https://github.com/kcosr/build-service/pull/5))
 
 ## [0.1.1] - 2026-01-18
 
