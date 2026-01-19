@@ -21,6 +21,7 @@ use build_service::validation::{validate_relative_path, validate_relative_patter
 const DEFAULT_SOCKET_PATH: &str = "/run/build-service.sock";
 const CLIENT_CONFIG_DIR: &str = ".build-service";
 const CLIENT_CONFIG_FILE: &str = "config.toml";
+const CONNECTION_FALLBACK_EXIT_CODE: u8 = 222;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Client for the build-service daemon")]
@@ -98,6 +99,14 @@ impl std::fmt::Display for BuildError {
             BuildError::ConnectionFailed(msg) => write!(f, "{}", msg),
             BuildError::Other(msg) => write!(f, "{}", msg),
         }
+    }
+}
+
+fn connection_failure_exit_code(local_fallback: bool) -> u8 {
+    if local_fallback {
+        CONNECTION_FALLBACK_EXIT_CODE
+    } else {
+        1
     }
 }
 
@@ -196,10 +205,10 @@ fn main() -> ExitCode {
             match err {
                 BuildError::ConnectionFailed(msg) => {
                     eprintln!("build request failed: {msg}");
-                    // Return exit code 127 if local_fallback is enabled
+                    // Return fallback exit code if local_fallback is enabled
                     // This signals the wrapper to fall back to local build
                     let local_fallback = connection.map(|c| c.local_fallback).unwrap_or(false);
-                    return ExitCode::from(if local_fallback { 127 } else { 1 });
+                    return ExitCode::from(connection_failure_exit_code(local_fallback));
                 }
                 BuildError::Other(msg) => {
                     eprintln!("build request failed: {msg}");
@@ -894,6 +903,15 @@ mod tests {
         assert_eq!(normalize_exit_code(0), 0);
         assert_eq!(normalize_exit_code(255), 255);
         assert_eq!(normalize_exit_code(300), 255);
+    }
+
+    #[test]
+    fn connection_failure_exit_code_respects_fallback() {
+        assert_eq!(
+            connection_failure_exit_code(true),
+            CONNECTION_FALLBACK_EXIT_CODE
+        );
+        assert_eq!(connection_failure_exit_code(false), 1);
     }
 
     #[test]

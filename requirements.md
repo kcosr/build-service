@@ -143,6 +143,7 @@ exclude = ["**/*.tmp"]
 # endpoint = "unix:///run/build-service.sock"
 # endpoint = "https://build.example.com"
 # token = "..."
+# local_fallback = false
 
 [request]
 # timeout_sec = 900
@@ -157,6 +158,7 @@ Notes:
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
 - Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`.
 - The wrapper falls back to the local command when `.build-service/config.toml` is missing.
+- When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 
 ## Protocol
 
