@@ -76,12 +76,29 @@ struct ConnectionConfig {
     endpoint: Option<String>,
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    local_fallback: bool,
 }
 
 #[derive(Debug, Clone)]
 enum Endpoint {
     Http { base: String },
     Unix { path: PathBuf },
+}
+
+#[derive(Debug)]
+enum BuildError {
+    ConnectionFailed(String),
+    Other(String),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::ConnectionFailed(msg) => write!(f, "{}", msg),
+            BuildError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -176,8 +193,19 @@ fn main() -> ExitCode {
     let build = match run_build(&request, &source_archive, &endpoint, token.as_deref()) {
         Ok(result) => result,
         Err(err) => {
-            eprintln!("build request failed: {err}");
-            return ExitCode::from(1);
+            match err {
+                BuildError::ConnectionFailed(msg) => {
+                    eprintln!("build request failed: {msg}");
+                    // Return exit code 127 if local_fallback is enabled
+                    // This signals the wrapper to fall back to local build
+                    let local_fallback = connection.map(|c| c.local_fallback).unwrap_or(false);
+                    return ExitCode::from(if local_fallback { 127 } else { 1 });
+                }
+                BuildError::Other(msg) => {
+                    eprintln!("build request failed: {msg}");
+                    return ExitCode::from(1);
+                }
+            }
         }
     };
 
@@ -596,13 +624,13 @@ fn run_build(
     source_archive: &NamedTempFile,
     endpoint: &Endpoint,
     token: Option<&str>,
-) -> io::Result<BuildResult> {
+) -> Result<BuildResult, BuildError> {
     let (client, url, send_auth) = match endpoint {
         Endpoint::Http { base } => (
             Client::builder()
                 .timeout(None)
                 .build()
-                .map_err(io::Error::other)?,
+                .map_err(|e| BuildError::Other(format!("failed to create client: {}", e)))?,
             format!("{base}/v1/builds"),
             true,
         ),
@@ -611,13 +639,15 @@ fn run_build(
                 .unix_socket(path.clone())
                 .timeout(None)
                 .build()
-                .map_err(io::Error::other)?;
+                .map_err(|e| BuildError::Other(format!("failed to create client: {}", e)))?;
             (client, "http://localhost/v1/builds".to_string(), false)
         }
     };
 
-    let metadata = serde_json::to_string(request).map_err(io::Error::other)?;
-    let source_part = Part::file(source_archive.path()).map_err(io::Error::other)?;
+    let metadata = serde_json::to_string(request)
+        .map_err(|e| BuildError::Other(format!("failed to serialize request: {}", e)))?;
+    let source_part = Part::file(source_archive.path())
+        .map_err(|e| BuildError::Other(format!("failed to read source archive: {}", e)))?;
     let form = Form::new()
         .part(
             "metadata",
@@ -632,11 +662,24 @@ fn run_build(
         }
     }
 
-    let response = builder.send().map_err(io::Error::other)?;
+    let response = match builder.send() {
+        Ok(resp) => resp,
+        Err(err) => {
+            // Check if this is a connection error
+            if err.is_connect() || err.is_timeout() {
+                return Err(BuildError::ConnectionFailed(format!(
+                    "cannot reach endpoint: {}",
+                    err
+                )));
+            }
+            return Err(BuildError::Other(format!("request failed: {}", err)));
+        }
+    };
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_else(|_| "".to_string());
-        return Err(io::Error::other(format!(
+        return Err(BuildError::Other(format!(
             "server returned {status}: {body}"
         )));
     }
@@ -644,7 +687,7 @@ fn run_build(
     read_responses(response)
 }
 
-fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResult> {
+fn read_responses(response: reqwest::blocking::Response) -> Result<BuildResult, BuildError> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut exit_code: Option<i32> = None;
@@ -653,7 +696,9 @@ fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResu
 
     loop {
         line.clear();
-        let bytes = reader.read_line(&mut line)?;
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|e| BuildError::Other(format!("failed to read response: {}", e)))?;
         if bytes == 0 {
             break;
         }
@@ -663,23 +708,33 @@ fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResu
             continue;
         }
 
-        let event: ResponseEvent = serde_json::from_str(trimmed).map_err(io::Error::other)?;
+        let event: ResponseEvent = serde_json::from_str(trimmed)
+            .map_err(|e| BuildError::Other(format!("invalid response format: {}", e)))?;
 
         match event {
             ResponseEvent::Stdout { data } => {
                 let mut stdout = io::stdout();
-                stdout.write_all(data.as_bytes())?;
-                stdout.flush()?;
+                stdout
+                    .write_all(data.as_bytes())
+                    .map_err(|e| BuildError::Other(format!("failed to write stdout: {}", e)))?;
+                stdout
+                    .flush()
+                    .map_err(|e| BuildError::Other(format!("failed to flush stdout: {}", e)))?;
             }
             ResponseEvent::Stderr { data } => {
                 let mut stderr = io::stderr();
-                stderr.write_all(data.as_bytes())?;
-                stderr.flush()?;
+                stderr
+                    .write_all(data.as_bytes())
+                    .map_err(|e| BuildError::Other(format!("failed to write stderr: {}", e)))?;
+                stderr
+                    .flush()
+                    .map_err(|e| BuildError::Other(format!("failed to flush stderr: {}", e)))?;
             }
             ResponseEvent::Error { message, .. } => {
                 if let Some(message) = message {
                     let mut stderr = io::stderr();
-                    writeln!(stderr, "{message}")?;
+                    writeln!(stderr, "{message}")
+                        .map_err(|e| BuildError::Other(format!("failed to write error: {}", e)))?;
                 }
             }
             ResponseEvent::Exit {
@@ -702,10 +757,7 @@ fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResu
             timed_out,
             artifacts,
         }),
-        None => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "missing exit event",
-        )),
+        None => Err(BuildError::Other("missing exit event".to_string())),
     }
 }
 

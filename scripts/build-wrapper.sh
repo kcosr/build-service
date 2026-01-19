@@ -7,7 +7,15 @@ config_file="config.toml"
 dir=$(pwd)
 while :; do
     if [ -f "$dir/$config_dir/$config_file" ]; then
-        exec build-cli "$cmd" "$@"
+        build-cli "$cmd" "$@"
+        exit_code=$?
+        # Exit code 127 means connection failed and local_fallback is enabled
+        # Fall through to execute local build tool
+        if [ $exit_code -ne 127 ]; then
+            exit $exit_code
+        fi
+        # If we get here, exit code was 127, fall back to local build
+        break
     fi
     if [ "$dir" = "/" ]; then
         break

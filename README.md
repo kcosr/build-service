@@ -87,6 +87,7 @@ exclude = ["**/*.tmp"]
 # endpoint = "unix:///run/build-service.sock"
 # endpoint = "https://build.example.com"
 # token = "..."
+# local_fallback = false  # if true, fall back to local build when endpoint is unreachable
 
 [request]
 # optional defaults
@@ -101,6 +102,7 @@ Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
 - The wrapper falls back to the local command when `.build-service/config.toml` is missing.
+- When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable (connection refused, timeout, etc.).
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
 - Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`.
@@ -214,7 +216,9 @@ ln -s /usr/local/bin/build-wrapper /usr/local/bin/cargo
 
 Ensure the real tools are still available later in `PATH` (for example in `/usr/bin`). The wrapper removes its own directory from `PATH` before falling back, so it will pick the system tool instead of re-invoking itself.
 
-The wrapper runs `build-cli` with the command name it was invoked as (for example `make` or `cargo`). If no repo-local config is found, it executes the local command instead.
+The wrapper runs `build-cli` with the command name it was invoked as (for example `make` or `cargo`). The wrapper falls back to the local command in two cases:
+1. No repo-local config (`.build-service/config.toml`) is found
+2. Config has `connection.local_fallback = true` and the build service endpoint is unreachable
 
 ## Logging
 
