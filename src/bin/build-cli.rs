@@ -301,12 +301,7 @@ impl LineLimiter {
         )?;
 
         if !self.tail_buffer.is_empty() {
-            writeln!(
-                writer,
-                "... last {} {} lines:",
-                self.tail_buffer.len(),
-                label
-            )?;
+            writeln!(writer, "last {} {} lines:", self.tail_buffer.len(), label)?;
             for line in &self.tail_buffer {
                 writer.write_all(line.as_bytes())?;
             }
@@ -1176,7 +1171,7 @@ mod tests {
         let rendered = String::from_utf8(output).unwrap();
         assert_eq!(
             rendered,
-            "one\ntwo\n... 2 more stdout lines suppressed\n... last 2 stdout lines:\nthree\nfour\n"
+            "one\ntwo\n... 2 more stdout lines suppressed\nlast 2 stdout lines:\nthree\nfour\n"
         );
     }
 
@@ -1192,7 +1187,7 @@ mod tests {
         let rendered = String::from_utf8(output).unwrap();
         assert_eq!(
             rendered,
-            "... 2 more stderr lines suppressed\n... last 1 stderr lines:\ntwo\n"
+            "... 2 more stderr lines suppressed\nlast 1 stderr lines:\ntwo\n"
         );
     }
 
