@@ -44,7 +44,7 @@ If your environment includes untrusted or semi-trusted workloads, consider addit
 - You run `make` (or another tool) through the wrapper (typically via a symlink so it is transparent); it looks for `.build-service/config.toml` up the tree.
 - If config exists, the wrapper execs `build-cli <tool> ...`; otherwise it falls back to the local tool.
 - `build-cli` applies `[sources]` include/exclude globs from the repo config, zips matching files, and posts `metadata` + `source.zip` to the endpoint.
-- The server validates the request, extracts into a temp workspace, and runs the allowlisted command.
+- The server validates the request, extracts into a workspace (ephemeral by default; reusable when requested), and runs the allowlisted command.
 - The client streams stdout/stderr from NDJSON; on success the server emits `artifacts.zip` info.
 - `build-cli` downloads and extracts `artifacts.zip` back into the repo root, using `[artifacts]` include/exclude globs to decide what the server packages.
 
@@ -57,6 +57,7 @@ Key fields:
 - `service.socket.*`: Unix socket enablement, path, group, mode.
 - `service.http.*`: HTTP enablement, listen address, auth, and optional TLS.
 - `build.workspace_root`: base directory for temp workspaces.
+- `build.workspace.*`: defaults and GC settings for reusable workspaces.
 - `build.max_upload_bytes`: max source upload size (default 128MB).
 - `build.max_extracted_bytes`: max total extracted source size (default 10x upload limit).
 - `build.run_as_user` / `build.run_as_group`: optional run-as user/group.
@@ -97,6 +98,13 @@ exclude = ["**/*.tmp"]
 CC = "clang"
 CFLAGS = "-O2 -g"
 
+[workspace]
+# reuse = true
+# id = "custom_id"
+# create = true
+# refresh = false
+# ttl_sec = 3600
+
 [output]
 # stdout_max_lines = 2000
 # stderr_max_lines = 1000
@@ -108,12 +116,15 @@ Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
 - Source include patterns that match nothing are skipped.
 - Output limits are optional; unset means unlimited, `0` disables output. Once reached, the CLI prints a `[build-service] suppressing <stream> output due to limits (increase output lines with BUILD_SERVICE_STDOUT_MAX_LINES/BUILD_SERVICE_STDERR_MAX_LINES)` notice and later summarizes suppressed lines.
+- When workspace reuse is enabled, the CLI reads `.build-service/workspace-id` if no workspace id is configured and writes it when the server returns `workspace_id`.
+- Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force a full resync of sources for the next build.
+- Set `BUILD_SERVICE_ENABLED=false` to force the wrapper to skip build-service and run the local tool.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
 - The wrapper falls back to the local command when `.build-service/config.toml` is missing.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
-- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`.
+- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
 
 ## Protocol
 
@@ -136,7 +147,8 @@ Metadata JSON:
   "cwd": "subdir",
   "timeout_sec": 600,
   "artifacts": {"include": ["out/**"], "exclude": []},
-  "env": {"CC": "clang"}
+  "env": {"CC": "clang"},
+  "workspace": {"reuse": true, "id": "custom_id", "create": true, "ttl_sec": 3600}
 }
 ```
 
@@ -148,10 +160,12 @@ Streamed as `application/x-ndjson` until exit.
 {"type":"stdout","data":"..."}
 {"type":"stderr","data":"..."}
 {"type":"exit","code":0,"timed_out":false,
+ "workspace_id":"custom_id",
  "artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":123456}}
 ```
 
 Artifact patterns that match no files are skipped (logged at info level). If no files match any pattern, `artifacts` is `null` in the exit event.
+For reuse builds, the exit event includes `workspace_id`; ephemeral builds omit it.
 
 ### Artifact Download
 `GET /v1/builds/{build_id}/artifacts.zip`

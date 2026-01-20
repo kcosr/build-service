@@ -31,6 +31,11 @@ workspace_root = "/var/lib/build-service/workspaces"
 max_upload_bytes = 134217728
 max_extracted_bytes = 1342177280
 
+[build.workspace]
+# default_ttl_sec = 7200
+# allow_permanent = false
+# gc_interval_sec = 3600
+
 [build.commands]
 make = "/usr/bin/make"
 

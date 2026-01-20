@@ -21,6 +21,8 @@ pub struct Request {
     pub artifacts: ArtifactSpec,
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceRequest>,
 }
 
 impl Request {
@@ -41,6 +43,20 @@ pub struct ArtifactSpec {
 pub struct ArtifactArchive {
     pub path: String,
     pub size: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceRequest {
+    #[serde(default)]
+    pub reuse: bool,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub create: Option<bool>,
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    #[serde(default)]
+    pub ttl_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +84,8 @@ pub enum ResponseEvent {
         timed_out: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         artifacts: Option<ArtifactArchive>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
     },
 }
 
@@ -86,6 +104,7 @@ mod tests {
             timeout_sec: None,
             artifacts: ArtifactSpec::default(),
             env: None,
+            workspace: None,
         };
         assert_eq!(request.schema_version_or_default(), "3");
     }

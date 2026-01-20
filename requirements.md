@@ -37,7 +37,7 @@
 Responsibilities:
 - Listen on HTTP (TCP) and/or HTTP-over-UDS.
 - Enforce command allowlist and timeouts.
-- Extract uploaded source into a temp workspace.
+- Extract uploaded source into a workspace (ephemeral by default, reusable when requested).
 - Execute build command and stream NDJSON output.
 - Collect artifacts into a single `artifacts.zip`.
 
@@ -96,6 +96,11 @@ workspace_root = "/var/lib/build-service/workspaces"
 max_upload_bytes = 134217728
 max_extracted_bytes = 1342177280
 
+[build.workspace]
+# default_ttl_sec = 7200
+# allow_permanent = false
+# gc_interval_sec = 3600
+
 [build.commands]
 make = "/usr/bin/make"
 
@@ -152,6 +157,13 @@ exclude = ["**/*.tmp"]
 CC = "clang"
 CFLAGS = "-O2 -g"
 
+[workspace]
+# reuse = true
+# id = "custom_id"
+# create = true
+# refresh = false
+# ttl_sec = 3600
+
 [output]
 # stdout_max_lines = 2000
 # stderr_max_lines = 1000
@@ -165,7 +177,8 @@ Notes:
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
-- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`.
+- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
+- Wrapper override: `BUILD_SERVICE_ENABLED=false` skips build-service and runs the local tool.
 - The wrapper falls back to the local command when `.build-service/config.toml` is missing.
 
 ## Protocol
@@ -189,7 +202,8 @@ Example metadata:
   "cwd": "subdir",
   "timeout_sec": 600,
   "artifacts": {"include": ["out/**"], "exclude": []},
-  "env": {"CC": "clang"}
+  "env": {"CC": "clang"},
+  "workspace": {"reuse": true, "id": "custom_id", "create": true, "ttl_sec": 3600}
 }
 ```
 
@@ -200,6 +214,7 @@ Example metadata:
 {"type":"stdout","data":"..."}
 {"type":"stderr","data":"..."}
 {"type":"exit","code":0,"timed_out":false,
+ "workspace_id":"custom_id",
  "artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":123456}}
 ```
 

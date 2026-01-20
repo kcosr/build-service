@@ -8,6 +8,7 @@ use build_service::artifacts::spawn_gc_task;
 use build_service::config::Config;
 use build_service::http;
 use build_service::logging::LoggingSettings;
+use build_service::workspace::{spawn_gc_task as spawn_workspace_gc_task, WorkspaceState};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Host-side build daemon")]
@@ -46,11 +47,17 @@ async fn main() -> ExitCode {
 
     tracing::info!("build-service starting");
 
+    let workspace_state = Arc::new(WorkspaceState::new(
+        config.build.workspace_root.clone(),
+        config.build.workspace.clone(),
+    ));
+
     spawn_gc_task(config.clone());
+    spawn_workspace_gc_task(Arc::clone(&workspace_state));
 
     let config = Arc::new(config);
 
-    if let Err(err) = http::run(config).await {
+    if let Err(err) = http::run(config, workspace_state).await {
         eprintln!("build-service failed: {err}");
         return ExitCode::from(1);
     }

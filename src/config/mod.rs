@@ -154,6 +154,21 @@ impl Config {
             ));
         }
 
+        if self.build.workspace.default_ttl_sec == 0 && !self.build.workspace.allow_permanent {
+            return Err(ConfigError::Invalid(
+                "build.workspace.default_ttl_sec must be > 0 unless allow_permanent is true"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(interval) = self.build.workspace.gc_interval_sec {
+            if interval == 0 {
+                return Err(ConfigError::Invalid(
+                    "build.workspace.gc_interval_sec must be greater than zero".to_string(),
+                ));
+            }
+        }
+
         if self.build.max_upload_bytes == 0 {
             return Err(ConfigError::Invalid(
                 "build.max_upload_bytes must be greater than zero".to_string(),
@@ -378,6 +393,9 @@ pub struct BuildConfig {
     pub workspace_root: PathBuf,
 
     #[serde(default)]
+    pub workspace: WorkspaceConfig,
+
+    #[serde(default)]
     pub run_as_user: Option<String>,
 
     #[serde(default)]
@@ -403,6 +421,7 @@ impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             workspace_root: default_workspace_root(),
+            workspace: WorkspaceConfig::default(),
             run_as_user: None,
             run_as_group: None,
             max_upload_bytes: default_max_upload_bytes(),
@@ -424,6 +443,32 @@ fn default_max_upload_bytes() -> u64 {
 
 fn default_max_extracted_bytes() -> u64 {
     DEFAULT_MAX_EXTRACTED_BYTES
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    #[serde(default = "default_workspace_ttl_sec")]
+    pub default_ttl_sec: u64,
+
+    #[serde(default)]
+    pub allow_permanent: bool,
+
+    #[serde(default)]
+    pub gc_interval_sec: Option<u64>,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_sec: default_workspace_ttl_sec(),
+            allow_permanent: false,
+            gc_interval_sec: None,
+        }
+    }
+}
+
+fn default_workspace_ttl_sec() -> u64 {
+    7200
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

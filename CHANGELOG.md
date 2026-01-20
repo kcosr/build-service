@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Workspace reuse support with optional client-supplied IDs and TTL-based GC.
 
 ## [0.2.0] - 2026-01-20
 

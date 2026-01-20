@@ -27,6 +27,7 @@ use crate::build::{execute_build, validate_request, CancellationFlag};
 use crate::config::{Config, HttpAuthConfig, SocketModeError};
 use crate::protocol::Request;
 use crate::user::UserError;
+use crate::workspace::{WorkspaceError, WorkspaceState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
@@ -50,6 +51,7 @@ pub enum HttpError {
 struct AppState {
     config: Arc<Config>,
     auth_required: bool,
+    workspace_state: Arc<WorkspaceState>,
 }
 
 #[derive(serde::Serialize)]
@@ -57,18 +59,21 @@ struct ErrorResponse {
     error: String,
 }
 
-pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
+pub async fn run(
+    config: Arc<Config>,
+    workspace_state: Arc<WorkspaceState>,
+) -> Result<(), HttpError> {
     match (config.service.http.enabled, config.service.socket.enabled) {
         (true, true) => {
-            let tcp = run_tcp(Arc::clone(&config));
-            let uds = run_uds(Arc::clone(&config));
+            let tcp = run_tcp(Arc::clone(&config), Arc::clone(&workspace_state));
+            let uds = run_uds(Arc::clone(&config), Arc::clone(&workspace_state));
             tokio::try_join!(tcp, uds)?;
         }
         (true, false) => {
-            run_tcp(config).await?;
+            run_tcp(config, workspace_state).await?;
         }
         (false, true) => {
-            run_uds(config).await?;
+            run_uds(config, workspace_state).await?;
         }
         (false, false) => {}
     }
@@ -76,7 +81,10 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     Ok(())
 }
 
-async fn run_tcp(config: Arc<Config>) -> Result<(), HttpError> {
+async fn run_tcp(
+    config: Arc<Config>,
+    workspace_state: Arc<WorkspaceState>,
+) -> Result<(), HttpError> {
     let addr: std::net::SocketAddr = config
         .service
         .http
@@ -87,6 +95,7 @@ async fn run_tcp(config: Arc<Config>) -> Result<(), HttpError> {
     let state = AppState {
         config: Arc::clone(&config),
         auth_required: config.service.http.auth.required,
+        workspace_state,
     };
     let app = build_router(state, config.build.max_upload_bytes);
 
@@ -106,11 +115,15 @@ async fn run_tcp(config: Arc<Config>) -> Result<(), HttpError> {
     Ok(())
 }
 
-async fn run_uds(config: Arc<Config>) -> Result<(), HttpError> {
+async fn run_uds(
+    config: Arc<Config>,
+    workspace_state: Arc<WorkspaceState>,
+) -> Result<(), HttpError> {
     let listener = setup_socket(&config)?;
     let state = AppState {
         config: Arc::clone(&config),
         auth_required: false,
+        workspace_state,
     };
     let app = build_router(state, config.build.max_upload_bytes);
 
@@ -254,8 +267,41 @@ async fn start_build(
         }
     };
 
+    let workspace_plan = match state.workspace_state.plan_request(&validated.request) {
+        Ok(plan) => plan,
+        Err(err) => {
+            let _ = std::fs::remove_file(&source);
+            return bad_request(&err.to_string());
+        }
+    };
+
+    if workspace_plan.reuse && workspace_plan.client_supplied && !workspace_plan.create {
+        let workspace_path = state.workspace_state.workspace_path(&workspace_plan.id);
+        if !workspace_path.is_dir() {
+            let _ = std::fs::remove_file(&source);
+            return bad_request("workspace not found");
+        }
+    }
+
+    let workspace_guard = if workspace_plan.reuse {
+        match state.workspace_state.try_acquire(&workspace_plan.id) {
+            Ok(guard) => Some(guard),
+            Err(WorkspaceError::Busy) => {
+                let _ = std::fs::remove_file(&source);
+                return conflict("workspace_busy");
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&source);
+                return bad_request(&err.to_string());
+            }
+        }
+    } else {
+        None
+    };
+
     let (tx, rx) = mpsc::channel(128);
     let config = Arc::clone(&state.config);
+    let workspace_state = Arc::clone(&state.workspace_state);
     let cancellation = CancellationFlag::default();
     let cancel_watch = cancellation.clone();
     let tx_watch = tx.clone();
@@ -263,7 +309,18 @@ async fn start_build(
         tx_watch.closed().await;
         cancel_watch.cancel();
     });
-    tokio::task::spawn_blocking(move || execute_build(validated, config, source, tx, cancellation));
+    tokio::task::spawn_blocking(move || {
+        execute_build(
+            validated,
+            config,
+            workspace_state,
+            workspace_plan,
+            source,
+            tx,
+            cancellation,
+            workspace_guard,
+        )
+    });
 
     let stream = ReceiverStream::new(rx).map(|event| {
         let line = match serde_json::to_string(&event) {
@@ -350,6 +407,128 @@ fn authorize(headers: &HeaderMap, auth: &HttpAuthConfig, enforce: bool) -> Optio
     None
 }
 
+fn setup_socket(config: &Config) -> Result<UnixListener, HttpError> {
+    let socket_path = &config.service.socket.path;
+
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if socket_path.exists() {
+        let meta = std::fs::symlink_metadata(socket_path)?;
+        if !meta.file_type().is_socket() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("socket path exists and is not a socket: {socket_path:?}"),
+            )
+            .into());
+        }
+        std::fs::remove_file(socket_path)?;
+    }
+
+    let old_umask = unsafe { libc::umask(0o077) };
+    let listener = UnixListener::bind(socket_path)?;
+    unsafe { libc::umask(old_umask) };
+
+    let gid = crate::user::lookup_group_gid(&config.service.socket.group)?;
+    apply_socket_permissions(socket_path, gid, config.service.socket.parse_mode()?)?;
+
+    Ok(listener)
+}
+
+fn apply_socket_permissions(path: &Path, gid: u32, mode: u32) -> io::Result<()> {
+    let gid_t = gid as libc::gid_t;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket path"))?;
+    let uid = !0 as libc::uid_t;
+    let ret = unsafe { libc::chown(c_path.as_ptr(), uid, gid_t) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let permissions = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, permissions)?;
+
+    Ok(())
+}
+
+fn build_tls_config(config: &Config) -> Result<axum_server::tls_rustls::RustlsConfig, HttpError> {
+    let tls = &config.service.http.tls;
+    let cert_path = tls
+        .cert_path
+        .as_ref()
+        .ok_or_else(|| HttpError::Tls("service.http.tls.cert_path must be set".to_string()))?;
+    let key_path = tls
+        .key_path
+        .as_ref()
+        .ok_or_else(|| HttpError::Tls("service.http.tls.key_path must be set".to_string()))?;
+
+    let mut certs = load_certs(cert_path).map_err(HttpError::Tls)?;
+    if let Some(ca_path) = &tls.ca_path {
+        let mut ca_certs = load_certs(ca_path).map_err(HttpError::Tls)?;
+        certs.append(&mut ca_certs);
+    }
+
+    let key = load_private_key(key_path).map_err(HttpError::Tls)?;
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| HttpError::Tls(err.to_string()))?;
+
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        Arc::new(server_config),
+    ))
+}
+
+fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    let mut reader = io::BufReader::new(std::fs::File::open(path).map_err(|err| err.to_string())?);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    if certs.is_empty() {
+        return Err("no certificates found".to_string());
+    }
+    Ok(certs)
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
+    let mut reader = io::BufReader::new(std::fs::File::open(path).map_err(|err| err.to_string())?);
+    let key = rustls_pemfile::private_key(&mut reader)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "no private key found".to_string())?;
+    Ok(key)
+}
+
+fn bad_request(message: &str) -> Response {
+    let body = Json(ErrorResponse {
+        error: message.to_string(),
+    });
+    (StatusCode::BAD_REQUEST, body).into_response()
+}
+
+fn conflict(message: &str) -> Response {
+    let body = Json(ErrorResponse {
+        error: message.to_string(),
+    });
+    (StatusCode::CONFLICT, body).into_response()
+}
+
+fn payload_too_large(message: &str) -> Response {
+    let body = Json(ErrorResponse {
+        error: message.to_string(),
+    });
+    (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
+}
+
+fn server_error(message: &str) -> Response {
+    error!("http handler error: {message}");
+    let body = Json(ErrorResponse {
+        error: "internal error".to_string(),
+    });
+    (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +604,7 @@ mod tests {
                     exclude: Vec::new(),
                 },
                 env: None,
+                workspace: None,
             };
 
             let client = Client::builder().timeout(None).build().expect("client");
@@ -513,6 +693,7 @@ mod tests {
                     exclude: Vec::new(),
                 },
                 env: None,
+                workspace: None,
             };
 
             let client = Client::builder()
@@ -674,9 +855,14 @@ echo "Build finished successfully"
 
     fn build_app(config: Config) -> Router {
         let max_upload_bytes = config.build.max_upload_bytes;
+        let workspace_state = Arc::new(WorkspaceState::new(
+            config.build.workspace_root.clone(),
+            config.build.workspace.clone(),
+        ));
         let state = AppState {
             config: Arc::new(config),
             auth_required: false,
+            workspace_state,
         };
         build_router(state, max_upload_bytes)
     }
@@ -826,6 +1012,7 @@ echo "Build finished successfully"
                 exclude: Vec::new(),
             },
             env: Some(HashMap::new()),
+            workspace: None,
         }
     }
 
@@ -850,119 +1037,4 @@ echo "Build finished successfully"
         zip.finish()?;
         Ok(temp)
     }
-}
-
-fn setup_socket(config: &Config) -> Result<UnixListener, HttpError> {
-    let socket_path = &config.service.socket.path;
-
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    if socket_path.exists() {
-        let meta = std::fs::symlink_metadata(socket_path)?;
-        if !meta.file_type().is_socket() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("socket path exists and is not a socket: {socket_path:?}"),
-            )
-            .into());
-        }
-        std::fs::remove_file(socket_path)?;
-    }
-
-    let old_umask = unsafe { libc::umask(0o077) };
-    let listener = UnixListener::bind(socket_path)?;
-    unsafe { libc::umask(old_umask) };
-
-    let gid = crate::user::lookup_group_gid(&config.service.socket.group)?;
-    apply_socket_permissions(socket_path, gid, config.service.socket.parse_mode()?)?;
-
-    Ok(listener)
-}
-
-fn apply_socket_permissions(path: &Path, gid: u32, mode: u32) -> io::Result<()> {
-    let gid_t = gid as libc::gid_t;
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket path"))?;
-    let uid = !0 as libc::uid_t;
-    let ret = unsafe { libc::chown(c_path.as_ptr(), uid, gid_t) };
-    if ret != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let permissions = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, permissions)?;
-
-    Ok(())
-}
-
-fn build_tls_config(config: &Config) -> Result<axum_server::tls_rustls::RustlsConfig, HttpError> {
-    let tls = &config.service.http.tls;
-    let cert_path = tls
-        .cert_path
-        .as_ref()
-        .ok_or_else(|| HttpError::Tls("service.http.tls.cert_path must be set".to_string()))?;
-    let key_path = tls
-        .key_path
-        .as_ref()
-        .ok_or_else(|| HttpError::Tls("service.http.tls.key_path must be set".to_string()))?;
-
-    let mut certs = load_certs(cert_path).map_err(HttpError::Tls)?;
-    if let Some(ca_path) = &tls.ca_path {
-        let mut ca_certs = load_certs(ca_path).map_err(HttpError::Tls)?;
-        certs.append(&mut ca_certs);
-    }
-
-    let key = load_private_key(key_path).map_err(HttpError::Tls)?;
-
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|err| HttpError::Tls(err.to_string()))?;
-
-    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
-        Arc::new(server_config),
-    ))
-}
-
-fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let mut reader = io::BufReader::new(std::fs::File::open(path).map_err(|err| err.to_string())?);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| err.to_string())?;
-    if certs.is_empty() {
-        return Err("no certificates found".to_string());
-    }
-    Ok(certs)
-}
-
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
-    let mut reader = io::BufReader::new(std::fs::File::open(path).map_err(|err| err.to_string())?);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|err| err.to_string())?
-        .ok_or_else(|| "no private key found".to_string())?;
-    Ok(key)
-}
-
-fn bad_request(message: &str) -> Response {
-    let body = Json(ErrorResponse {
-        error: message.to_string(),
-    });
-    (StatusCode::BAD_REQUEST, body).into_response()
-}
-
-fn payload_too_large(message: &str) -> Response {
-    let body = Json(ErrorResponse {
-        error: message.to_string(),
-    });
-    (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
-}
-
-fn server_error(message: &str) -> Response {
-    error!("http handler error: {message}");
-    let body = Json(ErrorResponse {
-        error: "internal error".to_string(),
-    });
-    (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
 }
