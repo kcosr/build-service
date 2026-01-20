@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,7 @@ use build_service::validation::{validate_relative_path, validate_relative_patter
 const DEFAULT_SOCKET_PATH: &str = "/run/build-service.sock";
 const CLIENT_CONFIG_DIR: &str = ".build-service";
 const CLIENT_CONFIG_FILE: &str = "config.toml";
+const CONNECTION_FALLBACK_EXIT_CODE: u8 = 222;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Client for the build-service daemon")]
@@ -78,6 +80,8 @@ struct ConnectionConfig {
     endpoint: Option<String>,
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    local_fallback: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -96,6 +100,56 @@ struct OutputConfig {
 enum Endpoint {
     Http { base: String },
     Unix { path: PathBuf },
+}
+
+#[derive(Debug)]
+enum BuildError {
+    ConnectionFailed(String),
+    Other(String),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::ConnectionFailed(msg) | BuildError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+fn connection_failure_exit_code(local_fallback: bool) -> u8 {
+    if local_fallback {
+        CONNECTION_FALLBACK_EXIT_CODE
+    } else {
+        1
+    }
+}
+
+fn is_connection_failure(err: &reqwest::Error) -> bool {
+    if err.is_connect() || err.is_timeout() {
+        return true;
+    }
+
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if let Some(io_err) = cause.downcast_ref::<io::Error>() {
+            match io_err.kind() {
+                io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::AddrNotAvailable
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::NotFound
+                | io::ErrorKind::PermissionDenied => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        source = cause.source();
+    }
+
+    false
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -382,10 +436,17 @@ fn main() -> ExitCode {
         &output_limits,
     ) {
         Ok(result) => result,
-        Err(err) => {
-            eprintln!("build request failed: {err}");
-            return ExitCode::from(1);
-        }
+        Err(err) => match err {
+            BuildError::ConnectionFailed(msg) => {
+                eprintln!("build request failed: {msg}");
+                let local_fallback = connection.map(|c| c.local_fallback).unwrap_or(false);
+                return ExitCode::from(connection_failure_exit_code(local_fallback));
+            }
+            BuildError::Other(msg) => {
+                eprintln!("build request failed: {msg}");
+                return ExitCode::from(1);
+            }
+        },
     };
 
     if build.exit_code != 0 {
@@ -804,13 +865,13 @@ fn run_build(
     endpoint: &Endpoint,
     token: Option<&str>,
     output_limits: &OutputLimits,
-) -> io::Result<BuildResult> {
+) -> Result<BuildResult, BuildError> {
     let (client, url, send_auth) = match endpoint {
         Endpoint::Http { base } => (
             Client::builder()
                 .timeout(None)
                 .build()
-                .map_err(io::Error::other)?,
+                .map_err(|err| BuildError::Other(format!("failed to create client: {err}")))?,
             format!("{base}/v1/builds"),
             true,
         ),
@@ -819,13 +880,15 @@ fn run_build(
                 .unix_socket(path.clone())
                 .timeout(None)
                 .build()
-                .map_err(io::Error::other)?;
+                .map_err(|err| BuildError::Other(format!("failed to create client: {err}")))?;
             (client, "http://localhost/v1/builds".to_string(), false)
         }
     };
 
-    let metadata = serde_json::to_string(request).map_err(io::Error::other)?;
-    let source_part = Part::file(source_archive.path()).map_err(io::Error::other)?;
+    let metadata = serde_json::to_string(request)
+        .map_err(|err| BuildError::Other(format!("failed to serialize request: {err}")))?;
+    let source_part = Part::file(source_archive.path())
+        .map_err(|err| BuildError::Other(format!("failed to read source archive: {err}")))?;
     let form = Form::new()
         .part(
             "metadata",
@@ -840,11 +903,22 @@ fn run_build(
         }
     }
 
-    let response = builder.send().map_err(io::Error::other)?;
+    let response = match builder.send() {
+        Ok(response) => response,
+        Err(err) => {
+            if is_connection_failure(&err) {
+                return Err(BuildError::ConnectionFailed(format!(
+                    "cannot reach endpoint: {err}"
+                )));
+            }
+            return Err(BuildError::Other(format!("request failed: {err}")));
+        }
+    };
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_else(|_| "".to_string());
-        return Err(io::Error::other(format!(
+        return Err(BuildError::Other(format!(
             "server returned {status}: {body}"
         )));
     }
@@ -855,7 +929,7 @@ fn run_build(
 fn read_responses(
     response: reqwest::blocking::Response,
     output_limits: &OutputLimits,
-) -> io::Result<BuildResult> {
+) -> Result<BuildResult, BuildError> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut exit_code: Option<i32> = None;
@@ -865,7 +939,9 @@ fn read_responses(
 
     loop {
         line.clear();
-        let bytes = reader.read_line(&mut line)?;
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|err| BuildError::Other(format!("failed to read response: {err}")))?;
         if bytes == 0 {
             break;
         }
@@ -875,19 +951,26 @@ fn read_responses(
             continue;
         }
 
-        let event: ResponseEvent = serde_json::from_str(trimmed).map_err(io::Error::other)?;
+        let event: ResponseEvent = serde_json::from_str(trimmed)
+            .map_err(|err| BuildError::Other(format!("invalid response format: {err}")))?;
 
         match event {
             ResponseEvent::Stdout { data } => {
-                output.write_stdout(&data)?;
+                output
+                    .write_stdout(&data)
+                    .map_err(|err| BuildError::Other(format!("failed to write stdout: {err}")))?;
             }
             ResponseEvent::Stderr { data } => {
-                output.write_stderr(&data)?;
+                output
+                    .write_stderr(&data)
+                    .map_err(|err| BuildError::Other(format!("failed to write stderr: {err}")))?;
             }
             ResponseEvent::Error { message, .. } => {
                 if let Some(message) = message {
                     let mut stderr = io::stderr();
-                    writeln!(stderr, "{message}")?;
+                    writeln!(stderr, "{message}").map_err(|err| {
+                        BuildError::Other(format!("failed to write error: {err}"))
+                    })?;
                 }
             }
             ResponseEvent::Exit {
@@ -904,7 +987,9 @@ fn read_responses(
         }
     }
 
-    output.finish()?;
+    output
+        .finish()
+        .map_err(|err| BuildError::Other(format!("failed to flush output: {err}")))?;
 
     match exit_code {
         Some(code) => Ok(BuildResult {
@@ -912,10 +997,7 @@ fn read_responses(
             timed_out,
             artifacts,
         }),
-        None => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "missing exit event",
-        )),
+        None => Err(BuildError::Other("missing exit event".to_string())),
     }
 }
 
@@ -1044,7 +1126,9 @@ fn normalize_exit_code(code: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[test]
     fn normalize_exit_code_clamps() {
@@ -1052,6 +1136,29 @@ mod tests {
         assert_eq!(normalize_exit_code(0), 0);
         assert_eq!(normalize_exit_code(255), 255);
         assert_eq!(normalize_exit_code(300), 255);
+    }
+
+    #[test]
+    fn connection_failure_exit_code_respects_fallback() {
+        assert_eq!(
+            connection_failure_exit_code(true),
+            CONNECTION_FALLBACK_EXIT_CODE
+        );
+        assert_eq!(connection_failure_exit_code(false), 1);
+    }
+
+    #[test]
+    fn is_connection_failure_detects_refused_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let err = client.get(format!("http://{addr}")).send().unwrap_err();
+        assert!(is_connection_failure(&err));
     }
 
     #[test]

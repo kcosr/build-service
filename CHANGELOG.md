@@ -5,6 +5,7 @@
 ### Added
 - Add client-configured stdout/stderr line limits with optional tail summaries ([#???](https://github.com/kcosr/build-service/pull/???)).
 - Cancel builds when clients disconnect from the output stream ([#???](https://github.com/kcosr/build-service/pull/???)).
+- Return a fallback exit code when `connection.local_fallback` is enabled and the endpoint is unreachable ([#???](https://github.com/kcosr/build-service/pull/???)).
 
 ## [0.1.1] - 2026-01-18
 
