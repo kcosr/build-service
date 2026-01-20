@@ -6,3 +6,4 @@ pub mod logging;
 pub mod protocol;
 pub mod user;
 pub mod validation;
+pub mod workspace;

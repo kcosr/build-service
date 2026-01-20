@@ -15,6 +15,7 @@ use crate::protocol::{ArtifactArchive, ArtifactSpec};
 use crate::validation::validate_relative_pattern;
 
 const DEFAULT_GC_INTERVAL_SECS: u64 = 3600;
+const INTERNAL_EXCLUDE_PATTERN: &str = ".build-service/**";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactError {
@@ -63,7 +64,9 @@ pub fn collect_artifacts_zip(
         source,
     })?;
 
-    let exclude_patterns = compile_patterns(&spec.exclude)?;
+    let mut excludes = spec.exclude.clone();
+    excludes.push(INTERNAL_EXCLUDE_PATTERN.to_string());
+    let exclude_patterns = compile_patterns(&excludes)?;
     let mut matched_files: HashMap<PathBuf, PathBuf> = HashMap::new();
 
     for pattern in &spec.include {

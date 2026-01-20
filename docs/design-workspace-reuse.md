@@ -1,121 +1,141 @@
-# Workspace Reuse Design
+# Workspace Reuse (Concise Design)
 
-## Overview
+## Goal
+Reuse build workspaces across runs to enable incremental builds while keeping the default behavior unchanged.
 
-Currently each build creates a fresh workspace directory, extracts sources, builds, and deletes the workspace. This means every build starts from scratch.
-
-This feature would allow reusing workspace directories across builds to enable incremental builds.
-
-## Flow
-
-### First build from a checkout
-
-1. Client checks `.build-service/workspace-id` - doesn't exist
-2. Client packages sources, sends request without `workspace_id`
-3. Server creates `ws_<uuid>` workspace, extracts sources
-4. Server runs build, collects artifacts
-5. Server returns `workspace_id` in response
-6. Client saves workspace_id to `.build-service/workspace-id`
-
-### Subsequent builds from same checkout
-
-1. Client reads `.build-service/workspace-id` → e.g., `ws_abc123`
-2. Client packages sources, sends request with `workspace_id=ws_abc123`
-3. Server checks if workspace exists and not expired:
-   - **Yes**: Sync sources (delete removed files, extract zip over existing)
-   - **No**: Create new workspace, extract fresh
-4. Server runs build, collects artifacts
-5. Server returns `workspace_id` (same or new if recreated)
-6. Client updates `.build-service/workspace-id` if changed
-
-## Source Sync Strategy
-
-- Server tracks file list from last extraction in a separate metadata directory (not in workspace, to avoid it being pulled back as an artifact)
-- On new build with existing workspace:
-  1. Compare file list from new zip to stored list
-  2. Delete files that are no longer in the zip
-  3. Extract new zip (overwrites existing, adds new)
-- No hashes needed - the zip is the source of truth
-
-## Protocol Changes
-
-### Request
-
-New optional field:
-
-```json
-{
-  "workspace_id": "ws_abc123",
-  "command": "make",
-  ...
-}
-```
-
-### Exit Event
-
-New field in exit event:
-
-```json
-{
-  "type": "exit",
-  "code": 0,
-  "workspace_id": "ws_abc123",
-  "artifacts": { ... }
-}
-```
-
-## Configuration
-
-### Server config
-
-```toml
-[build]
-# TTL for workspace reuse. 0 = no reuse (current behavior)
-workspace_ttl_sec = 28800  # 8 hours default
-```
-
-### Client file
-
-```
-.build-service/workspace-id
-```
-
-Contents: just the workspace ID string, e.g., `ws_abc123`
-
-This file should be added to `.gitignore` so each checkout maintains its own workspace identity.
+## Key Decisions
+- **IDs:** `ws_<uuid>` for server-generated workspace directories, `bld_<uuid>` for build runs/artifacts.
+- **Source handling:** Always extract sources into the workspace. Reuse does not clean old files. A manifest lets the server skip rewriting unchanged files; `refresh` forces a full resync.
+- **Workspace metadata:** Only for reusable workspaces; stored inside `.build-service/` in the workspace (metadata + manifest).
+- **Ephemeral builds:** No metadata written; workspace deleted after build.
+- **Client control:** Reuse is enabled via client config/env; no CLI flags.
+- **TTL:** Server has a **default TTL**; client may override per request. No max TTL.
+- **Permanent workspaces:** `ttl_sec = 0` if server allows it.
+- **Client-supplied IDs:** Supported with an explicit `create` flag and must match `^[A-Za-z0-9_-]+$` (no required prefix). No tenancy; any client can reuse any ID.
 
 ## Storage Layout
-
 ```
-/var/build-service/
-├── workspaces/
-│   └── builds/           # Temporary builds (current behavior when no reuse)
-│       └── bld_xxx/
-├── persistent/           # Reusable workspaces
-│   └── ws_abc123/
-│       └── <extracted sources and build outputs>
-├── workspace-meta/       # Metadata separate from workspaces
-│   └── ws_abc123/
-│       ├── file-list.txt # List of files from last extraction
-│       └── last-used     # Timestamp for TTL
-└── artifacts/
-    └── bld_xxx/
-        └── artifacts.zip
+<data_root>/workspaces/
+├── <workspace_id>/
+│   ├── .build-service/meta.json
+│   └── .build-service/manifest.json
+└── <workspace_id>/
+    ├── .build-service/meta.json
+    └── .build-service/manifest.json
+
+<artifacts_root>/bld_<uuid>/artifacts.zip
 ```
 
-## Cleanup
+## Metadata (persistent workspaces only)
+Path: `<workspace_dir>/.build-service/meta.json`
+```json
+{
+  "workspace_id": "<workspace_id>",
+  "ttl_sec": 7200,
+  "last_used": "2026-01-20T06:20:12Z"
+}
+```
 
-- GC runs periodically (like artifact GC)
-- Deletes workspaces where `last-used` timestamp exceeds TTL
-- Configurable via `build.workspace_ttl_sec`
+Path: `<workspace_dir>/.build-service/manifest.json`
+```json
+{
+  "version": 1,
+  "entries": {"src/lib.rs": {"size": 123, "hash": "<blake3>"}}
+}
+```
 
-## Edge Cases
+Server must ignore `.build-service/**` from the source zip and exclude it from artifacts.
 
-1. **Workspace deleted by GC mid-session**: Server creates new workspace, returns new ID
-2. **Concurrent builds to same workspace**: Need locking or reject with error
-3. **Disk space**: May need max workspace count/size limits in addition to TTL
+## Request/Response
+### Request
+```json
+{
+  "workspace": {
+    "reuse": true,
+    "id": "custom_id",        // optional
+    "create": true,           // optional, only used with id
+    "refresh": false,         // optional
+    "ttl_sec": 3600           // optional, 0 = permanent
+  },
+  "command": "make",
+  "args": ["-j4"]
+}
+```
 
-## Not in Scope
+### Response (NDJSON)
+```
+{"type":"build","id":"bld_<uuid>","status":"started"}
+{"type":"exit","code":0,"workspace_id":"<workspace_id>","artifacts":{"path":"/v1/builds/bld_<uuid>/artifacts.zip","size":123}}
+```
+Note: For ephemeral builds, omit `workspace_id` in the exit event.
 
-- `make clean` does not have special handling - it just runs in the workspace like any other command
-- No explicit "delete workspace" command (TTL handles cleanup)
+## Server Behavior
+### Ephemeral build (no workspace block)
+1. Generate `ws_<uuid>` and `bld_<uuid>`.
+2. Create `<data_root>/workspaces/ws_<uuid>`.
+3. Extract sources (always).
+4. Run build in workspace.
+5. Collect artifacts under `bld_<uuid>`.
+6. **Delete workspace dir.** No metadata or manifest.
+
+### Reuse enabled, no workspace id
+1. Generate `ws_<uuid>` and `bld_<uuid>`.
+2. Create workspace dir + `.build-service/`.
+3. Extract sources (always). Use `manifest.json` to skip rewriting unchanged files unless `refresh` is set.
+4. Run build; collect artifacts.
+5. Write/update `meta.json` with TTL/last_used; write `manifest.json`.
+6. **Keep workspace dir.**
+
+### Reuse enabled, id provided
+- If workspace exists: reuse it, extract sources, update metadata.
+- If missing:
+  - `create=true` → create new workspace with provided id.
+  - `create=false` or absent → **reject request**.
+
+### Concurrency (workspace lock)
+- A workspace may only have **one active build** at a time.
+- Server tracks an `active` flag in memory for each `workspace_id`.
+- If a build request arrives for a workspace with `active=true`, reject with `409 workspace_busy`.
+- `active` is set when build starts and cleared in a `finally`/drop guard on completion or error.
+- On server startup, all workspaces default to `active=false` (no running builds).
+- This design assumes a **single server instance**.
+
+## TTL Rules (server)
+- If client provides `ttl_sec`: use exactly that value.
+- If not provided: use server `default_ttl_sec`.
+- `ttl_sec = 0` → permanent (only if `allow_permanent = true`).
+
+## Client Behavior
+### Config
+```toml
+[workspace]
+reuse = true
+id = "custom_id"        # optional
+create = true           # optional
+refresh = false         # optional
+
+# optional default
+# ttl_sec = 3600
+```
+
+### Env overrides
+```
+BUILD_SERVICE_WORKSPACE_REUSE=true
+BUILD_SERVICE_WORKSPACE_ID=custom_id
+BUILD_SERVICE_WORKSPACE_CREATE=true
+BUILD_SERVICE_WORKSPACE_REFRESH=true
+BUILD_SERVICE_WORKSPACE_TTL=3600
+```
+
+### Workspace id file
+- `.build-service/workspace-id`
+- Only read when reuse is enabled.
+- Stored from exit event when server returns `workspace_id`.
+
+## Open Items
+- None.
+
+## Persistence Across Restarts
+- Workspace state is persisted via `<workspace_dir>/.build-service/meta.json`.
+- On startup, the server scans `<data_root>/workspaces/*` and loads any `meta.json` it finds.
+- GC and reuse checks rely on this metadata, so workspaces survive restarts.

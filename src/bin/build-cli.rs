@@ -15,9 +15,10 @@ use zip::write::FileOptions;
 use zip::ZipWriter;
 
 use build_service::protocol::{
-    ArtifactArchive, ArtifactSpec, Request, ResponseEvent, SCHEMA_VERSION,
+    ArtifactArchive, ArtifactSpec, Request, ResponseEvent, WorkspaceRequest, SCHEMA_VERSION,
 };
 use build_service::validation::{validate_relative_path, validate_relative_pattern};
+use build_service::workspace::is_valid_workspace_id;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/build-service.sock";
 const CLIENT_CONFIG_DIR: &str = ".build-service";
@@ -26,6 +27,11 @@ const CONNECTION_FALLBACK_EXIT_CODE: u8 = 222;
 const OUTPUT_PREFIX: &str = "[build-service]";
 const STDOUT_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDOUT_MAX_LINES";
 const STDERR_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDERR_MAX_LINES";
+const WORKSPACE_REUSE_ENV: &str = "BUILD_SERVICE_WORKSPACE_REUSE";
+const WORKSPACE_ID_ENV: &str = "BUILD_SERVICE_WORKSPACE_ID";
+const WORKSPACE_CREATE_ENV: &str = "BUILD_SERVICE_WORKSPACE_CREATE";
+const WORKSPACE_REFRESH_ENV: &str = "BUILD_SERVICE_WORKSPACE_REFRESH";
+const WORKSPACE_TTL_ENV: &str = "BUILD_SERVICE_WORKSPACE_TTL";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Client for the build-service daemon")]
@@ -59,6 +65,8 @@ struct ClientConfig {
     connection: Option<ConnectionConfig>,
     #[serde(default)]
     output: Option<OutputConfig>,
+    #[serde(default)]
+    workspace: Option<WorkspaceConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -97,6 +105,20 @@ struct OutputConfig {
     stdout_tail_lines: usize,
     #[serde(default)]
     stderr_tail_lines: usize,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WorkspaceConfig {
+    #[serde(default)]
+    reuse: bool,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    create: bool,
+    #[serde(default)]
+    refresh: bool,
+    #[serde(default)]
+    ttl_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -463,6 +485,14 @@ fn main() -> ExitCode {
         }
     };
 
+    let workspace = match resolve_workspace_config(client_config.workspace.as_ref(), &repo_root) {
+        Ok(workspace) => workspace,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+
     let request = Request {
         schema_version: Some(SCHEMA_VERSION.to_string()),
         request_id: args.request_id,
@@ -472,6 +502,7 @@ fn main() -> ExitCode {
         timeout_sec,
         artifacts,
         env,
+        workspace,
     };
 
     let connection = client_config.connection.as_ref();
@@ -511,6 +542,12 @@ fn main() -> ExitCode {
             }
         },
     };
+
+    if let Some(workspace_id) = &build.workspace_id {
+        if let Err(err) = write_workspace_id_file(&repo_root, workspace_id) {
+            eprintln!("failed to write workspace-id: {err}");
+        }
+    }
 
     if build.exit_code != 0 {
         return to_exit_code(build.exit_code, build.timed_out);
@@ -905,10 +942,156 @@ fn resolve_token(explicit: Option<String>, config: Option<&ConnectionConfig>) ->
     None
 }
 
+fn parse_env_bool(name: &str) -> io::Result<Option<bool>> {
+    let value = match env::var(name) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be true or false"),
+        ));
+    }
+
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(Some(true)),
+        "false" | "0" => Ok(Some(false)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be true or false"),
+        )),
+    }
+}
+
+fn parse_env_u64(name: &str) -> io::Result<Option<u64>> {
+    let value = match env::var(name) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be a non-negative integer"),
+        ));
+    }
+
+    let parsed: u64 = trimmed.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be a non-negative integer, got {trimmed}"),
+        )
+    })?;
+    Ok(Some(parsed))
+}
+
+fn resolve_workspace_config(
+    config: Option<&WorkspaceConfig>,
+    repo_root: &Path,
+) -> io::Result<Option<WorkspaceRequest>> {
+    let reuse = if let Some(value) = parse_env_bool(WORKSPACE_REUSE_ENV)? {
+        value
+    } else {
+        config.map(|cfg| cfg.reuse).unwrap_or(false)
+    };
+
+    if !reuse {
+        return Ok(None);
+    }
+
+    let env_id = env::var(WORKSPACE_ID_ENV).ok().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let config_id = config.and_then(|cfg| cfg.id.as_ref().map(|id| id.trim().to_string()));
+    let mut id = env_id.or(config_id);
+
+    let create = if let Some(value) = parse_env_bool(WORKSPACE_CREATE_ENV)? {
+        value
+    } else {
+        config.map(|cfg| cfg.create).unwrap_or(false)
+    };
+
+    let refresh = if let Some(value) = parse_env_bool(WORKSPACE_REFRESH_ENV)? {
+        value
+    } else {
+        config.map(|cfg| cfg.refresh).unwrap_or(false)
+    };
+
+    let ttl_sec = if let Some(value) = parse_env_u64(WORKSPACE_TTL_ENV)? {
+        Some(value)
+    } else {
+        config.and_then(|cfg| cfg.ttl_sec)
+    };
+
+    if id.is_none() {
+        id = read_workspace_id_file(repo_root)?;
+    }
+
+    if create && id.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace.create requires workspace.id",
+        ));
+    }
+
+    if let Some(ref id) = id {
+        if !is_valid_workspace_id(id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace.id must match [A-Za-z0-9_-]+",
+            ));
+        }
+    }
+
+    Ok(Some(WorkspaceRequest {
+        reuse,
+        id,
+        create: if create { Some(true) } else { None },
+        refresh: if refresh { Some(true) } else { None },
+        ttl_sec,
+    }))
+}
+
+fn read_workspace_id_file(repo_root: &Path) -> io::Result<Option<String>> {
+    let path = repo_root.join(CLIENT_CONFIG_DIR).join("workspace-id");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace-id file is empty",
+        ));
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+fn write_workspace_id_file(repo_root: &Path, workspace_id: &str) -> io::Result<()> {
+    let dir = repo_root.join(CLIENT_CONFIG_DIR);
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("workspace-id"), format!("{workspace_id}\n"))?;
+    Ok(())
+}
+
 struct BuildResult {
     exit_code: i32,
     timed_out: bool,
     artifacts: Option<ArtifactArchive>,
+    workspace_id: Option<String>,
 }
 
 fn run_build(
@@ -987,6 +1170,7 @@ fn read_responses(
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
     let mut artifacts: Option<ArtifactArchive> = None;
+    let mut workspace_id: Option<String> = None;
     let mut output = OutputLimiter::new(*output_limits);
 
     loop {
@@ -1029,10 +1213,12 @@ fn read_responses(
                 code,
                 timed_out: timed,
                 artifacts: event_artifacts,
+                workspace_id: event_workspace_id,
             } => {
                 exit_code = Some(code);
                 timed_out = timed;
                 artifacts = event_artifacts;
+                workspace_id = event_workspace_id;
                 break;
             }
             ResponseEvent::Build { .. } => {}
@@ -1048,6 +1234,7 @@ fn read_responses(
             exit_code: code,
             timed_out,
             artifacts,
+            workspace_id,
         }),
         None => Err(BuildError::Other("missing exit event".to_string())),
     }
@@ -1233,7 +1420,7 @@ mod tests {
         let archive = build_source_archive(root, &patterns).expect("archive");
         let file = fs::File::open(archive.path()).expect("open zip");
         let archive = ZipArchive::new(file).expect("read zip");
-        assert!(archive.len() > 0, "archive should have entries");
+        assert!(!archive.is_empty(), "archive should have entries");
     }
 
     #[test]

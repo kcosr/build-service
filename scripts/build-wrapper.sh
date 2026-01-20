@@ -3,10 +3,20 @@
 cmd=$(basename -- "$0")
 config_dir=".build-service"
 config_file="config.toml"
+enabled_env=${BUILD_SERVICE_ENABLED-}
+disabled="false"
+if [ -n "${BUILD_SERVICE_ENABLED+x}" ]; then
+    lower=$(printf '%s' "$enabled_env" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+        ""|0|false|no|off)
+            disabled="true"
+            ;;
+    esac
+fi
 
 dir=$(pwd)
 while :; do
-    if [ -f "$dir/$config_dir/$config_file" ]; then
+    if [ "$disabled" != "true" ] && [ -f "$dir/$config_dir/$config_file" ]; then
         build-cli "$cmd" "$@"
         exit_code=$?
         # Exit code 222 means connection failed and local_fallback is enabled

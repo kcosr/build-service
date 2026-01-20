@@ -11,6 +11,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use blake3::Hasher;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -22,10 +24,12 @@ use crate::user::{lookup_group_gid, lookup_user, lookup_user_by_name, UserInfo};
 use crate::validation::{
     validate_cwd, validate_make_args, validate_relative_path, ValidationError,
 };
+use crate::workspace::{WorkspaceGuard, WorkspacePlan, WorkspaceState};
 
 const TIMEOUT_EXIT_CODE: i32 = 124;
 const TIMEOUT_KILL_GRACE_SECS: u64 = 5;
 const OUTPUT_CHUNK_SIZE: usize = 4096;
+const WORKSPACE_MANIFEST_FILE: &str = "manifest.json";
 
 #[derive(Clone, Default)]
 pub struct CancellationFlag(Arc<AtomicBool>);
@@ -163,14 +167,33 @@ pub fn validate_request(request: Request, config: &Config) -> Result<ValidatedRe
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_build(
     validated: ValidatedRequest,
     config: std::sync::Arc<Config>,
+    workspace_state: Arc<WorkspaceState>,
+    workspace_plan: WorkspacePlan,
     source_archive: PathBuf,
     sender: Sender<ResponseEvent>,
     cancellation: CancellationFlag,
+    workspace_guard: Option<WorkspaceGuard>,
 ) {
-    if let Err(err) = run_build(validated, &config, &source_archive, &sender, &cancellation) {
+    let _workspace_guard = workspace_guard;
+    let workspace_id = if workspace_plan.reuse {
+        Some(workspace_plan.id.clone())
+    } else {
+        None
+    };
+
+    if let Err(err) = run_build(
+        validated,
+        &config,
+        &workspace_state,
+        &workspace_plan,
+        &source_archive,
+        &sender,
+        &cancellation,
+    ) {
         let _ = sender.blocking_send(ResponseEvent::Error {
             code: err.code.to_string(),
             message: Some(err.message),
@@ -180,6 +203,7 @@ pub fn execute_build(
             code: 1,
             timed_out: false,
             artifacts: None,
+            workspace_id,
         });
     }
 
@@ -194,6 +218,8 @@ pub fn execute_build(
 fn run_build(
     validated: ValidatedRequest,
     config: &Config,
+    workspace_state: &WorkspaceState,
+    workspace_plan: &WorkspacePlan,
     source_archive: &Path,
     sender: &Sender<ResponseEvent>,
     cancellation: &CancellationFlag,
@@ -209,32 +235,47 @@ fn run_build(
 
     let run_as = resolve_run_as(config)?;
 
-    let workspace = prepare_workspace(config, &build_id, source_archive)?;
+    let workspace = prepare_workspace(config, workspace_state, workspace_plan, source_archive)?;
     let cleanup_path = workspace.clone();
 
+    let workspace_id = if workspace_plan.reuse {
+        Some(workspace_plan.id.as_str())
+    } else {
+        None
+    };
     let result = run_build_in_workspace(
         &validated,
         config,
         &run_as,
         &workspace,
         &build_id,
+        workspace_id,
         sender,
         cancellation,
     );
 
-    if let Err(err) = std::fs::remove_dir_all(&cleanup_path) {
+    if workspace_plan.reuse {
+        if let Err(err) = workspace_state.record_use(workspace_plan) {
+            warn!(
+                "failed to update workspace metadata {:?}: {err}",
+                workspace_plan.id
+            );
+        }
+    } else if let Err(err) = std::fs::remove_dir_all(&cleanup_path) {
         warn!("failed to cleanup workspace {:?}: {err}", cleanup_path);
     }
 
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_build_in_workspace(
     validated: &ValidatedRequest,
     config: &Config,
     run_as: &RunAs,
     workspace_root: &Path,
     build_id: &str,
+    workspace_id: Option<&str>,
     sender: &Sender<ResponseEvent>,
     cancellation: &CancellationFlag,
 ) -> Result<(), BuildError> {
@@ -347,6 +388,7 @@ fn run_build_in_workspace(
                 code: exit_code,
                 timed_out,
                 artifacts: None,
+                workspace_id: workspace_id.map(|id| id.to_string()),
             })
             .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
         return Ok(());
@@ -373,6 +415,7 @@ fn run_build_in_workspace(
                     code: 1,
                     timed_out: false,
                     artifacts: None,
+                    workspace_id: workspace_id.map(|id| id.to_string()),
                 })
                 .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
             return Ok(());
@@ -384,6 +427,7 @@ fn run_build_in_workspace(
             code: exit_code,
             timed_out,
             artifacts,
+            workspace_id: workspace_id.map(|id| id.to_string()),
         })
         .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
 
@@ -420,29 +464,70 @@ fn map_artifact_error(err: ArtifactError) -> BuildError {
 
 fn prepare_workspace(
     config: &Config,
-    build_id: &str,
+    workspace_state: &WorkspaceState,
+    plan: &WorkspacePlan,
     source_archive: &Path,
 ) -> Result<PathBuf, BuildError> {
-    let workspace_root = config.build.workspace_root.join("builds");
-    std::fs::create_dir_all(&workspace_root).map_err(|err| {
+    std::fs::create_dir_all(&config.build.workspace_root).map_err(|err| {
         BuildError::new(
             "workspace_create_failed",
             format!("failed to create workspace root: {err}"),
         )
     })?;
 
-    let workspace = workspace_root.join(build_id);
-    std::fs::create_dir_all(&workspace).map_err(|err| {
-        BuildError::new(
-            "workspace_create_failed",
-            format!("failed to create workspace: {err}"),
-        )
-    })?;
+    let workspace = workspace_state.workspace_path(&plan.id);
+    let existed = workspace.exists();
 
-    if let Err(err) =
-        extract_source_archive(source_archive, &workspace, config.build.max_extracted_bytes)
-    {
-        let _ = std::fs::remove_dir_all(&workspace);
+    if existed && !workspace.is_dir() {
+        return Err(BuildError::new(
+            "workspace_not_directory",
+            "workspace path exists but is not a directory",
+        ));
+    }
+
+    if !plan.reuse && existed {
+        return Err(BuildError::new(
+            "workspace_exists",
+            "workspace already exists",
+        ));
+    }
+
+    if plan.reuse && plan.client_supplied && !plan.create && !existed {
+        return Err(BuildError::new(
+            "workspace_not_found",
+            "workspace not found",
+        ));
+    }
+
+    if !existed {
+        std::fs::create_dir_all(&workspace).map_err(|err| {
+            BuildError::new(
+                "workspace_create_failed",
+                format!("failed to create workspace: {err}"),
+            )
+        })?;
+    }
+
+    if plan.reuse {
+        let meta_dir = workspace.join(".build-service");
+        std::fs::create_dir_all(&meta_dir).map_err(|err| {
+            BuildError::new(
+                "workspace_create_failed",
+                format!("failed to create workspace metadata dir: {err}"),
+            )
+        })?;
+    }
+
+    if let Err(err) = extract_source_archive(
+        source_archive,
+        &workspace,
+        config.build.max_extracted_bytes,
+        plan.reuse,
+        plan.refresh,
+    ) {
+        if !plan.reuse {
+            let _ = std::fs::remove_dir_all(&workspace);
+        }
         return Err(err);
     }
 
@@ -453,6 +538,8 @@ fn extract_source_archive(
     source_archive: &Path,
     dest: &Path,
     max_extracted_bytes: u64,
+    use_manifest: bool,
+    refresh: bool,
 ) -> Result<(), BuildError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -469,6 +556,13 @@ fn extract_source_archive(
         )
     })?;
 
+    let mut manifest = if use_manifest {
+        load_workspace_manifest(dest)
+    } else {
+        WorkspaceManifest::default()
+    };
+    let mut manifest_dirty = false;
+
     let mut extracted_bytes = 0u64;
     let mut buffer = vec![0u8; 8192];
 
@@ -484,8 +578,14 @@ fn extract_source_archive(
             ));
         };
 
+        if is_internal_build_service_path(enclosed) {
+            continue;
+        }
+
         let out_path = dest.join(enclosed);
         let unix_mode = file.unix_mode();
+        let entry_size = file.size();
+        let rel_path = enclosed.to_string_lossy().replace('\\', "/");
 
         if file.is_dir() {
             std::fs::create_dir_all(&out_path)
@@ -498,40 +598,221 @@ fn extract_source_archive(
                 .map_err(|err| BuildError::new("source_archive", format!("mkdir failed: {err}")))?;
         }
 
-        let mut outfile = std::fs::File::create(&out_path).map_err(|err| {
-            BuildError::new("source_archive", format!("create file failed: {err}"))
-        })?;
-        loop {
-            let bytes = file.read(&mut buffer).map_err(|err| {
-                BuildError::new("source_archive", format!("read zip entry failed: {err}"))
-            })?;
-            if bytes == 0 {
-                break;
+        let maybe_entry = manifest.entries.get(&rel_path);
+        let should_compare = use_manifest
+            && !refresh
+            && out_path.exists()
+            && maybe_entry
+                .map(|entry| entry.size == entry_size)
+                .unwrap_or(false);
+
+        if should_compare {
+            let parent = out_path.parent().unwrap_or(dest);
+            let mut temp = tempfile::Builder::new()
+                .prefix(".build-service-tmp-")
+                .tempfile_in(parent)
+                .map_err(|err| {
+                    BuildError::new("source_archive", format!("tempfile failed: {err}"))
+                })?;
+            let mut hasher = Hasher::new();
+
+            loop {
+                let bytes = file.read(&mut buffer).map_err(|err| {
+                    BuildError::new("source_archive", format!("read zip entry failed: {err}"))
+                })?;
+                if bytes == 0 {
+                    break;
+                }
+
+                extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
+                if extracted_bytes > max_extracted_bytes {
+                    return Err(BuildError::new(
+                        "source_archive",
+                        format!(
+                            "extracted size exceeds max_extracted_bytes ({max_extracted_bytes} bytes)"
+                        ),
+                    ));
+                }
+
+                hasher.update(&buffer[..bytes]);
+                temp.write_all(&buffer[..bytes]).map_err(|err| {
+                    BuildError::new("source_archive", format!("write file failed: {err}"))
+                })?;
             }
 
-            extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
-            if extracted_bytes > max_extracted_bytes {
-                return Err(BuildError::new(
-                    "source_archive",
-                    format!(
-                        "extracted size exceeds max_extracted_bytes ({max_extracted_bytes} bytes)"
-                    ),
-                ));
+            let hash = hasher.finalize().to_hex().to_string();
+            let unchanged = maybe_entry.map(|entry| entry.hash == hash).unwrap_or(false);
+            if unchanged {
+                continue;
             }
 
-            outfile.write_all(&buffer[..bytes]).map_err(|err| {
-                BuildError::new("source_archive", format!("write file failed: {err}"))
-            })?;
-        }
+            if out_path.exists() {
+                std::fs::remove_file(&out_path).map_err(|err| {
+                    BuildError::new("source_archive", format!("remove file failed: {err}"))
+                })?;
+            }
 
-        // Restore Unix permissions if present in zip
-        if let Some(mode) = unix_mode {
-            std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode)).map_err(
-                |err| BuildError::new("source_archive", format!("set permissions failed: {err}")),
-            )?;
+            temp.persist(&out_path).map_err(|err| {
+                BuildError::new("source_archive", format!("persist temp file failed: {err}"))
+            })?;
+
+            if let Some(mode) = unix_mode {
+                std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))
+                    .map_err(|err| {
+                        BuildError::new("source_archive", format!("set permissions failed: {err}"))
+                    })?;
+            }
+
+            manifest.entries.insert(
+                rel_path.clone(),
+                ManifestEntry {
+                    size: entry_size,
+                    hash,
+                },
+            );
+            manifest_dirty = true;
+        } else {
+            let mut outfile = std::fs::File::create(&out_path).map_err(|err| {
+                BuildError::new("source_archive", format!("create file failed: {err}"))
+            })?;
+            let mut hasher = if use_manifest {
+                Some(Hasher::new())
+            } else {
+                None
+            };
+
+            loop {
+                let bytes = file.read(&mut buffer).map_err(|err| {
+                    BuildError::new("source_archive", format!("read zip entry failed: {err}"))
+                })?;
+                if bytes == 0 {
+                    break;
+                }
+
+                extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
+                if extracted_bytes > max_extracted_bytes {
+                    return Err(BuildError::new(
+                        "source_archive",
+                        format!(
+                            "extracted size exceeds max_extracted_bytes ({max_extracted_bytes} bytes)"
+                        ),
+                    ));
+                }
+
+                if let Some(ref mut hasher) = hasher {
+                    hasher.update(&buffer[..bytes]);
+                }
+
+                outfile.write_all(&buffer[..bytes]).map_err(|err| {
+                    BuildError::new("source_archive", format!("write file failed: {err}"))
+                })?;
+            }
+
+            if let Some(hasher) = hasher {
+                let hash = hasher.finalize().to_hex().to_string();
+                manifest.entries.insert(
+                    rel_path.clone(),
+                    ManifestEntry {
+                        size: entry_size,
+                        hash,
+                    },
+                );
+                manifest_dirty = true;
+            }
+
+            // Restore Unix permissions if present in zip
+            if let Some(mode) = unix_mode {
+                std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))
+                    .map_err(|err| {
+                        BuildError::new("source_archive", format!("set permissions failed: {err}"))
+                    })?;
+            }
         }
     }
 
+    if use_manifest && manifest_dirty {
+        write_workspace_manifest(dest, &manifest)?;
+    }
+
+    Ok(())
+}
+
+fn is_internal_build_service_path(path: &Path) -> bool {
+    path.components()
+        .next()
+        .map(|component| component.as_os_str() == ".build-service")
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkspaceManifest {
+    version: u32,
+    entries: HashMap<String, ManifestEntry>,
+}
+
+impl Default for WorkspaceManifest {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ManifestEntry {
+    size: u64,
+    hash: String,
+}
+
+fn workspace_manifest_path(dest: &Path) -> PathBuf {
+    dest.join(".build-service").join(WORKSPACE_MANIFEST_FILE)
+}
+
+fn load_workspace_manifest(dest: &Path) -> WorkspaceManifest {
+    let path = workspace_manifest_path(dest);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return WorkspaceManifest::default(),
+        Err(err) => {
+            warn!("failed to read workspace manifest {:?}: {err}", path);
+            return WorkspaceManifest::default();
+        }
+    };
+
+    let manifest: WorkspaceManifest = match serde_json::from_slice(&bytes) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            warn!("failed to parse workspace manifest {:?}: {err}", path);
+            return WorkspaceManifest::default();
+        }
+    };
+
+    if manifest.version != 1 {
+        warn!(
+            "unsupported workspace manifest version {} at {:?}",
+            manifest.version, path
+        );
+        return WorkspaceManifest::default();
+    }
+
+    manifest
+}
+
+fn write_workspace_manifest(dest: &Path, manifest: &WorkspaceManifest) -> Result<(), BuildError> {
+    let path = workspace_manifest_path(dest);
+    let payload = serde_json::to_vec(manifest).map_err(|err| {
+        BuildError::new(
+            "workspace_manifest",
+            format!("failed to serialize manifest: {err}"),
+        )
+    })?;
+    std::fs::write(&path, payload).map_err(|err| {
+        BuildError::new(
+            "workspace_manifest",
+            format!("failed to write manifest: {err}"),
+        )
+    })?;
     Ok(())
 }
 
@@ -828,7 +1109,7 @@ mod tests {
         let dest = temp.path().join("workspace");
         std::fs::create_dir_all(&dest).expect("dest dir");
 
-        let err = extract_source_archive(source.path(), &dest, 5).unwrap_err();
+        let err = extract_source_archive(source.path(), &dest, 5, false, false).unwrap_err();
         assert_eq!(err.code, "source_archive");
         assert!(
             err.message.contains("max_extracted_bytes"),
