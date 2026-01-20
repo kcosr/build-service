@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-01-20
 
 ### Added
 - Add client-configured stdout/stderr line limits with optional tail summaries and env overrides ([#6](https://github.com/kcosr/build-service/pull/6)).
