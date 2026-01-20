@@ -95,10 +95,17 @@ exclude = ["**/*.tmp"]
 [request.env]
 CC = "clang"
 CFLAGS = "-O2 -g"
+
+[output]
+# stdout_max_lines = 2000
+# stderr_max_lines = 1000
+# stdout_tail_lines = 50
+# stderr_tail_lines = 50
 ```
 
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
+- Output limits are optional; unset means unlimited, `0` disables output, and tail lines only print after suppression.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
 - The wrapper falls back to the local command when `.build-service/config.toml` is missing.
 - Endpoint must start with `http://`, `https://`, or `unix://`.

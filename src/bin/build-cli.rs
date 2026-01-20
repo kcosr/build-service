@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -52,6 +52,8 @@ struct ClientConfig {
     request: Option<RequestConfig>,
     #[serde(default)]
     connection: Option<ConnectionConfig>,
+    #[serde(default)]
+    output: Option<OutputConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -78,10 +80,208 @@ struct ConnectionConfig {
     token: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct OutputConfig {
+    #[serde(default)]
+    stdout_max_lines: Option<usize>,
+    #[serde(default)]
+    stderr_max_lines: Option<usize>,
+    #[serde(default)]
+    stdout_tail_lines: usize,
+    #[serde(default)]
+    stderr_tail_lines: usize,
+}
+
 #[derive(Debug, Clone)]
 enum Endpoint {
     Http { base: String },
     Unix { path: PathBuf },
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct OutputLimits {
+    stdout_max_lines: Option<usize>,
+    stderr_max_lines: Option<usize>,
+    stdout_tail_lines: usize,
+    stderr_tail_lines: usize,
+}
+
+impl OutputLimits {
+    fn from_config(config: Option<&OutputConfig>) -> Self {
+        let Some(config) = config else {
+            return Self::default();
+        };
+
+        Self {
+            stdout_max_lines: config.stdout_max_lines,
+            stderr_max_lines: config.stderr_max_lines,
+            stdout_tail_lines: config.stdout_tail_lines,
+            stderr_tail_lines: config.stderr_tail_lines,
+        }
+    }
+}
+
+struct OutputLimiter {
+    stdout: LineLimiter,
+    stderr: LineLimiter,
+}
+
+impl OutputLimiter {
+    fn new(limits: OutputLimits) -> Self {
+        Self {
+            stdout: LineLimiter::new(limits.stdout_max_lines, limits.stdout_tail_lines),
+            stderr: LineLimiter::new(limits.stderr_max_lines, limits.stderr_tail_lines),
+        }
+    }
+
+    fn write_stdout(&mut self, data: &str) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        self.stdout.write_chunk(data, &mut stdout)
+    }
+
+    fn write_stderr(&mut self, data: &str) -> io::Result<()> {
+        let mut stderr = io::stderr();
+        self.stderr.write_chunk(data, &mut stderr)
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.stdout.finish();
+        self.stderr.finish();
+        let mut stdout = io::stdout();
+        let mut stderr = io::stderr();
+        self.stdout.write_summary(&mut stdout, "stdout")?;
+        self.stderr.write_summary(&mut stderr, "stderr")?;
+        stdout.flush()?;
+        stderr.flush()?;
+        Ok(())
+    }
+}
+
+struct LineLimiter {
+    max_lines: Option<usize>,
+    tail_lines: usize,
+    printed_lines: usize,
+    suppressed_lines: usize,
+    at_line_start: bool,
+    current_line_allowed: bool,
+    suppressed_line: String,
+    tail_buffer: VecDeque<String>,
+}
+
+impl LineLimiter {
+    fn new(max_lines: Option<usize>, tail_lines: usize) -> Self {
+        Self {
+            max_lines,
+            tail_lines,
+            printed_lines: 0,
+            suppressed_lines: 0,
+            at_line_start: true,
+            current_line_allowed: true,
+            suppressed_line: String::new(),
+            tail_buffer: VecDeque::new(),
+        }
+    }
+
+    fn write_chunk(&mut self, data: &str, writer: &mut dyn Write) -> io::Result<()> {
+        if self.max_lines.is_none() {
+            writer.write_all(data.as_bytes())?;
+            writer.flush()?;
+            return Ok(());
+        }
+
+        let mut output = String::new();
+        for segment in data.split_inclusive('\n') {
+            if self.at_line_start {
+                self.current_line_allowed = self
+                    .max_lines
+                    .map(|max| self.printed_lines < max)
+                    .unwrap_or(true);
+                self.at_line_start = false;
+            }
+
+            if self.current_line_allowed {
+                output.push_str(segment);
+            } else if self.tail_lines > 0 {
+                self.suppressed_line.push_str(segment);
+            }
+
+            if segment.ends_with('\n') {
+                self.finish_line();
+            }
+        }
+
+        if !output.is_empty() {
+            writer.write_all(output.as_bytes())?;
+            writer.flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        if self.max_lines.is_none() {
+            return;
+        }
+
+        if !self.at_line_start {
+            if self.current_line_allowed {
+                self.printed_lines += 1;
+            } else {
+                self.suppressed_lines += 1;
+                self.push_tail_line();
+            }
+            self.suppressed_line.clear();
+            self.at_line_start = true;
+        }
+    }
+
+    fn write_summary(&self, writer: &mut dyn Write, label: &str) -> io::Result<()> {
+        if self.max_lines.is_none() || self.suppressed_lines == 0 {
+            return Ok(());
+        }
+
+        writeln!(
+            writer,
+            "... {} more {} lines suppressed",
+            self.suppressed_lines, label
+        )?;
+
+        if !self.tail_buffer.is_empty() {
+            writeln!(
+                writer,
+                "... last {} {} lines:",
+                self.tail_buffer.len(),
+                label
+            )?;
+            for line in &self.tail_buffer {
+                writer.write_all(line.as_bytes())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finish_line(&mut self) {
+        if self.current_line_allowed {
+            self.printed_lines += 1;
+        } else {
+            self.suppressed_lines += 1;
+            self.push_tail_line();
+        }
+        self.suppressed_line.clear();
+        self.at_line_start = true;
+    }
+
+    fn push_tail_line(&mut self) {
+        if self.tail_lines == 0 {
+            return;
+        }
+
+        self.tail_buffer.push_back(self.suppressed_line.clone());
+        if self.tail_buffer.len() > self.tail_lines {
+            self.tail_buffer.pop_front();
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -172,8 +372,15 @@ fn main() -> ExitCode {
         }
     };
     let token = resolve_token(args.token, connection);
+    let output_limits = OutputLimits::from_config(client_config.output.as_ref());
 
-    let build = match run_build(&request, &source_archive, &endpoint, token.as_deref()) {
+    let build = match run_build(
+        &request,
+        &source_archive,
+        &endpoint,
+        token.as_deref(),
+        &output_limits,
+    ) {
         Ok(result) => result,
         Err(err) => {
             eprintln!("build request failed: {err}");
@@ -596,6 +803,7 @@ fn run_build(
     source_archive: &NamedTempFile,
     endpoint: &Endpoint,
     token: Option<&str>,
+    output_limits: &OutputLimits,
 ) -> io::Result<BuildResult> {
     let (client, url, send_auth) = match endpoint {
         Endpoint::Http { base } => (
@@ -641,15 +849,19 @@ fn run_build(
         )));
     }
 
-    read_responses(response)
+    read_responses(response, output_limits)
 }
 
-fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResult> {
+fn read_responses(
+    response: reqwest::blocking::Response,
+    output_limits: &OutputLimits,
+) -> io::Result<BuildResult> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
     let mut artifacts: Option<ArtifactArchive> = None;
+    let mut output = OutputLimiter::new(*output_limits);
 
     loop {
         line.clear();
@@ -667,14 +879,10 @@ fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResu
 
         match event {
             ResponseEvent::Stdout { data } => {
-                let mut stdout = io::stdout();
-                stdout.write_all(data.as_bytes())?;
-                stdout.flush()?;
+                output.write_stdout(&data)?;
             }
             ResponseEvent::Stderr { data } => {
-                let mut stderr = io::stderr();
-                stderr.write_all(data.as_bytes())?;
-                stderr.flush()?;
+                output.write_stderr(&data)?;
             }
             ResponseEvent::Error { message, .. } => {
                 if let Some(message) = message {
@@ -695,6 +903,8 @@ fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResu
             ResponseEvent::Build { .. } => {}
         }
     }
+
+    output.finish()?;
 
     match exit_code {
         Some(code) => Ok(BuildResult {
@@ -842,6 +1052,54 @@ mod tests {
         assert_eq!(normalize_exit_code(0), 0);
         assert_eq!(normalize_exit_code(255), 255);
         assert_eq!(normalize_exit_code(300), 255);
+    }
+
+    #[test]
+    fn line_limiter_suppresses_and_prints_tail() {
+        let mut limiter = LineLimiter::new(Some(2), 2);
+        let mut output = Vec::new();
+
+        limiter.write_chunk("one\n", &mut output).unwrap();
+        limiter
+            .write_chunk("two\nthree\nfour\n", &mut output)
+            .unwrap();
+        limiter.finish();
+        limiter.write_summary(&mut output, "stdout").unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(
+            rendered,
+            "one\ntwo\n... 2 more stdout lines suppressed\n... last 2 stdout lines:\nthree\nfour\n"
+        );
+    }
+
+    #[test]
+    fn line_limiter_zero_limit_prints_only_summary_and_tail() {
+        let mut limiter = LineLimiter::new(Some(0), 1);
+        let mut output = Vec::new();
+
+        limiter.write_chunk("one\ntwo\n", &mut output).unwrap();
+        limiter.finish();
+        limiter.write_summary(&mut output, "stderr").unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(
+            rendered,
+            "... 2 more stderr lines suppressed\n... last 1 stderr lines:\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn line_limiter_no_suppression_skips_summary() {
+        let mut limiter = LineLimiter::new(Some(5), 3);
+        let mut output = Vec::new();
+
+        limiter.write_chunk("one\ntwo\n", &mut output).unwrap();
+        limiter.finish();
+        limiter.write_summary(&mut output, "stdout").unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(rendered, "one\ntwo\n");
     }
 
     #[test]
