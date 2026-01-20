@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,10 @@ use build_service::validation::{validate_relative_path, validate_relative_patter
 const DEFAULT_SOCKET_PATH: &str = "/run/build-service.sock";
 const CLIENT_CONFIG_DIR: &str = ".build-service";
 const CLIENT_CONFIG_FILE: &str = "config.toml";
+const CONNECTION_FALLBACK_EXIT_CODE: u8 = 222;
+const OUTPUT_PREFIX: &str = "[build-service]";
+const STDOUT_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDOUT_MAX_LINES";
+const STDERR_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDERR_MAX_LINES";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Client for the build-service daemon")]
@@ -52,6 +57,8 @@ struct ClientConfig {
     request: Option<RequestConfig>,
     #[serde(default)]
     connection: Option<ConnectionConfig>,
+    #[serde(default)]
+    output: Option<OutputConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -76,12 +83,316 @@ struct ConnectionConfig {
     endpoint: Option<String>,
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    local_fallback: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OutputConfig {
+    #[serde(default)]
+    stdout_max_lines: Option<usize>,
+    #[serde(default)]
+    stderr_max_lines: Option<usize>,
+    #[serde(default)]
+    stdout_tail_lines: usize,
+    #[serde(default)]
+    stderr_tail_lines: usize,
 }
 
 #[derive(Debug, Clone)]
 enum Endpoint {
     Http { base: String },
     Unix { path: PathBuf },
+}
+
+#[derive(Debug)]
+enum BuildError {
+    ConnectionFailed(String),
+    Other(String),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::ConnectionFailed(msg) | BuildError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+fn connection_failure_exit_code(local_fallback: bool) -> u8 {
+    if local_fallback {
+        CONNECTION_FALLBACK_EXIT_CODE
+    } else {
+        1
+    }
+}
+
+fn is_connection_failure(err: &reqwest::Error) -> bool {
+    if err.is_connect() || err.is_timeout() {
+        return true;
+    }
+
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if let Some(io_err) = cause.downcast_ref::<io::Error>() {
+            match io_err.kind() {
+                io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::AddrNotAvailable
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::NotFound
+                | io::ErrorKind::PermissionDenied => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        source = cause.source();
+    }
+
+    false
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct OutputLimits {
+    stdout_max_lines: Option<usize>,
+    stderr_max_lines: Option<usize>,
+    stdout_tail_lines: usize,
+    stderr_tail_lines: usize,
+}
+
+fn resolve_output_limits(config: Option<&OutputConfig>) -> io::Result<OutputLimits> {
+    let stdout_max_lines = if let Ok(raw) = env::var(STDOUT_MAX_LINES_ENV) {
+        parse_output_limit(&raw, STDOUT_MAX_LINES_ENV)?
+            .or_else(|| config.and_then(|config| config.stdout_max_lines))
+    } else {
+        config.and_then(|config| config.stdout_max_lines)
+    };
+
+    let stderr_max_lines = if let Ok(raw) = env::var(STDERR_MAX_LINES_ENV) {
+        parse_output_limit(&raw, STDERR_MAX_LINES_ENV)?
+            .or_else(|| config.and_then(|config| config.stderr_max_lines))
+    } else {
+        config.and_then(|config| config.stderr_max_lines)
+    };
+
+    let stdout_tail_lines = config
+        .map(|config| config.stdout_tail_lines)
+        .unwrap_or_default();
+    let stderr_tail_lines = config
+        .map(|config| config.stderr_tail_lines)
+        .unwrap_or_default();
+
+    Ok(OutputLimits {
+        stdout_max_lines,
+        stderr_max_lines,
+        stdout_tail_lines,
+        stderr_tail_lines,
+    })
+}
+
+fn parse_output_limit(raw: &str, var: &str) -> io::Result<Option<usize>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed: usize = trimmed.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{var} must be a non-negative integer, got {trimmed}"),
+        )
+    })?;
+    Ok(Some(parsed))
+}
+
+struct OutputLimiter {
+    stdout: LineLimiter,
+    stderr: LineLimiter,
+}
+
+impl OutputLimiter {
+    fn new(limits: OutputLimits) -> Self {
+        Self {
+            stdout: LineLimiter::new(
+                "stdout",
+                STDOUT_MAX_LINES_ENV,
+                limits.stdout_max_lines,
+                limits.stdout_tail_lines,
+            ),
+            stderr: LineLimiter::new(
+                "stderr",
+                STDERR_MAX_LINES_ENV,
+                limits.stderr_max_lines,
+                limits.stderr_tail_lines,
+            ),
+        }
+    }
+
+    fn write_stdout(&mut self, data: &str) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        self.stdout.write_chunk(data, &mut stdout)
+    }
+
+    fn write_stderr(&mut self, data: &str) -> io::Result<()> {
+        let mut stderr = io::stderr();
+        self.stderr.write_chunk(data, &mut stderr)
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.stdout.finish();
+        self.stderr.finish();
+        let mut stdout = io::stdout();
+        let mut stderr = io::stderr();
+        self.stdout.write_summary(&mut stdout, "stdout")?;
+        self.stderr.write_summary(&mut stderr, "stderr")?;
+        stdout.flush()?;
+        stderr.flush()?;
+        Ok(())
+    }
+}
+
+struct LineLimiter {
+    label: &'static str,
+    env_var: &'static str,
+    max_lines: Option<usize>,
+    tail_lines: usize,
+    printed_lines: usize,
+    suppressed_lines: usize,
+    at_line_start: bool,
+    current_line_allowed: bool,
+    suppression_notified: bool,
+    suppressed_line: String,
+    tail_buffer: VecDeque<String>,
+}
+
+impl LineLimiter {
+    fn new(
+        label: &'static str,
+        env_var: &'static str,
+        max_lines: Option<usize>,
+        tail_lines: usize,
+    ) -> Self {
+        Self {
+            label,
+            env_var,
+            max_lines,
+            tail_lines,
+            printed_lines: 0,
+            suppressed_lines: 0,
+            at_line_start: true,
+            current_line_allowed: true,
+            suppression_notified: false,
+            suppressed_line: String::new(),
+            tail_buffer: VecDeque::new(),
+        }
+    }
+
+    fn write_chunk(&mut self, data: &str, writer: &mut dyn Write) -> io::Result<()> {
+        if self.max_lines.is_none() {
+            writer.write_all(data.as_bytes())?;
+            writer.flush()?;
+            return Ok(());
+        }
+
+        let mut output = String::new();
+        for segment in data.split_inclusive('\n') {
+            if self.at_line_start {
+                self.current_line_allowed = self
+                    .max_lines
+                    .map(|max| self.printed_lines < max)
+                    .unwrap_or(true);
+                self.at_line_start = false;
+
+                if !self.current_line_allowed && !self.suppression_notified {
+                    output.push_str(&format!(
+                        "{OUTPUT_PREFIX} suppressing {} output due to limits (increase output lines with {}=<lines>)\n",
+                        self.label,
+                        self.env_var
+                    ));
+                    self.suppression_notified = true;
+                }
+            }
+
+            if self.current_line_allowed {
+                output.push_str(segment);
+            } else if self.tail_lines > 0 {
+                self.suppressed_line.push_str(segment);
+            }
+
+            if segment.ends_with('\n') {
+                self.finish_line();
+            }
+        }
+
+        if !output.is_empty() {
+            writer.write_all(output.as_bytes())?;
+            writer.flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        if self.max_lines.is_none() {
+            return;
+        }
+
+        if !self.at_line_start {
+            if self.current_line_allowed {
+                self.printed_lines += 1;
+            } else {
+                self.suppressed_lines += 1;
+                self.push_tail_line();
+            }
+            self.suppressed_line.clear();
+            self.at_line_start = true;
+        }
+    }
+
+    fn write_summary(&self, writer: &mut dyn Write, label: &str) -> io::Result<()> {
+        if self.max_lines.is_none() || self.suppressed_lines == 0 {
+            return Ok(());
+        }
+
+        writeln!(
+            writer,
+            "{OUTPUT_PREFIX} {} more {} lines suppressed",
+            self.suppressed_lines, label
+        )?;
+
+        if !self.tail_buffer.is_empty() {
+            for line in &self.tail_buffer {
+                writer.write_all(line.as_bytes())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finish_line(&mut self) {
+        if self.current_line_allowed {
+            self.printed_lines += 1;
+        } else {
+            self.suppressed_lines += 1;
+            self.push_tail_line();
+        }
+        self.suppressed_line.clear();
+        self.at_line_start = true;
+    }
+
+    fn push_tail_line(&mut self) {
+        if self.tail_lines == 0 {
+            return;
+        }
+
+        self.tail_buffer.push_back(self.suppressed_line.clone());
+        if self.tail_buffer.len() > self.tail_lines {
+            self.tail_buffer.pop_front();
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -172,13 +483,33 @@ fn main() -> ExitCode {
         }
     };
     let token = resolve_token(args.token, connection);
-
-    let build = match run_build(&request, &source_archive, &endpoint, token.as_deref()) {
-        Ok(result) => result,
+    let output_limits = match resolve_output_limits(client_config.output.as_ref()) {
+        Ok(limits) => limits,
         Err(err) => {
-            eprintln!("build request failed: {err}");
+            eprintln!("{err}");
             return ExitCode::from(1);
         }
+    };
+
+    let build = match run_build(
+        &request,
+        &source_archive,
+        &endpoint,
+        token.as_deref(),
+        &output_limits,
+    ) {
+        Ok(result) => result,
+        Err(err) => match err {
+            BuildError::ConnectionFailed(msg) => {
+                eprintln!("build request failed: {msg}");
+                let local_fallback = connection.map(|c| c.local_fallback).unwrap_or(false);
+                return ExitCode::from(connection_failure_exit_code(local_fallback));
+            }
+            BuildError::Other(msg) => {
+                eprintln!("build request failed: {msg}");
+                return ExitCode::from(1);
+            }
+        },
     };
 
     if build.exit_code != 0 {
@@ -264,14 +595,10 @@ fn build_source_archive(root: &Path, patterns: &PatternConfig) -> io::Result<Nam
         let entries = glob::glob(&pattern_root)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
 
-        let mut found = false;
-        if collect_recursive_prefix(pattern, &root, &exclude_patterns, &mut matched_files)? {
-            found = true;
-        }
+        let _ = collect_recursive_prefix(pattern, &root, &exclude_patterns, &mut matched_files)?;
 
         for entry in entries {
             let path = entry.map_err(|err| io::Error::other(err.to_string()))?;
-            found = true;
             let canonical = fs::canonicalize(&path)?;
 
             if !canonical.starts_with(&root) {
@@ -292,13 +619,6 @@ fn build_source_archive(root: &Path, patterns: &PatternConfig) -> io::Result<Nam
                     matched_files.entry(canonical).or_insert(rel);
                 }
             }
-        }
-
-        if !found {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("pattern {pattern} matched nothing"),
-            ));
         }
     }
 
@@ -596,13 +916,14 @@ fn run_build(
     source_archive: &NamedTempFile,
     endpoint: &Endpoint,
     token: Option<&str>,
-) -> io::Result<BuildResult> {
+    output_limits: &OutputLimits,
+) -> Result<BuildResult, BuildError> {
     let (client, url, send_auth) = match endpoint {
         Endpoint::Http { base } => (
             Client::builder()
                 .timeout(None)
                 .build()
-                .map_err(io::Error::other)?,
+                .map_err(|err| BuildError::Other(format!("failed to create client: {err}")))?,
             format!("{base}/v1/builds"),
             true,
         ),
@@ -611,13 +932,15 @@ fn run_build(
                 .unix_socket(path.clone())
                 .timeout(None)
                 .build()
-                .map_err(io::Error::other)?;
+                .map_err(|err| BuildError::Other(format!("failed to create client: {err}")))?;
             (client, "http://localhost/v1/builds".to_string(), false)
         }
     };
 
-    let metadata = serde_json::to_string(request).map_err(io::Error::other)?;
-    let source_part = Part::file(source_archive.path()).map_err(io::Error::other)?;
+    let metadata = serde_json::to_string(request)
+        .map_err(|err| BuildError::Other(format!("failed to serialize request: {err}")))?;
+    let source_part = Part::file(source_archive.path())
+        .map_err(|err| BuildError::Other(format!("failed to read source archive: {err}")))?;
     let form = Form::new()
         .part(
             "metadata",
@@ -632,28 +955,45 @@ fn run_build(
         }
     }
 
-    let response = builder.send().map_err(io::Error::other)?;
+    let response = match builder.send() {
+        Ok(response) => response,
+        Err(err) => {
+            if is_connection_failure(&err) {
+                return Err(BuildError::ConnectionFailed(format!(
+                    "cannot reach endpoint: {err}"
+                )));
+            }
+            return Err(BuildError::Other(format!("request failed: {err}")));
+        }
+    };
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_else(|_| "".to_string());
-        return Err(io::Error::other(format!(
+        return Err(BuildError::Other(format!(
             "server returned {status}: {body}"
         )));
     }
 
-    read_responses(response)
+    read_responses(response, output_limits)
 }
 
-fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResult> {
+fn read_responses(
+    response: reqwest::blocking::Response,
+    output_limits: &OutputLimits,
+) -> Result<BuildResult, BuildError> {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
     let mut artifacts: Option<ArtifactArchive> = None;
+    let mut output = OutputLimiter::new(*output_limits);
 
     loop {
         line.clear();
-        let bytes = reader.read_line(&mut line)?;
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|err| BuildError::Other(format!("failed to read response: {err}")))?;
         if bytes == 0 {
             break;
         }
@@ -663,23 +1003,26 @@ fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResu
             continue;
         }
 
-        let event: ResponseEvent = serde_json::from_str(trimmed).map_err(io::Error::other)?;
+        let event: ResponseEvent = serde_json::from_str(trimmed)
+            .map_err(|err| BuildError::Other(format!("invalid response format: {err}")))?;
 
         match event {
             ResponseEvent::Stdout { data } => {
-                let mut stdout = io::stdout();
-                stdout.write_all(data.as_bytes())?;
-                stdout.flush()?;
+                output
+                    .write_stdout(&data)
+                    .map_err(|err| BuildError::Other(format!("failed to write stdout: {err}")))?;
             }
             ResponseEvent::Stderr { data } => {
-                let mut stderr = io::stderr();
-                stderr.write_all(data.as_bytes())?;
-                stderr.flush()?;
+                output
+                    .write_stderr(&data)
+                    .map_err(|err| BuildError::Other(format!("failed to write stderr: {err}")))?;
             }
             ResponseEvent::Error { message, .. } => {
                 if let Some(message) = message {
                     let mut stderr = io::stderr();
-                    writeln!(stderr, "{message}")?;
+                    writeln!(stderr, "{message}").map_err(|err| {
+                        BuildError::Other(format!("failed to write error: {err}"))
+                    })?;
                 }
             }
             ResponseEvent::Exit {
@@ -696,16 +1039,17 @@ fn read_responses(response: reqwest::blocking::Response) -> io::Result<BuildResu
         }
     }
 
+    output
+        .finish()
+        .map_err(|err| BuildError::Other(format!("failed to flush output: {err}")))?;
+
     match exit_code {
         Some(code) => Ok(BuildResult {
             exit_code: code,
             timed_out,
             artifacts,
         }),
-        None => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "missing exit event",
-        )),
+        None => Err(BuildError::Other("missing exit event".to_string())),
     }
 }
 
@@ -834,7 +1178,14 @@ fn normalize_exit_code(code: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::time::Duration;
+    use tempfile::tempdir;
+    use zip::ZipArchive;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn normalize_exit_code_clamps() {
@@ -842,6 +1193,95 @@ mod tests {
         assert_eq!(normalize_exit_code(0), 0);
         assert_eq!(normalize_exit_code(255), 255);
         assert_eq!(normalize_exit_code(300), 255);
+    }
+
+    #[test]
+    fn connection_failure_exit_code_respects_fallback() {
+        assert_eq!(
+            connection_failure_exit_code(true),
+            CONNECTION_FALLBACK_EXIT_CODE
+        );
+        assert_eq!(connection_failure_exit_code(false), 1);
+    }
+
+    #[test]
+    fn is_connection_failure_detects_refused_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let err = client.get(format!("http://{addr}")).send().unwrap_err();
+        assert!(is_connection_failure(&err));
+    }
+
+    #[test]
+    fn build_source_archive_skips_unmatched_patterns() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir_all(root.join("src")).expect("create src dir");
+        fs::write(root.join("src/main.rs"), "fn main() {}").expect("write file");
+
+        let patterns = PatternConfig {
+            include: vec!["src/**".to_string(), "tests/**".to_string()],
+            exclude: Vec::new(),
+        };
+
+        let archive = build_source_archive(root, &patterns).expect("archive");
+        let file = fs::File::open(archive.path()).expect("open zip");
+        let archive = ZipArchive::new(file).expect("read zip");
+        assert!(archive.len() > 0, "archive should have entries");
+    }
+
+    #[test]
+    fn line_limiter_suppresses_and_prints_tail() {
+        let mut limiter = LineLimiter::new("stdout", STDOUT_MAX_LINES_ENV, Some(2), 2);
+        let mut output = Vec::new();
+
+        limiter.write_chunk("one\n", &mut output).unwrap();
+        limiter
+            .write_chunk("two\nthree\nfour\n", &mut output)
+            .unwrap();
+        limiter.finish();
+        limiter.write_summary(&mut output, "stdout").unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(
+            rendered,
+            "one\ntwo\n[build-service] suppressing stdout output due to limits (increase output lines with BUILD_SERVICE_STDOUT_MAX_LINES=<lines>)\n[build-service] 2 more stdout lines suppressed\nthree\nfour\n"
+        );
+    }
+
+    #[test]
+    fn line_limiter_zero_limit_prints_only_summary_and_tail() {
+        let mut limiter = LineLimiter::new("stderr", STDERR_MAX_LINES_ENV, Some(0), 1);
+        let mut output = Vec::new();
+
+        limiter.write_chunk("one\ntwo\n", &mut output).unwrap();
+        limiter.finish();
+        limiter.write_summary(&mut output, "stderr").unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(
+            rendered,
+            "[build-service] suppressing stderr output due to limits (increase output lines with BUILD_SERVICE_STDERR_MAX_LINES=<lines>)\n[build-service] 2 more stderr lines suppressed\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn line_limiter_no_suppression_skips_summary() {
+        let mut limiter = LineLimiter::new("stdout", STDOUT_MAX_LINES_ENV, Some(5), 3);
+        let mut output = Vec::new();
+
+        limiter.write_chunk("one\ntwo\n", &mut output).unwrap();
+        limiter.finish();
+        limiter.write_summary(&mut output, "stdout").unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(rendered, "one\ntwo\n");
     }
 
     #[test]
@@ -874,8 +1314,48 @@ mod tests {
     }
 
     #[test]
+    fn resolve_output_limits_prefers_env_then_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_stdout = env::var(STDOUT_MAX_LINES_ENV).ok();
+        let prev_stderr = env::var(STDERR_MAX_LINES_ENV).ok();
+
+        env::remove_var(STDOUT_MAX_LINES_ENV);
+        env::remove_var(STDERR_MAX_LINES_ENV);
+
+        let config = OutputConfig {
+            stdout_max_lines: Some(5),
+            stderr_max_lines: Some(6),
+            stdout_tail_lines: 1,
+            stderr_tail_lines: 2,
+        };
+
+        let limits = resolve_output_limits(Some(&config)).unwrap();
+        assert_eq!(limits.stdout_max_lines, Some(5));
+        assert_eq!(limits.stderr_max_lines, Some(6));
+        assert_eq!(limits.stdout_tail_lines, 1);
+        assert_eq!(limits.stderr_tail_lines, 2);
+
+        env::set_var(STDOUT_MAX_LINES_ENV, "9");
+        env::set_var(STDERR_MAX_LINES_ENV, "0");
+        let limits = resolve_output_limits(Some(&config)).unwrap();
+        assert_eq!(limits.stdout_max_lines, Some(9));
+        assert_eq!(limits.stderr_max_lines, Some(0));
+
+        if let Some(prev) = prev_stdout {
+            env::set_var(STDOUT_MAX_LINES_ENV, prev);
+        } else {
+            env::remove_var(STDOUT_MAX_LINES_ENV);
+        }
+
+        if let Some(prev) = prev_stderr {
+            env::set_var(STDERR_MAX_LINES_ENV, prev);
+        } else {
+            env::remove_var(STDERR_MAX_LINES_ENV);
+        }
+    }
+
+    #[test]
     fn resolve_timeout_prefers_explicit_then_env_then_config() {
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
         let prev = env::var("BUILD_SERVICE_TIMEOUT").ok();
 

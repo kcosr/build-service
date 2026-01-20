@@ -87,6 +87,7 @@ exclude = ["**/*.tmp"]
 # endpoint = "unix:///run/build-service.sock"
 # endpoint = "https://build.example.com"
 # token = "..."
+# local_fallback = false  # if true, fall back to local build when endpoint is unreachable
 
 [request]
 # optional defaults
@@ -95,15 +96,24 @@ exclude = ["**/*.tmp"]
 [request.env]
 CC = "clang"
 CFLAGS = "-O2 -g"
+
+[output]
+# stdout_max_lines = 2000
+# stderr_max_lines = 1000
+# stdout_tail_lines = 50
+# stderr_tail_lines = 50
 ```
 
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
+- Source include patterns that match nothing are skipped.
+- Output limits are optional; unset means unlimited, `0` disables output. Once reached, the CLI prints a `[build-service] suppressing <stream> output due to limits (increase output lines with BUILD_SERVICE_STDOUT_MAX_LINES/BUILD_SERVICE_STDERR_MAX_LINES)` notice and later summarizes suppressed lines.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
 - The wrapper falls back to the local command when `.build-service/config.toml` is missing.
+- When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
-- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`.
+- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`.
 
 ## Protocol
 
@@ -195,6 +205,8 @@ Environment:
 - `BUILD_SERVICE_ENDPOINT`: endpoint URL (`http://`, `https://`, or `unix://`)
 - `BUILD_SERVICE_TOKEN`: bearer token (HTTP only)
 - `BUILD_SERVICE_TIMEOUT`: timeout in seconds
+- `BUILD_SERVICE_STDOUT_MAX_LINES`: override stdout line limit
+- `BUILD_SERVICE_STDERR_MAX_LINES`: override stderr line limit
 
 ## Build Wrapper
 
@@ -214,7 +226,9 @@ ln -s /usr/local/bin/build-wrapper /usr/local/bin/cargo
 
 Ensure the real tools are still available later in `PATH` (for example in `/usr/bin`). The wrapper removes its own directory from `PATH` before falling back, so it will pick the system tool instead of re-invoking itself.
 
-The wrapper runs `build-cli` with the command name it was invoked as (for example `make` or `cargo`). If no repo-local config is found, it executes the local command instead.
+The wrapper runs `build-cli` with the command name it was invoked as (for example `make` or `cargo`). The wrapper falls back to the local command in two cases:
+1. No repo-local config (`.build-service/config.toml`) is found
+2. Config has `connection.local_fallback = true` and the build service endpoint is unreachable
 
 ## Logging
 
@@ -223,5 +237,6 @@ Logs are written using `tracing` in a plain-text format. Configure log directory
 ## Notes
 
 - Builds run as the service process user by default, or `build.run_as_user`/`build.run_as_group` if set.
+- If the client disconnects, the service cancels the build and terminates the process group.
 - Artifacts are bundled into `artifacts.zip` and extracted by the client into the repo root.
 - Unix file permissions are preserved in both source and artifact archives.

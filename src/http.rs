@@ -23,7 +23,7 @@ use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
 use tracing::{error, warn};
 
-use crate::build::{execute_build, validate_request};
+use crate::build::{execute_build, validate_request, CancellationFlag};
 use crate::config::{Config, HttpAuthConfig, SocketModeError};
 use crate::protocol::Request;
 use crate::user::UserError;
@@ -256,7 +256,14 @@ async fn start_build(
 
     let (tx, rx) = mpsc::channel(128);
     let config = Arc::clone(&state.config);
-    tokio::task::spawn_blocking(move || execute_build(validated, config, source, tx));
+    let cancellation = CancellationFlag::default();
+    let cancel_watch = cancellation.clone();
+    let tx_watch = tx.clone();
+    tokio::spawn(async move {
+        tx_watch.closed().await;
+        cancel_watch.cancel();
+    });
+    tokio::task::spawn_blocking(move || execute_build(validated, config, source, tx, cancellation));
 
     let stream = ReceiverStream::new(rx).map(|event| {
         let line = match serde_json::to_string(&event) {

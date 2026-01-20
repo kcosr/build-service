@@ -4,6 +4,10 @@ use std::io::{self, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,6 +26,19 @@ use crate::validation::{
 const TIMEOUT_EXIT_CODE: i32 = 124;
 const TIMEOUT_KILL_GRACE_SECS: u64 = 5;
 const OUTPUT_CHUNK_SIZE: usize = 4096;
+
+#[derive(Clone, Default)]
+pub struct CancellationFlag(Arc<AtomicBool>);
+
+impl CancellationFlag {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Debug)]
 pub struct BuildError {
@@ -151,8 +168,9 @@ pub fn execute_build(
     config: std::sync::Arc<Config>,
     source_archive: PathBuf,
     sender: Sender<ResponseEvent>,
+    cancellation: CancellationFlag,
 ) {
-    if let Err(err) = run_build(validated, &config, &source_archive, &sender) {
+    if let Err(err) = run_build(validated, &config, &source_archive, &sender, &cancellation) {
         let _ = sender.blocking_send(ResponseEvent::Error {
             code: err.code.to_string(),
             message: Some(err.message),
@@ -178,6 +196,7 @@ fn run_build(
     config: &Config,
     source_archive: &Path,
     sender: &Sender<ResponseEvent>,
+    cancellation: &CancellationFlag,
 ) -> Result<(), BuildError> {
     let build_id = format!("bld_{}", Uuid::new_v4().simple());
 
@@ -193,7 +212,15 @@ fn run_build(
     let workspace = prepare_workspace(config, &build_id, source_archive)?;
     let cleanup_path = workspace.clone();
 
-    let result = run_build_in_workspace(&validated, config, &run_as, &workspace, &build_id, sender);
+    let result = run_build_in_workspace(
+        &validated,
+        config,
+        &run_as,
+        &workspace,
+        &build_id,
+        sender,
+        cancellation,
+    );
 
     if let Err(err) = std::fs::remove_dir_all(&cleanup_path) {
         warn!("failed to cleanup workspace {:?}: {err}", cleanup_path);
@@ -209,6 +236,7 @@ fn run_build_in_workspace(
     workspace_root: &Path,
     build_id: &str,
     sender: &Sender<ResponseEvent>,
+    cancellation: &CancellationFlag,
 ) -> Result<(), BuildError> {
     let cwd = resolve_cwd(workspace_root, validated.request.cwd.as_deref())?;
 
@@ -266,11 +294,25 @@ fn run_build_in_workspace(
     let stderr_handle = spawn_output_thread(stderr, sender.clone(), StreamKind::Stderr);
 
     let start = Instant::now();
-    let (exit_code, timed_out) = wait_with_timeout(&mut child, validated.timeout_sec)
+    let outcome = wait_with_timeout(&mut child, validated.timeout_sec, cancellation)
         .map_err(|err| BuildError::new("wait_failed", err.to_string()))?;
 
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
+
+    let (exit_code, timed_out) = match outcome {
+        WaitOutcome::Exited { code, timed_out } => (code, timed_out),
+        WaitOutcome::Cancelled => {
+            warn!(
+                "build cancelled build_id={} request_id={} duration_sec={} cwd={}",
+                build_id,
+                request_id,
+                start.elapsed().as_secs(),
+                cwd.display()
+            );
+            return Err(BuildError::new("stream_closed", "client disconnected"));
+        }
+    };
 
     if timed_out {
         warn!(
@@ -635,17 +677,35 @@ fn stream_output(mut reader: impl Read, sender: Sender<ResponseEvent>, kind: Str
     }
 }
 
-fn wait_with_timeout(child: &mut Child, timeout_sec: u64) -> io::Result<(i32, bool)> {
+enum WaitOutcome {
+    Exited { code: i32, timed_out: bool },
+    Cancelled,
+}
+
+enum TerminationReason {
+    Timeout,
+    Cancelled,
+}
+
+fn wait_with_timeout(
+    child: &mut Child,
+    timeout_sec: u64,
+    cancellation: &CancellationFlag,
+) -> io::Result<WaitOutcome> {
     let timeout = Duration::from_secs(timeout_sec);
     let start = Instant::now();
 
     loop {
         if let Some(status) = child.try_wait()? {
-            let code = status.code().unwrap_or_else(|| match status.signal() {
-                Some(signal) => 128 + signal,
-                None => 1,
+            return Ok(WaitOutcome::Exited {
+                code: exit_code(status),
+                timed_out: false,
             });
-            return Ok((code, false));
+        }
+
+        if cancellation.is_cancelled() {
+            terminate_process(child, TerminationReason::Cancelled)?;
+            return Ok(WaitOutcome::Cancelled);
         }
 
         if start.elapsed() >= timeout {
@@ -655,39 +715,85 @@ fn wait_with_timeout(child: &mut Child, timeout_sec: u64) -> io::Result<(i32, bo
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    if let Err(err) = child.kill() {
+    let code = terminate_process(child, TerminationReason::Timeout)?;
+    Ok(WaitOutcome::Exited {
+        code,
+        timed_out: true,
+    })
+}
+
+fn terminate_process(child: &mut Child, reason: TerminationReason) -> io::Result<i32> {
+    let label = match reason {
+        TerminationReason::Timeout => "timed-out",
+        TerminationReason::Cancelled => "cancelled",
+    };
+
+    if let Err(err) = signal_process_group(child, libc::SIGTERM) {
         warn!(
-            "failed to kill timed-out process (pid {}): {}",
+            "failed to terminate {label} process group (pid {}): {}",
             child.id(),
             err
         );
     }
-    let start_kill = Instant::now();
+
+    if let Some(code) = wait_for_exit(child, Duration::from_secs(TIMEOUT_KILL_GRACE_SECS))? {
+        return Ok(code);
+    }
+
+    if let Err(err) = signal_process_group(child, libc::SIGKILL) {
+        warn!(
+            "failed to force kill {label} process group (pid {}): {}",
+            child.id(),
+            err
+        );
+    }
+
+    if let Some(code) = wait_for_exit(child, Duration::from_secs(TIMEOUT_KILL_GRACE_SECS))? {
+        return Ok(code);
+    }
+
+    Ok(TIMEOUT_EXIT_CODE)
+}
+
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> io::Result<Option<i32>> {
+    let start = Instant::now();
 
     loop {
         if let Some(status) = child.try_wait()? {
-            let code = status.code().unwrap_or_else(|| match status.signal() {
-                Some(signal) => 128 + signal,
-                None => 1,
-            });
-            return Ok((code, true));
+            return Ok(Some(exit_code(status)));
         }
 
-        if start_kill.elapsed() >= Duration::from_secs(TIMEOUT_KILL_GRACE_SECS) {
-            break;
+        if start.elapsed() >= timeout {
+            return Ok(None);
         }
 
         std::thread::sleep(Duration::from_millis(100));
     }
+}
 
-    if let Err(err) = child.kill() {
-        warn!(
-            "failed to force kill timed-out process (pid {}): {}",
-            child.id(),
-            err
-        );
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| match status.signal() {
+        Some(signal) => 128 + signal,
+        None => 1,
+    })
+}
+
+fn signal_process_group(child: &Child, signal: i32) -> io::Result<()> {
+    let pid = child.id() as i32;
+    if unsafe { libc::killpg(pid, signal) } == 0 {
+        return Ok(());
     }
-    Ok((TIMEOUT_EXIT_CODE, true))
+
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(());
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+
+    Err(err)
 }
 
 #[allow(clippy::module_name_repetitions)]
@@ -729,6 +835,26 @@ mod tests {
             "unexpected error: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn wait_with_timeout_cancels_on_disconnect() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .expect("spawn sleep");
+
+        let cancellation = CancellationFlag::default();
+        let cancel_clone = cancellation.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            cancel_clone.cancel();
+        });
+
+        let outcome = wait_with_timeout(&mut child, 60, &cancellation).expect("wait result");
+        assert!(matches!(outcome, WaitOutcome::Cancelled));
+        let _ = child.wait();
     }
 
     fn create_test_zip(name: &str, contents: &[u8]) -> io::Result<NamedTempFile> {

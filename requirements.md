@@ -143,6 +143,7 @@ exclude = ["**/*.tmp"]
 # endpoint = "unix:///run/build-service.sock"
 # endpoint = "https://build.example.com"
 # token = "..."
+# local_fallback = false
 
 [request]
 # timeout_sec = 900
@@ -150,12 +151,21 @@ exclude = ["**/*.tmp"]
 [request.env]
 CC = "clang"
 CFLAGS = "-O2 -g"
+
+[output]
+# stdout_max_lines = 2000
+# stderr_max_lines = 1000
+# stdout_tail_lines = 50
+# stderr_tail_lines = 50
 ```
 
 Notes:
+- Output limits are optional; unset means unlimited, `0` disables output. Once reached, the CLI prints a `[build-service] suppressing <stream> output due to limits (increase output lines with BUILD_SERVICE_STDOUT_MAX_LINES/BUILD_SERVICE_STDERR_MAX_LINES)` notice and later summarizes suppressed lines.
+- Source include patterns that match nothing are skipped.
+- When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
-- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`.
+- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`.
 - The wrapper falls back to the local command when `.build-service/config.toml` is missing.
 
 ## Protocol
@@ -214,3 +224,5 @@ On timeout:
 2. Wait 5 seconds
 3. Send `SIGKILL` if still running
 4. Emit `{"type":"exit","code":124,"timed_out":true}`
+
+If the client disconnects while streaming output, the service cancels the build and terminates the process group.

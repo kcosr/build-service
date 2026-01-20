@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Add client-configured stdout/stderr line limits with optional tail summaries and env overrides ([#6](https://github.com/kcosr/build-service/pull/6)).
+- Cancel builds when clients disconnect from the output stream ([#6](https://github.com/kcosr/build-service/pull/6)).
+- Return a fallback exit code when `connection.local_fallback` is enabled and the endpoint is unreachable ([#6](https://github.com/kcosr/build-service/pull/6)).
+
+### Fixed
+- Skip source include patterns that match no files instead of failing packaging ([#6](https://github.com/kcosr/build-service/pull/6)).
 
 ## [0.1.1] - 2026-01-18
 
