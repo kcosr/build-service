@@ -23,6 +23,9 @@ const DEFAULT_SOCKET_PATH: &str = "/run/build-service.sock";
 const CLIENT_CONFIG_DIR: &str = ".build-service";
 const CLIENT_CONFIG_FILE: &str = "config.toml";
 const CONNECTION_FALLBACK_EXIT_CODE: u8 = 222;
+const OUTPUT_PREFIX: &str = "[build-service]";
+const STDOUT_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDOUT_MAX_LINES";
+const STDERR_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDERR_MAX_LINES";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Client for the build-service daemon")]
@@ -160,19 +163,49 @@ struct OutputLimits {
     stderr_tail_lines: usize,
 }
 
-impl OutputLimits {
-    fn from_config(config: Option<&OutputConfig>) -> Self {
-        let Some(config) = config else {
-            return Self::default();
-        };
+fn resolve_output_limits(config: Option<&OutputConfig>) -> io::Result<OutputLimits> {
+    let stdout_max_lines = if let Ok(raw) = env::var(STDOUT_MAX_LINES_ENV) {
+        parse_output_limit(&raw, STDOUT_MAX_LINES_ENV)?
+            .or_else(|| config.and_then(|config| config.stdout_max_lines))
+    } else {
+        config.and_then(|config| config.stdout_max_lines)
+    };
 
-        Self {
-            stdout_max_lines: config.stdout_max_lines,
-            stderr_max_lines: config.stderr_max_lines,
-            stdout_tail_lines: config.stdout_tail_lines,
-            stderr_tail_lines: config.stderr_tail_lines,
-        }
+    let stderr_max_lines = if let Ok(raw) = env::var(STDERR_MAX_LINES_ENV) {
+        parse_output_limit(&raw, STDERR_MAX_LINES_ENV)?
+            .or_else(|| config.and_then(|config| config.stderr_max_lines))
+    } else {
+        config.and_then(|config| config.stderr_max_lines)
+    };
+
+    let stdout_tail_lines = config
+        .map(|config| config.stdout_tail_lines)
+        .unwrap_or_default();
+    let stderr_tail_lines = config
+        .map(|config| config.stderr_tail_lines)
+        .unwrap_or_default();
+
+    Ok(OutputLimits {
+        stdout_max_lines,
+        stderr_max_lines,
+        stdout_tail_lines,
+        stderr_tail_lines,
+    })
+}
+
+fn parse_output_limit(raw: &str, var: &str) -> io::Result<Option<usize>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
     }
+
+    let parsed: usize = trimmed.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{var} must be a non-negative integer, got {trimmed}"),
+        )
+    })?;
+    Ok(Some(parsed))
 }
 
 struct OutputLimiter {
@@ -183,8 +216,18 @@ struct OutputLimiter {
 impl OutputLimiter {
     fn new(limits: OutputLimits) -> Self {
         Self {
-            stdout: LineLimiter::new(limits.stdout_max_lines, limits.stdout_tail_lines),
-            stderr: LineLimiter::new(limits.stderr_max_lines, limits.stderr_tail_lines),
+            stdout: LineLimiter::new(
+                "stdout",
+                STDOUT_MAX_LINES_ENV,
+                limits.stdout_max_lines,
+                limits.stdout_tail_lines,
+            ),
+            stderr: LineLimiter::new(
+                "stderr",
+                STDERR_MAX_LINES_ENV,
+                limits.stderr_max_lines,
+                limits.stderr_tail_lines,
+            ),
         }
     }
 
@@ -212,25 +255,36 @@ impl OutputLimiter {
 }
 
 struct LineLimiter {
+    label: &'static str,
+    env_var: &'static str,
     max_lines: Option<usize>,
     tail_lines: usize,
     printed_lines: usize,
     suppressed_lines: usize,
     at_line_start: bool,
     current_line_allowed: bool,
+    suppression_notified: bool,
     suppressed_line: String,
     tail_buffer: VecDeque<String>,
 }
 
 impl LineLimiter {
-    fn new(max_lines: Option<usize>, tail_lines: usize) -> Self {
+    fn new(
+        label: &'static str,
+        env_var: &'static str,
+        max_lines: Option<usize>,
+        tail_lines: usize,
+    ) -> Self {
         Self {
+            label,
+            env_var,
             max_lines,
             tail_lines,
             printed_lines: 0,
             suppressed_lines: 0,
             at_line_start: true,
             current_line_allowed: true,
+            suppression_notified: false,
             suppressed_line: String::new(),
             tail_buffer: VecDeque::new(),
         }
@@ -251,6 +305,15 @@ impl LineLimiter {
                     .map(|max| self.printed_lines < max)
                     .unwrap_or(true);
                 self.at_line_start = false;
+
+                if !self.current_line_allowed && !self.suppression_notified {
+                    output.push_str(&format!(
+                        "{OUTPUT_PREFIX} suppressing {} output due to limits (increase output lines with {}=<lines>)\n",
+                        self.label,
+                        self.env_var
+                    ));
+                    self.suppression_notified = true;
+                }
             }
 
             if self.current_line_allowed {
@@ -296,12 +359,11 @@ impl LineLimiter {
 
         writeln!(
             writer,
-            "... {} more {} lines suppressed",
+            "{OUTPUT_PREFIX} {} more {} lines suppressed",
             self.suppressed_lines, label
         )?;
 
         if !self.tail_buffer.is_empty() {
-            writeln!(writer, "last {} {} lines:", self.tail_buffer.len(), label)?;
             for line in &self.tail_buffer {
                 writer.write_all(line.as_bytes())?;
             }
@@ -421,7 +483,13 @@ fn main() -> ExitCode {
         }
     };
     let token = resolve_token(args.token, connection);
-    let output_limits = OutputLimits::from_config(client_config.output.as_ref());
+    let output_limits = match resolve_output_limits(client_config.output.as_ref()) {
+        Ok(limits) => limits,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
 
     let build = match run_build(
         &request,
@@ -1125,6 +1193,8 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn normalize_exit_code_clamps() {
         assert_eq!(normalize_exit_code(-1), 1);
@@ -1158,7 +1228,7 @@ mod tests {
 
     #[test]
     fn line_limiter_suppresses_and_prints_tail() {
-        let mut limiter = LineLimiter::new(Some(2), 2);
+        let mut limiter = LineLimiter::new("stdout", STDOUT_MAX_LINES_ENV, Some(2), 2);
         let mut output = Vec::new();
 
         limiter.write_chunk("one\n", &mut output).unwrap();
@@ -1171,13 +1241,13 @@ mod tests {
         let rendered = String::from_utf8(output).unwrap();
         assert_eq!(
             rendered,
-            "one\ntwo\n... 2 more stdout lines suppressed\nlast 2 stdout lines:\nthree\nfour\n"
+            "one\ntwo\n[build-service] suppressing stdout output due to limits (increase output lines with BUILD_SERVICE_STDOUT_MAX_LINES=<lines>)\n[build-service] 2 more stdout lines suppressed\nthree\nfour\n"
         );
     }
 
     #[test]
     fn line_limiter_zero_limit_prints_only_summary_and_tail() {
-        let mut limiter = LineLimiter::new(Some(0), 1);
+        let mut limiter = LineLimiter::new("stderr", STDERR_MAX_LINES_ENV, Some(0), 1);
         let mut output = Vec::new();
 
         limiter.write_chunk("one\ntwo\n", &mut output).unwrap();
@@ -1187,13 +1257,13 @@ mod tests {
         let rendered = String::from_utf8(output).unwrap();
         assert_eq!(
             rendered,
-            "... 2 more stderr lines suppressed\nlast 1 stderr lines:\ntwo\n"
+            "[build-service] suppressing stderr output due to limits (increase output lines with BUILD_SERVICE_STDERR_MAX_LINES=<lines>)\n[build-service] 2 more stderr lines suppressed\ntwo\n"
         );
     }
 
     #[test]
     fn line_limiter_no_suppression_skips_summary() {
-        let mut limiter = LineLimiter::new(Some(5), 3);
+        let mut limiter = LineLimiter::new("stdout", STDOUT_MAX_LINES_ENV, Some(5), 3);
         let mut output = Vec::new();
 
         limiter.write_chunk("one\ntwo\n", &mut output).unwrap();
@@ -1234,8 +1304,48 @@ mod tests {
     }
 
     #[test]
+    fn resolve_output_limits_prefers_env_then_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_stdout = env::var(STDOUT_MAX_LINES_ENV).ok();
+        let prev_stderr = env::var(STDERR_MAX_LINES_ENV).ok();
+
+        env::remove_var(STDOUT_MAX_LINES_ENV);
+        env::remove_var(STDERR_MAX_LINES_ENV);
+
+        let config = OutputConfig {
+            stdout_max_lines: Some(5),
+            stderr_max_lines: Some(6),
+            stdout_tail_lines: 1,
+            stderr_tail_lines: 2,
+        };
+
+        let limits = resolve_output_limits(Some(&config)).unwrap();
+        assert_eq!(limits.stdout_max_lines, Some(5));
+        assert_eq!(limits.stderr_max_lines, Some(6));
+        assert_eq!(limits.stdout_tail_lines, 1);
+        assert_eq!(limits.stderr_tail_lines, 2);
+
+        env::set_var(STDOUT_MAX_LINES_ENV, "9");
+        env::set_var(STDERR_MAX_LINES_ENV, "0");
+        let limits = resolve_output_limits(Some(&config)).unwrap();
+        assert_eq!(limits.stdout_max_lines, Some(9));
+        assert_eq!(limits.stderr_max_lines, Some(0));
+
+        if let Some(prev) = prev_stdout {
+            env::set_var(STDOUT_MAX_LINES_ENV, prev);
+        } else {
+            env::remove_var(STDOUT_MAX_LINES_ENV);
+        }
+
+        if let Some(prev) = prev_stderr {
+            env::set_var(STDERR_MAX_LINES_ENV, prev);
+        } else {
+            env::remove_var(STDERR_MAX_LINES_ENV);
+        }
+    }
+
+    #[test]
     fn resolve_timeout_prefers_explicit_then_env_then_config() {
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
         let prev = env::var("BUILD_SERVICE_TIMEOUT").ok();
 
