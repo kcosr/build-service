@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- Workspace reuse support with optional client-supplied IDs and TTL-based GC.
+- Workspace reuse support with client-supplied IDs, refreshable source sync, and TTL-based GC ([#7](https://github.com/kcosr/build-service/pull/7)).
 
 ## [0.2.0] - 2026-01-20
 
