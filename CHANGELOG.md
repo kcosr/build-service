@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Add client-configured stdout/stderr line limits with optional tail summaries ([#???](https://github.com/kcosr/build-service/pull/???)).
+- Cancel builds when clients disconnect from the output stream ([#???](https://github.com/kcosr/build-service/pull/???)).
 
 ## [0.1.1] - 2026-01-18
 
