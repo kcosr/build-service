@@ -595,14 +595,10 @@ fn build_source_archive(root: &Path, patterns: &PatternConfig) -> io::Result<Nam
         let entries = glob::glob(&pattern_root)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
 
-        let mut found = false;
-        if collect_recursive_prefix(pattern, &root, &exclude_patterns, &mut matched_files)? {
-            found = true;
-        }
+        let _ = collect_recursive_prefix(pattern, &root, &exclude_patterns, &mut matched_files)?;
 
         for entry in entries {
             let path = entry.map_err(|err| io::Error::other(err.to_string()))?;
-            found = true;
             let canonical = fs::canonicalize(&path)?;
 
             if !canonical.starts_with(&root) {
@@ -623,13 +619,6 @@ fn build_source_archive(root: &Path, patterns: &PatternConfig) -> io::Result<Nam
                     matched_files.entry(canonical).or_insert(rel);
                 }
             }
-        }
-
-        if !found {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("pattern {pattern} matched nothing"),
-            ));
         }
     }
 
@@ -1189,9 +1178,12 @@ fn normalize_exit_code(code: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::net::TcpListener;
     use std::sync::Mutex;
     use std::time::Duration;
+    use tempfile::tempdir;
+    use zip::ZipArchive;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1224,6 +1216,24 @@ mod tests {
             .unwrap();
         let err = client.get(format!("http://{addr}")).send().unwrap_err();
         assert!(is_connection_failure(&err));
+    }
+
+    #[test]
+    fn build_source_archive_skips_unmatched_patterns() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir_all(root.join("src")).expect("create src dir");
+        fs::write(root.join("src/main.rs"), "fn main() {}").expect("write file");
+
+        let patterns = PatternConfig {
+            include: vec!["src/**".to_string(), "tests/**".to_string()],
+            exclude: Vec::new(),
+        };
+
+        let archive = build_source_archive(root, &patterns).expect("archive");
+        let file = fs::File::open(archive.path()).expect("open zip");
+        let archive = ZipArchive::new(file).expect("read zip");
+        assert!(archive.len() > 0, "archive should have entries");
     }
 
     #[test]

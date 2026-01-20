@@ -106,6 +106,7 @@ CFLAGS = "-O2 -g"
 
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
+- Source include patterns that match nothing are skipped.
 - Output limits are optional; unset means unlimited, `0` disables output. Once reached, the CLI prints a `[build-service] suppressing <stream> output due to limits (increase output lines with BUILD_SERVICE_STDOUT_MAX_LINES/BUILD_SERVICE_STDERR_MAX_LINES)` notice and later summarizes suppressed lines.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
 - The wrapper falls back to the local command when `.build-service/config.toml` is missing.
