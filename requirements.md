@@ -221,3 +221,5 @@ On timeout:
 2. Wait 5 seconds
 3. Send `SIGKILL` if still running
 4. Emit `{"type":"exit","code":124,"timed_out":true}`
+
+If the client disconnects while streaming output, the service cancels the build and terminates the process group.

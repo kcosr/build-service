@@ -230,5 +230,6 @@ Logs are written using `tracing` in a plain-text format. Configure log directory
 ## Notes
 
 - Builds run as the service process user by default, or `build.run_as_user`/`build.run_as_group` if set.
+- If the client disconnects, the service cancels the build and terminates the process group.
 - Artifacts are bundled into `artifacts.zip` and extracted by the client into the repo root.
 - Unix file permissions are preserved in both source and artifact archives.
