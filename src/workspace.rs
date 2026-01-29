@@ -15,6 +15,7 @@ use crate::config::WorkspaceConfig;
 use crate::protocol::Request;
 
 const DEFAULT_GC_INTERVAL_SECS: u64 = 3600;
+const MAX_WORKSPACE_ID_LEN: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct WorkspacePlan {
@@ -126,10 +127,11 @@ impl WorkspaceState {
         let client_supplied = workspace.id.is_some();
         let id = match &workspace.id {
             Some(id) => {
-                if !is_valid_workspace_id(id) {
+                let sanitized = sanitize_workspace_id(id);
+                if sanitized.is_empty() {
                     return Err(WorkspaceError::InvalidId);
                 }
-                id.clone()
+                sanitized
             }
             None => format!("ws_{}", Uuid::new_v4().simple()),
         };
@@ -214,6 +216,41 @@ pub fn is_valid_workspace_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+pub fn sanitize_workspace_id(id: &str) -> String {
+    let mut output = String::with_capacity(id.len().min(MAX_WORKSPACE_ID_LEN));
+    let mut prev_dash = false;
+
+    for ch in id.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            ch
+        } else {
+            '-'
+        };
+
+        if normalized == '-' {
+            if output.is_empty() || prev_dash {
+                prev_dash = true;
+                continue;
+            }
+            output.push('-');
+            prev_dash = true;
+        } else {
+            output.push(normalized);
+            prev_dash = false;
+        }
+
+        if output.len() >= MAX_WORKSPACE_ID_LEN {
+            break;
+        }
+    }
+
+    while output.ends_with('-') {
+        output.pop();
+    }
+
+    output
 }
 
 fn gc_workspaces(state: &WorkspaceState) -> Result<(), WorkspaceError> {
@@ -331,4 +368,63 @@ fn parse_timestamp(value: &str) -> Result<SystemTime, WorkspaceError> {
     let seconds = datetime.unix_timestamp();
     let seconds = if seconds < 0 { 0 } else { seconds as u64 };
     Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ArtifactSpec, Request, WorkspaceRequest};
+    use tempfile::tempdir;
+
+    #[test]
+    fn sanitize_workspace_id_replaces_and_collapses() {
+        assert_eq!(sanitize_workspace_id("vsl-main"), "vsl-main");
+        assert_eq!(
+            sanitize_workspace_id("vsl-feature/auth"),
+            "vsl-feature-auth"
+        );
+        assert_eq!(
+            sanitize_workspace_id("my//project--test"),
+            "my-project-test"
+        );
+        assert_eq!(sanitize_workspace_id("--bad--id--"), "bad-id");
+    }
+
+    #[test]
+    fn sanitize_workspace_id_all_invalid_is_empty() {
+        assert!(sanitize_workspace_id("!!!").is_empty());
+    }
+
+    #[test]
+    fn sanitize_workspace_id_truncates() {
+        let input = "a".repeat(200);
+        let output = sanitize_workspace_id(&input);
+        assert_eq!(output.len(), MAX_WORKSPACE_ID_LEN);
+    }
+
+    #[test]
+    fn plan_request_sanitizes_client_id() {
+        let temp = tempdir().expect("tempdir");
+        let state = WorkspaceState::new(temp.path().to_path_buf(), WorkspaceConfig::default());
+        let request = Request {
+            schema_version: None,
+            request_id: None,
+            command: "make".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_sec: None,
+            artifacts: ArtifactSpec::default(),
+            env: None,
+            workspace: Some(WorkspaceRequest {
+                reuse: true,
+                id: Some("feature/add-auth".to_string()),
+                create: Some(true),
+                refresh: None,
+                ttl_sec: None,
+            }),
+        };
+
+        let plan = state.plan_request(&request).expect("plan");
+        assert_eq!(plan.id, "feature-add-auth");
+    }
 }

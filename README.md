@@ -100,7 +100,7 @@ CFLAGS = "-O2 -g"
 
 [workspace]
 # reuse = true
-# id = "custom_id"
+# id = "custom_id"   # supports {branch} macro
 # create = true
 # refresh = false
 # ttl_sec = 3600
@@ -117,6 +117,7 @@ Notes:
 - Source include patterns that match nothing are skipped.
 - Output limits are optional; unset means unlimited, `0` disables output. Once reached, the CLI prints a `[build-service] suppressing <stream> output due to limits (increase output lines with BUILD_SERVICE_STDOUT_MAX_LINES/BUILD_SERVICE_STDERR_MAX_LINES)` notice and later summarizes suppressed lines.
 - When workspace reuse is enabled, the CLI reads `.build-service/workspace-id` if no workspace id is configured and writes it when the server returns `workspace_id`.
+- `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{branch}`; the CLI expands it to the current git branch and the server sanitizes the resulting workspace id.
 - Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force a full resync of sources for the next build.
 - Set `BUILD_SERVICE_ENABLED=false` to force the wrapper to skip build-service and run the local tool.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
