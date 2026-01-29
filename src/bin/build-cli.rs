@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use clap::Parser;
 use reqwest::blocking::multipart::{Form, Part};
@@ -18,7 +18,6 @@ use build_service::protocol::{
     ArtifactArchive, ArtifactSpec, Request, ResponseEvent, WorkspaceRequest, SCHEMA_VERSION,
 };
 use build_service::validation::{validate_relative_path, validate_relative_pattern};
-use build_service::workspace::is_valid_workspace_id;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/build-service.sock";
 const CLIENT_CONFIG_DIR: &str = ".build-service";
@@ -989,6 +988,47 @@ fn parse_env_u64(name: &str) -> io::Result<Option<u64>> {
     Ok(Some(parsed))
 }
 
+fn get_git_branch(repo_root: &Path) -> io::Result<String> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--abbrev-ref")
+        .arg("HEAD")
+        .current_dir(repo_root)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = if stderr.trim().is_empty() {
+            "failed to resolve git branch".to_string()
+        } else {
+            format!("failed to resolve git branch: {}", stderr.trim())
+        };
+        return Err(io::Error::other(message));
+    }
+
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        return Err(io::Error::other(
+            "failed to resolve git branch: empty output",
+        ));
+    }
+
+    if branch == "HEAD" {
+        Ok("detached".to_string())
+    } else {
+        Ok(branch)
+    }
+}
+
+fn expand_workspace_macros(id: &str, repo_root: &Path) -> io::Result<String> {
+    if !id.contains("{branch}") {
+        return Ok(id.to_string());
+    }
+
+    let branch = get_git_branch(repo_root)?;
+    Ok(id.replace("{branch}", branch.as_str()))
+}
+
 fn resolve_workspace_config(
     config: Option<&WorkspaceConfig>,
     repo_root: &Path,
@@ -1013,6 +1053,9 @@ fn resolve_workspace_config(
     });
     let config_id = config.and_then(|cfg| cfg.id.as_ref().map(|id| id.trim().to_string()));
     let mut id = env_id.or(config_id);
+    if let Some(ref raw_id) = id {
+        id = Some(expand_workspace_macros(raw_id, repo_root)?);
+    }
 
     let create = if let Some(value) = parse_env_bool(WORKSPACE_CREATE_ENV)? {
         value
@@ -1041,15 +1084,6 @@ fn resolve_workspace_config(
             io::ErrorKind::InvalidInput,
             "workspace.create requires workspace.id",
         ));
-    }
-
-    if let Some(ref id) = id {
-        if !is_valid_workspace_id(id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "workspace.id must match [A-Za-z0-9_-]+",
-            ));
-        }
     }
 
     Ok(Some(WorkspaceRequest {
@@ -1367,12 +1401,42 @@ mod tests {
     use super::*;
     use std::fs;
     use std::net::TcpListener;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::tempdir;
     use zip::ZipArchive;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn git_available() -> bool {
+        Command::new("git").arg("--version").output().is_ok()
+    }
+
+    fn run_git(repo_root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_root)
+            .output()
+            .expect("run git");
+        if !output.status.success() {
+            panic!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_git_repo(repo_root: &Path) {
+        run_git(repo_root, &["init"]);
+        run_git(repo_root, &["config", "user.email", "test@example.com"]);
+        run_git(repo_root, &["config", "user.name", "Test"]);
+        fs::write(repo_root.join("README.md"), "test").expect("write readme");
+        run_git(repo_root, &["add", "."]);
+        run_git(repo_root, &["commit", "-m", "init"]);
+    }
 
     #[test]
     fn normalize_exit_code_clamps() {
@@ -1562,5 +1626,58 @@ mod tests {
         } else {
             env::remove_var("BUILD_SERVICE_TIMEOUT");
         }
+    }
+
+    #[test]
+    fn expand_workspace_macros_no_macro_skips_git() {
+        let temp = tempdir().expect("tempdir");
+        let id = expand_workspace_macros("custom_id", temp.path()).expect("expand");
+        assert_eq!(id, "custom_id");
+    }
+
+    #[test]
+    fn expand_workspace_macros_replaces_branch() {
+        if !git_available() {
+            eprintln!("git not available; skipping test");
+            return;
+        }
+        let temp = tempdir().expect("tempdir");
+        init_git_repo(temp.path());
+        run_git(temp.path(), &["checkout", "-b", "feature/add-auth"]);
+
+        let id = expand_workspace_macros("myproject-{branch}", temp.path()).expect("expand");
+        assert_eq!(id, "myproject-feature/add-auth");
+    }
+
+    #[test]
+    fn get_git_branch_detached_head_returns_detached() {
+        if !git_available() {
+            eprintln!("git not available; skipping test");
+            return;
+        }
+        let temp = tempdir().expect("tempdir");
+        init_git_repo(temp.path());
+        let sha = run_git(temp.path(), &["rev-parse", "HEAD"]);
+        let output = Command::new("git")
+            .arg("checkout")
+            .arg(&sha)
+            .current_dir(temp.path())
+            .output()
+            .expect("git checkout");
+        assert!(
+            output.status.success(),
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let branch = get_git_branch(temp.path()).expect("branch");
+        assert_eq!(branch, "detached");
+    }
+
+    #[test]
+    fn expand_workspace_macros_errors_outside_repo() {
+        let temp = tempdir().expect("tempdir");
+        let err = expand_workspace_macros("custom-{branch}", temp.path());
+        assert!(err.is_err());
     }
 }
