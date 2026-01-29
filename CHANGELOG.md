@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] - 2026-01-29
 
 ### Added
 - Support `{branch}` macro expansion for workspace IDs with server-side sanitization ([#8](https://github.com/kcosr/build-service/pull/8)).
