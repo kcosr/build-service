@@ -24,6 +24,7 @@ const CLIENT_CONFIG_DIR: &str = ".build-service";
 const CLIENT_CONFIG_FILE: &str = "config.toml";
 const CONNECTION_FALLBACK_EXIT_CODE: u8 = 222;
 const OUTPUT_PREFIX: &str = "[build-service]";
+const ENABLED_ENV: &str = "BUILD_SERVICE_ENABLED";
 const STDOUT_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDOUT_MAX_LINES";
 const STDERR_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDERR_MAX_LINES";
 const WORKSPACE_REUSE_ENV: &str = "BUILD_SERVICE_WORKSPACE_REUSE";
@@ -86,6 +87,8 @@ struct RequestConfig {
 
 #[derive(Debug, Deserialize, Default)]
 struct ConnectionConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
@@ -118,6 +121,10 @@ struct WorkspaceConfig {
     refresh: bool,
     #[serde(default)]
     ttl_sec: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +443,12 @@ fn main() -> ExitCode {
         }
     };
 
+    let connection = client_config.connection.as_ref();
+    if !resolve_connection_enabled(connection) {
+        eprintln!("{OUTPUT_PREFIX} disabled (BUILD_SERVICE_ENABLED/connection.enabled)");
+        return ExitCode::from(CONNECTION_FALLBACK_EXIT_CODE);
+    }
+
     if let Err(err) = validate_patterns(&client_config.sources, "sources") {
         eprintln!("{err}");
         return ExitCode::from(1);
@@ -504,7 +517,6 @@ fn main() -> ExitCode {
         workspace,
     };
 
-    let connection = client_config.connection.as_ref();
     let endpoint = match resolve_endpoint(args.endpoint, connection) {
         Ok(endpoint) => endpoint,
         Err(err) => {
@@ -939,6 +951,17 @@ fn resolve_token(explicit: Option<String>, config: Option<&ConnectionConfig>) ->
     }
 
     None
+}
+
+fn resolve_connection_enabled(config: Option<&ConnectionConfig>) -> bool {
+    if let Ok(raw) = env::var(ENABLED_ENV) {
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        let disabled = matches!(lower.as_str(), "" | "0" | "false" | "no" | "off");
+        return !disabled;
+    }
+
+    config.map(|connection| connection.enabled).unwrap_or(true)
 }
 
 fn parse_env_bool(name: &str) -> io::Result<Option<bool>> {

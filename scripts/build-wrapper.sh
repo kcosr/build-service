@@ -19,7 +19,7 @@ while :; do
     if [ "$disabled" != "true" ] && [ -f "$dir/$config_dir/$config_file" ]; then
         build-cli "$cmd" "$@"
         exit_code=$?
-        # Exit code 222 means connection failed and local_fallback is enabled
+        # Exit code 222 means connection failed, or build-service was explicitly disabled
         # Fall through to execute local build tool
         if [ $exit_code -ne 222 ]; then
             exit $exit_code
