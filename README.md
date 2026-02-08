@@ -85,6 +85,7 @@ include = ["out/**", "dist/*.tar.gz"]
 exclude = ["**/*.tmp"]
 
 [connection]
+# enabled = true  # if false, skip build-service and run local tool
 # endpoint = "unix:///run/build-service.sock"
 # endpoint = "https://build.example.com"
 # token = "..."
@@ -119,13 +120,13 @@ Notes:
 - When workspace reuse is enabled, the CLI reads `.build-service/workspace-id` if no workspace id is configured and writes it when the server returns `workspace_id`.
 - `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{branch}`; the CLI expands it to the current git branch and the server sanitizes the resulting workspace id.
 - Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force a full resync of sources for the next build.
-- Set `BUILD_SERVICE_ENABLED=false` to force the wrapper to skip build-service and run the local tool.
+- Set `connection.enabled = false` (or `BUILD_SERVICE_ENABLED=false`) to force the wrapper to skip build-service and run the local tool. `BUILD_SERVICE_ENABLED` overrides the config when set.
 - The CLI refuses to run if `.build-service/config.toml` is missing.
 - The wrapper falls back to the local command when `.build-service/config.toml` is missing.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
-- Env overrides: `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
+- Env overrides: `BUILD_SERVICE_ENABLED`, `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
 
 ## Protocol
 
