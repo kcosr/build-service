@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.1] - 2026-02-08
 
 ### Added
 - Add `connection.enabled` to disable build-service usage via client config ([#9](https://github.com/kcosr/build-service/pull/9)).
