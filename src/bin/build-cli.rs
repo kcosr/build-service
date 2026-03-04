@@ -1044,12 +1044,20 @@ fn get_git_branch(repo_root: &Path) -> io::Result<String> {
 }
 
 fn expand_workspace_macros(id: &str, repo_root: &Path) -> io::Result<String> {
-    if !id.contains("{branch}") {
-        return Ok(id.to_string());
+    let mut expanded = id.to_string();
+
+    if expanded.contains("{uid}") {
+        // SAFETY: `geteuid` has no preconditions and reads process metadata only.
+        let uid = unsafe { libc::geteuid() };
+        expanded = expanded.replace("{uid}", &uid.to_string());
     }
 
-    let branch = get_git_branch(repo_root)?;
-    Ok(id.replace("{branch}", branch.as_str()))
+    if expanded.contains("{branch}") {
+        let branch = get_git_branch(repo_root)?;
+        expanded = expanded.replace("{branch}", branch.as_str());
+    }
+
+    Ok(expanded)
 }
 
 fn resolve_workspace_config(
@@ -1659,6 +1667,16 @@ mod tests {
     }
 
     #[test]
+    fn expand_workspace_macros_replaces_uid() {
+        let temp = tempdir().expect("tempdir");
+        // SAFETY: `geteuid` has no preconditions and reads process metadata only.
+        let uid = unsafe { libc::geteuid() };
+
+        let id = expand_workspace_macros("custom-{uid}", temp.path()).expect("expand");
+        assert_eq!(id, format!("custom-{uid}"));
+    }
+
+    #[test]
     fn expand_workspace_macros_replaces_branch() {
         if !git_available() {
             eprintln!("git not available; skipping test");
@@ -1670,6 +1688,22 @@ mod tests {
 
         let id = expand_workspace_macros("myproject-{branch}", temp.path()).expect("expand");
         assert_eq!(id, "myproject-feature/add-auth");
+    }
+
+    #[test]
+    fn expand_workspace_macros_replaces_uid_and_branch() {
+        if !git_available() {
+            eprintln!("git not available; skipping test");
+            return;
+        }
+        let temp = tempdir().expect("tempdir");
+        init_git_repo(temp.path());
+        run_git(temp.path(), &["checkout", "-b", "feature/add-auth"]);
+        // SAFETY: `geteuid` has no preconditions and reads process metadata only.
+        let uid = unsafe { libc::geteuid() };
+
+        let id = expand_workspace_macros("build-{uid}-{branch}", temp.path()).expect("expand");
+        assert_eq!(id, format!("build-{uid}-feature/add-auth"));
     }
 
     #[test]
