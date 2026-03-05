@@ -35,6 +35,7 @@ include = ["out/**"]
 
     Command::new(env!("CARGO_BIN_EXE_build-cli"))
         .current_dir(repo_root)
+        .env_remove("BUILD_SERVICE_ENABLED")
         .arg("--endpoint")
         .arg(&endpoint)
         .arg("make")
