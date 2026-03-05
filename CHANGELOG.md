@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- Support `{uid}` macro expansion for workspace IDs in the CLI (`workspace.id` and `BUILD_SERVICE_WORKSPACE_ID`).
+- Support `{uid}` macro expansion for workspace IDs in the CLI (`workspace.id` and `BUILD_SERVICE_WORKSPACE_ID`) ([#10](https://github.com/kcosr/build-service/pull/10)).
 
 ## [0.4.1] - 2026-02-08
 
