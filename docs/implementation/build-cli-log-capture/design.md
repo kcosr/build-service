@@ -51,6 +51,7 @@ Define a client-side design for preserving complete build output in log files wh
 8. Retain the existing output-limit config and env-var overrides, because they still control terminal verbosity.
 9. Resolve relative `log_dir` paths against the current run directory of the `build-cli` process when the run starts.
 10. Emit a final completion notice with both saved log paths whenever capture is enabled and the log sink was initialized successfully, even if no suppression occurred.
+    - Write this completion notice to `stderr` so it remains an operational message rather than build output.
 11. Use standard cross-platform file creation APIs in v1 and avoid platform-specific permission manipulation.
 
 ## 7. Contract / HTTP Semantics
@@ -87,7 +88,7 @@ Define a client-side design for preserving complete build output in log files wh
 6. `OutputLimiter` owns optional late-bound stream log path context and exposes a setter once the build ID is known; `LineLimiter` reads that state when it emits the suppression notice.
 7. If `stdout` or `stderr` events arrive before the `build` event, buffer those early event chunks in memory, initialize the log sink when the build ID arrives, then drain the buffered chunks into the correct log file and terminal limiter in original event order.
 8. If the `build` event never arrives, continue terminal output handling, emit a single warning that log capture could not be initialized, and abandon log capture for that run.
-9. Final summary output remains terminal-only, followed by a single completion notice that lists the saved log paths when capture is active.
+9. Final summary output remains terminal-only, followed by a single `stderr` completion notice that lists the saved log paths when capture is active.
 
 ### Writer behavior
 
@@ -101,7 +102,8 @@ Define a client-side design for preserving complete build output in log files wh
 - Relative `log_dir` values are resolved against the current run directory of the `build-cli` process when the run starts.
 - Default path uses the OS temp dir API, not a hardcoded `"/tmp"` string.
 - Per-build subdirectories are created lazily when the build event arrives.
-- Build IDs are assumed unique because the server generates them from UUIDs; if a target directory already exists, the current invocation truncates and rewrites `stdout.log` and `stderr.log`.
+- Build IDs are assumed unique because the server generates them from UUIDs; the client still treats the received ID as an opaque path component and abandons capture with a warning if it cannot be represented safely as a single local directory name.
+- If a target directory already exists, the current invocation truncates and rewrites `stdout.log` and `stderr.log`.
 - User-facing docs must call out that temp-dir retention is OS-managed and may be short-lived.
 
 ## 9. Error Semantics
@@ -112,7 +114,7 @@ Define a client-side design for preserving complete build output in log files wh
   - do not fail the build request outright,
   - continue terminal output handling,
   - print a single warning to `stderr` explaining that log capture was unavailable,
-  - abandon further log capture for that run after the first persistent failure, including mid-stream `ENOSPC` or permission errors,
+  - abandon further log capture for that run after the first log directory creation or file write failure, including mid-stream `ENOSPC` or permission errors,
   - retain the existing env-var-oriented suppression notice as a fallback for that run.
 
 ## 10. Migration Strategy
@@ -135,6 +137,7 @@ capture_logs = true
   - default disabled behavior
   - explicit `capture_logs = true`
   - explicit `log_dir`
+  - relative `log_dir` resolved against the current run directory
 - Unit tests for log-capture behavior:
   - build event initializes per-build paths
   - early `stdout` / `stderr` events buffer until the build ID is known
@@ -143,6 +146,7 @@ capture_logs = true
   - suppression notice points to the saved log path when capture is active
   - final completion notice prints saved paths even when no suppression occurs
   - failure to create/write logs warns once and falls back to the existing suppression hint
+  - invalid build ID path component warns once and abandons capture
 - Focused integration coverage for the `read_responses` loop using a mock NDJSON stream and real temp files.
 - Regression coverage for current limiter behavior when capture is disabled.
 - Full validation with `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`.

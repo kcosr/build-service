@@ -57,7 +57,7 @@ Implement client-side log capture for `build-cli` so that complete per-build `st
 - Buffer pre-build stream events until the build ID is known, then drain them into the log sink in original event order.
 - Preserve existing terminal limiter behavior.
 - Update suppression messaging to point at saved logs when available.
-- Emit a final completion notice with the saved log paths when capture succeeds.
+- Emit a final `stderr` completion notice with the saved log paths when capture succeeds.
 - Preserve current env-var hint as fallback if logs cannot be created.
 
 ### Acceptance Criteria
@@ -85,12 +85,13 @@ Implement client-side log capture for `build-cli` so that complete per-build `st
 | Area | Verification |
 | --- | --- |
 | Config parsing | Unit tests for `capture_logs` default, explicit enablement, and `log_dir` |
+| Relative path resolution | Unit test resolves relative `log_dir` against the current run directory |
 | Build ID handling | Unit test or focused integration test for `ResponseEvent::Build` path setup |
 | Early/missing build event | Tests for buffered early stream events and warning-only fallback when build ID never arrives |
 | Log writes | Unit test verifies `stdout.log` and `stderr.log` contents |
 | Suppression message | Unit test verifies path-based notice when capture is active |
 | Final notice | Unit test verifies both saved log paths are printed at build completion |
-| Fallback path | Unit test verifies warning plus legacy hint when log capture fails, including mid-stream write failure |
+| Fallback path | Unit test verifies warning plus legacy hint when log capture fails, including invalid build IDs and mid-stream write failure |
 | Integration | Focused `read_responses` test using mock NDJSON input and real temp files |
 | Formatting / lint / build | `cargo fmt`, `cargo clippy`, `cargo test`, `cargo build --release` |
 | Docs | Manual review of README and requirements changes |
@@ -144,6 +145,16 @@ For each phase, append an entry with:
 - Notes:
   - Reviews completed from live session streams and incorporated before locking docs.
   - H0 exit remains blocked until implementation execution begins from these locked artifacts.
+
+### 9.4 Execution Phase Evidence
+
+#### Phase H0: Contract Lock
+
+- Completion date: 2026-03-07
+- Commit hash(es):
+- Acceptance evidence:
+- Review run IDs + triage outcomes:
+- Go / No-Go decision:
 
 ## 10. Handoff Contract
 
