@@ -206,6 +206,27 @@ For each phase, append an entry with:
     - `defer`: document temp-dir accumulation behavior in README and requirements during H3 documentation updates.
 - Go / No-Go decision: Go
 
+#### Phase H3: Tests and Documentation
+
+- Completion date: 2026-03-07
+- Commit hash(es): `e2fa8e0`
+- Acceptance evidence:
+  - Added unit coverage in `src/bin/build-cli.rs` for capture-enabled config resolution, absolute/relative/empty `log_dir` handling, build-id validation, path-based suppression messaging, write-failure fallback, and a focused `read_responses()` integration with mock NDJSON and real temp files.
+  - Added CLI integration coverage in `tests/build_cli_log_capture.rs` for relative `log_dir` resolution from the startup run directory, saved-log completion notices with and without suppression, disabled-capture regression behavior, missing build-event fallback, and invalid build-ID fallback.
+  - Updated `README.md` and `requirements.md` with the new `[output]` keys, saved-log layout, relative-path semantics, fallback behavior, terminal-only limit semantics, and temp-dir retention caveat.
+  - Updated `CHANGELOG.md` under `## [Unreleased]` with the new feature summary. The PR link remains pending because no PR number exists in this local execution context.
+  - `docs/reference/architecture.md` and `docs/implementation/implementation-plan.md` are not present in this repository, so there were no corresponding finalization files to update.
+  - Verification passed before commit: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo build --release`.
+- Review run IDs + triage outcomes:
+  - Gemini `r_20260308035620592_d20bb25b`
+    - `reject`: no additional changes required; reviewer reported H3 complete against the locked design and phase plan.
+  - PI `r_20260308035620603_d03eda81`
+    - `accept`: add an integration test proving the final saved-log notice appears even when no suppression occurs.
+    - `accept`: add explicit coverage for disabled capture mode and absolute / empty `log_dir` handling.
+    - `reject`: add extra pre-build `stderr` buffering coverage in H3; rationale: the current buffering path is symmetric across stream variants and the phase gate is already satisfied by existing unit and integration coverage.
+    - `reject`: block H3 on a PR-numbered changelog link; rationale: the changelog entry is present, and the repo-specific PR-link completion step must happen when a PR number actually exists.
+- Go / No-Go decision: Go
+
 ## 10. Handoff Contract
 
 Use `$agent-runner-spec-execution` and `$agent-runner-review`.
