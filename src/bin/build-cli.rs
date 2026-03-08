@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -107,6 +107,10 @@ struct OutputConfig {
     stdout_tail_lines: usize,
     #[serde(default)]
     stderr_tail_lines: usize,
+    #[serde(default)]
+    capture_logs: bool,
+    #[serde(default)]
+    log_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -183,15 +187,20 @@ fn is_connection_failure(err: &reqwest::Error) -> bool {
     false
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct OutputLimits {
     stdout_max_lines: Option<usize>,
     stderr_max_lines: Option<usize>,
     stdout_tail_lines: usize,
     stderr_tail_lines: usize,
+    capture_logs: bool,
+    log_dir: Option<PathBuf>,
 }
 
-fn resolve_output_limits(config: Option<&OutputConfig>) -> io::Result<OutputLimits> {
+fn resolve_output_limits(
+    config: Option<&OutputConfig>,
+    run_dir: &Path,
+) -> io::Result<OutputLimits> {
     let stdout_max_lines = if let Ok(raw) = env::var(STDOUT_MAX_LINES_ENV) {
         parse_output_limit(&raw, STDOUT_MAX_LINES_ENV)?
             .or_else(|| config.and_then(|config| config.stdout_max_lines))
@@ -212,13 +221,41 @@ fn resolve_output_limits(config: Option<&OutputConfig>) -> io::Result<OutputLimi
     let stderr_tail_lines = config
         .map(|config| config.stderr_tail_lines)
         .unwrap_or_default();
+    let capture_logs = config.map(|config| config.capture_logs).unwrap_or(false);
+    let log_dir = if capture_logs {
+        Some(match config.and_then(|config| config.log_dir.as_deref()) {
+            Some(raw) => resolve_log_dir(raw, run_dir)?,
+            None => env::temp_dir().join("build-service"),
+        })
+    } else {
+        None
+    };
 
     Ok(OutputLimits {
         stdout_max_lines,
         stderr_max_lines,
         stdout_tail_lines,
         stderr_tail_lines,
+        capture_logs,
+        log_dir,
     })
+}
+
+fn resolve_log_dir(raw: &str, run_dir: &Path) -> io::Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output.log_dir must not be empty",
+        ));
+    }
+
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(run_dir.join(path))
+    }
 }
 
 fn parse_output_limit(raw: &str, var: &str) -> io::Result<Option<usize>> {
@@ -242,7 +279,7 @@ struct OutputLimiter {
 }
 
 impl OutputLimiter {
-    fn new(limits: OutputLimits) -> Self {
+    fn new(limits: &OutputLimits) -> Self {
         Self {
             stdout: LineLimiter::new(
                 "stdout",
@@ -257,6 +294,16 @@ impl OutputLimiter {
                 limits.stderr_tail_lines,
             ),
         }
+    }
+
+    fn set_log_paths(&mut self, paths: &StreamLogPaths) {
+        self.stdout.set_log_path(paths.stdout.clone());
+        self.stderr.set_log_path(paths.stderr.clone());
+    }
+
+    fn clear_log_paths(&mut self) {
+        self.stdout.clear_log_path();
+        self.stderr.clear_log_path();
     }
 
     fn write_stdout(&mut self, data: &str) -> io::Result<()> {
@@ -294,6 +341,7 @@ struct LineLimiter {
     suppression_notified: bool,
     suppressed_line: String,
     tail_buffer: VecDeque<String>,
+    log_path: Option<PathBuf>,
 }
 
 impl LineLimiter {
@@ -315,7 +363,16 @@ impl LineLimiter {
             suppression_notified: false,
             suppressed_line: String::new(),
             tail_buffer: VecDeque::new(),
+            log_path: None,
         }
+    }
+
+    fn set_log_path(&mut self, path: PathBuf) {
+        self.log_path = Some(path);
+    }
+
+    fn clear_log_path(&mut self) {
+        self.log_path = None;
     }
 
     fn write_chunk(&mut self, data: &str, writer: &mut dyn Write) -> io::Result<()> {
@@ -423,10 +480,131 @@ impl LineLimiter {
     }
 }
 
+#[derive(Debug, Clone)]
+struct StreamLogPaths {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+#[derive(Debug)]
+struct BuildLogSink {
+    paths: StreamLogPaths,
+    #[allow(dead_code)]
+    stdout_writer: BufWriter<fs::File>,
+    #[allow(dead_code)]
+    stderr_writer: BufWriter<fs::File>,
+}
+
+impl BuildLogSink {
+    fn new(base_dir: &Path, build_id: &str) -> io::Result<Self> {
+        validate_build_id(build_id)?;
+
+        let build_dir = base_dir.join(build_id);
+        fs::create_dir_all(&build_dir)?;
+
+        let stdout_path = build_dir.join("stdout.log");
+        let stderr_path = build_dir.join("stderr.log");
+        let stdout = BufWriter::new(fs::File::create(&stdout_path)?);
+        let stderr = BufWriter::new(fs::File::create(&stderr_path)?);
+
+        Ok(Self {
+            paths: StreamLogPaths {
+                stdout: stdout_path,
+                stderr: stderr_path,
+            },
+            stdout_writer: stdout,
+            stderr_writer: stderr,
+        })
+    }
+
+    fn paths(&self) -> &StreamLogPaths {
+        &self.paths
+    }
+}
+
+#[derive(Debug, Default)]
+struct LogCaptureState {
+    base_dir: Option<PathBuf>,
+    sink: Option<BuildLogSink>,
+    warning_emitted: bool,
+}
+
+impl LogCaptureState {
+    fn new(output_limits: &OutputLimits) -> Self {
+        Self {
+            base_dir: if output_limits.capture_logs {
+                output_limits.log_dir.clone()
+            } else {
+                None
+            },
+            sink: None,
+            warning_emitted: false,
+        }
+    }
+
+    fn initialize(&mut self, build_id: &str) -> io::Result<Option<StreamLogPaths>> {
+        let Some(base_dir) = self.base_dir.as_ref() else {
+            return Ok(None);
+        };
+
+        if let Some(existing) = self.sink.as_ref() {
+            return Ok(Some(existing.paths().clone()));
+        }
+
+        let sink = BuildLogSink::new(base_dir, build_id)?;
+        let paths = sink.paths().clone();
+        self.sink = Some(sink);
+        Ok(Some(paths))
+    }
+
+    fn disable(&mut self) {
+        self.base_dir = None;
+        self.sink = None;
+    }
+
+    fn write_warning(&mut self, message: &str) -> io::Result<()> {
+        if self.warning_emitted {
+            return Ok(());
+        }
+
+        self.warning_emitted = true;
+        let mut stderr = io::stderr();
+        writeln!(stderr, "{OUTPUT_PREFIX} log capture unavailable: {message}")?;
+        stderr.flush()
+    }
+}
+
+fn validate_build_id(build_id: &str) -> io::Result<()> {
+    let trimmed = build_id.trim();
+    if trimmed.is_empty() || matches!(trimmed, "." | "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "build id must be a non-empty single path component",
+        ));
+    }
+
+    if trimmed.contains('\0') || trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "build id must not contain path separators or NUL bytes",
+        ));
+    }
+
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    let repo_root = match find_repo_root() {
+    let run_dir = match env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("failed to resolve current directory: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let repo_root = match find_repo_root(&run_dir) {
         Ok(root) => root,
         Err(err) => {
             eprintln!("{err}");
@@ -470,7 +648,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let cwd = match resolve_relative_cwd(&repo_root) {
+    let cwd = match resolve_relative_cwd(&repo_root, &run_dir) {
         Ok(cwd) => cwd,
         Err(err) => {
             eprintln!("failed to resolve cwd: {err}");
@@ -525,7 +703,7 @@ fn main() -> ExitCode {
         }
     };
     let token = resolve_token(args.token, connection);
-    let output_limits = match resolve_output_limits(client_config.output.as_ref()) {
+    let output_limits = match resolve_output_limits(client_config.output.as_ref(), &run_dir) {
         Ok(limits) => limits,
         Err(err) => {
             eprintln!("{err}");
@@ -574,8 +752,8 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn find_repo_root() -> io::Result<PathBuf> {
-    let mut dir = env::current_dir()?;
+fn find_repo_root(start_dir: &Path) -> io::Result<PathBuf> {
+    let mut dir = start_dir.to_path_buf();
     loop {
         let candidate = dir.join(CLIENT_CONFIG_DIR).join(CLIENT_CONFIG_FILE);
         if candidate.exists() {
@@ -616,8 +794,7 @@ fn validate_patterns(patterns: &PatternConfig, label: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn resolve_relative_cwd(root: &Path) -> io::Result<Option<String>> {
-    let cwd = env::current_dir()?;
+fn resolve_relative_cwd(root: &Path, cwd: &Path) -> io::Result<Option<String>> {
     let rel = cwd
         .strip_prefix(root)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd is outside repo root"))?;
@@ -1236,7 +1413,8 @@ fn read_responses(
     let mut timed_out = false;
     let mut artifacts: Option<ArtifactArchive> = None;
     let mut workspace_id: Option<String> = None;
-    let mut output = OutputLimiter::new(*output_limits);
+    let mut output = OutputLimiter::new(output_limits);
+    let mut log_capture = LogCaptureState::new(output_limits);
 
     loop {
         line.clear();
@@ -1286,7 +1464,21 @@ fn read_responses(
                 workspace_id = event_workspace_id;
                 break;
             }
-            ResponseEvent::Build { .. } => {}
+            ResponseEvent::Build { id, .. } => match log_capture.initialize(&id) {
+                Ok(Some(paths)) => output.set_log_paths(&paths),
+                Ok(None) => {}
+                Err(err) => {
+                    output.clear_log_paths();
+                    log_capture.disable();
+                    log_capture
+                        .write_warning(&err.to_string())
+                        .map_err(|warn_err| {
+                            BuildError::Other(format!(
+                                "failed to report log capture warning: {warn_err}"
+                            ))
+                        })?;
+                }
+            },
         }
     }
 
@@ -1609,17 +1801,22 @@ mod tests {
             stderr_max_lines: Some(6),
             stdout_tail_lines: 1,
             stderr_tail_lines: 2,
+            capture_logs: false,
+            log_dir: None,
         };
 
-        let limits = resolve_output_limits(Some(&config)).unwrap();
+        let temp = tempdir().expect("tempdir");
+        let limits = resolve_output_limits(Some(&config), temp.path()).unwrap();
         assert_eq!(limits.stdout_max_lines, Some(5));
         assert_eq!(limits.stderr_max_lines, Some(6));
         assert_eq!(limits.stdout_tail_lines, 1);
         assert_eq!(limits.stderr_tail_lines, 2);
+        assert!(!limits.capture_logs);
+        assert_eq!(limits.log_dir, None);
 
         env::set_var(STDOUT_MAX_LINES_ENV, "9");
         env::set_var(STDERR_MAX_LINES_ENV, "0");
-        let limits = resolve_output_limits(Some(&config)).unwrap();
+        let limits = resolve_output_limits(Some(&config), temp.path()).unwrap();
         assert_eq!(limits.stdout_max_lines, Some(9));
         assert_eq!(limits.stderr_max_lines, Some(0));
 
