@@ -186,6 +186,26 @@ For each phase, append an entry with:
     - `defer`: add dedicated H1 unit coverage for path resolution and sink initialization in H3, per the locked phase ordering.
 - Go / No-Go decision: Go
 
+#### Phase H2: Streaming Integration and User Messaging
+
+- Completion date: 2026-03-07
+- Commit hash(es): `b53fd2c`
+- Acceptance evidence:
+  - `read_responses()` now buffers pre-build `stdout`/`stderr` events while capture is requested, drains buffered events in original order after the `build` event initializes the sink, and flushes buffered events back to the terminal with a single warning if capture cannot be initialized.
+  - `BuildLogSink` now writes complete `stdout` and `stderr` stream payloads to `<base>/<build_id>/stdout.log` and `stderr.log`, flushing after every event, while `LineLimiter` continues to enforce terminal max-line and tail-line behavior separately.
+  - Suppression notices now point to the saved per-stream log path when capture is healthy, fall back to the existing env-var hint when capture is unavailable, and `read_responses()` emits a final `stderr` completion notice with both log paths when capture remains active through completion.
+  - Verification passed before commit: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo build --release`.
+- Review run IDs + triage outcomes:
+  - Gemini `r_20260308034817227_e9102a60`
+    - `reject`: add a bounded pre-build buffer in v1; rationale: H0 already locked this as an accepted residual risk outside the v1 scope.
+    - `defer`: add H2 runtime coverage for buffering, fallback, and completion notices in H3, per the locked phase ordering.
+  - PI `r_20260308034817242_b7e721d7`
+    - `accept`: remove stale `#[allow(dead_code)]` annotations from actively used sink writers.
+    - `reject`: revisit flush-per-event performance in H2; rationale: the locked design explicitly chose per-event flushes for crash-safety and live log usefulness.
+    - `defer`: add focused H2 tests for path-based suppression, buffering, fallback, and final notices in H3.
+    - `defer`: document temp-dir accumulation behavior in README and requirements during H3 documentation updates.
+- Go / No-Go decision: Go
+
 ## 10. Handoff Contract
 
 Use `$agent-runner-spec-execution` and `$agent-runner-review`.
