@@ -504,11 +504,10 @@ struct StreamLogPaths {
     stderr: PathBuf,
 }
 
-#[derive(Debug)]
 struct BuildLogSink {
     paths: StreamLogPaths,
-    stdout_writer: BufWriter<fs::File>,
-    stderr_writer: BufWriter<fs::File>,
+    stdout_writer: BufWriter<Box<dyn Write>>,
+    stderr_writer: BufWriter<Box<dyn Write>>,
 }
 
 impl BuildLogSink {
@@ -520,8 +519,8 @@ impl BuildLogSink {
 
         let stdout_path = build_dir.join("stdout.log");
         let stderr_path = build_dir.join("stderr.log");
-        let stdout = BufWriter::new(fs::File::create(&stdout_path)?);
-        let stderr = BufWriter::new(fs::File::create(&stderr_path)?);
+        let stdout = BufWriter::new(Box::new(fs::File::create(&stdout_path)?) as Box<dyn Write>);
+        let stderr = BufWriter::new(Box::new(fs::File::create(&stderr_path)?) as Box<dyn Write>);
 
         Ok(Self {
             paths: StreamLogPaths {
@@ -546,9 +545,22 @@ impl BuildLogSink {
         self.stderr_writer.write_all(data.as_bytes())?;
         self.stderr_writer.flush()
     }
+
+    #[cfg(test)]
+    fn from_writers(
+        paths: StreamLogPaths,
+        stdout_writer: Box<dyn Write>,
+        stderr_writer: Box<dyn Write>,
+    ) -> Self {
+        Self {
+            paths,
+            stdout_writer: BufWriter::new(stdout_writer),
+            stderr_writer: BufWriter::new(stderr_writer),
+        }
+    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct LogCaptureState {
     base_dir: Option<PathBuf>,
     sink: Option<BuildLogSink>,
@@ -1772,9 +1784,11 @@ fn normalize_exit_code(code: i32) -> u8 {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{BufRead, BufReader, Read};
     use std::net::TcpListener;
     use std::path::Path;
     use std::sync::Mutex;
+    use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
     use zip::ZipArchive;
@@ -1808,6 +1822,68 @@ mod tests {
         fs::write(repo_root.join("README.md"), "test").expect("write readme");
         run_git(repo_root, &["add", "."]);
         run_git(repo_root, &["commit", "-m", "init"]);
+    }
+
+    fn start_ndjson_server(body: String) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let addr = listener.local_addr().expect("server addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read request line");
+            assert!(
+                request_line.starts_with("GET ") || request_line.starts_with("POST "),
+                "unexpected request line: {request_line:?}"
+            );
+
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read header line");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length =
+                            Some(value.trim().parse::<usize>().expect("parse content length"));
+                    }
+                }
+            }
+
+            if let Some(content_length) = content_length {
+                let mut discard = vec![0; content_length];
+                reader.read_exact(&mut discard).expect("read request body");
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("simulated write failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1980,6 +2056,151 @@ mod tests {
         } else {
             env::remove_var(STDERR_MAX_LINES_ENV);
         }
+    }
+
+    #[test]
+    fn resolve_output_limits_enables_capture_and_resolves_log_dir() {
+        let temp = tempdir().expect("tempdir");
+        let config = OutputConfig {
+            stdout_max_lines: None,
+            stderr_max_lines: None,
+            stdout_tail_lines: 0,
+            stderr_tail_lines: 0,
+            capture_logs: true,
+            log_dir: Some("captured-logs".to_string()),
+        };
+
+        let limits = resolve_output_limits(Some(&config), temp.path()).expect("resolve limits");
+        assert!(limits.capture_logs);
+        assert_eq!(limits.log_dir, Some(temp.path().join("captured-logs")));
+
+        let default_config = OutputConfig {
+            log_dir: None,
+            ..config
+        };
+        let default_limits =
+            resolve_output_limits(Some(&default_config), temp.path()).expect("default log dir");
+        assert_eq!(
+            default_limits.log_dir,
+            Some(env::temp_dir().join("build-service"))
+        );
+    }
+
+    #[test]
+    fn resolve_log_dir_accepts_absolute_and_rejects_empty_values() {
+        let temp = tempdir().expect("tempdir");
+        let absolute = temp.path().join("logs");
+        assert_eq!(
+            resolve_log_dir(absolute.to_str().expect("absolute path"), temp.path())
+                .expect("absolute log dir"),
+            absolute
+        );
+        assert!(resolve_log_dir("   ", temp.path()).is_err());
+    }
+
+    #[test]
+    fn validate_build_id_rejects_invalid_values() {
+        for invalid in ["", ".", "..", "bad/id", "bad\\id", "bad\0id"] {
+            assert!(
+                validate_build_id(invalid).is_err(),
+                "expected invalid build id: {invalid:?}"
+            );
+        }
+
+        validate_build_id("bld_123").expect("valid build id");
+    }
+
+    #[test]
+    fn line_limiter_uses_log_path_in_suppression_notice() {
+        let mut limiter = LineLimiter::new("stdout", STDOUT_MAX_LINES_ENV, Some(1), 0);
+        limiter.set_log_path(PathBuf::from("/tmp/build-service/bld_123/stdout.log"));
+        let mut output = Vec::new();
+
+        limiter.write_chunk("one\ntwo\n", &mut output).unwrap();
+        limiter.finish();
+        limiter.write_summary(&mut output, "stdout").unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(
+            rendered,
+            "one\n[build-service] suppressing stdout output due to limits (full log: /tmp/build-service/bld_123/stdout.log)\n[build-service] 1 more stdout lines suppressed\n"
+        );
+    }
+
+    #[test]
+    fn log_capture_state_disables_after_write_failure() {
+        let paths = StreamLogPaths {
+            stdout: PathBuf::from("/tmp/stdout.log"),
+            stderr: PathBuf::from("/tmp/stderr.log"),
+        };
+        let mut state = LogCaptureState {
+            base_dir: Some(PathBuf::from("/tmp/build-service")),
+            sink: Some(BuildLogSink::from_writers(
+                paths.clone(),
+                Box::new(FailingWriter),
+                Box::new(Vec::<u8>::new()),
+            )),
+            warning_emitted: false,
+            pending_events: VecDeque::new(),
+        };
+        let limits = OutputLimits {
+            stdout_max_lines: Some(10),
+            stderr_max_lines: Some(10),
+            stdout_tail_lines: 0,
+            stderr_tail_lines: 0,
+            capture_logs: true,
+            log_dir: Some(PathBuf::from("/tmp/build-service")),
+        };
+        let mut output = OutputLimiter::new(&limits);
+        output.set_log_paths(&paths);
+
+        state
+            .process_event(
+                BufferedStreamEvent::Stdout("one\ntwo\n".to_string()),
+                &mut output,
+            )
+            .expect("process event");
+
+        assert!(!state.capture_requested());
+        assert!(state.warning_emitted);
+        assert!(output.stdout.log_path.is_none());
+        assert!(output.stderr.log_path.is_none());
+    }
+
+    #[test]
+    fn read_responses_buffers_prebuild_events_and_writes_logs() {
+        let temp = tempdir().expect("tempdir");
+        let log_dir = temp.path().join("captured-logs");
+        let body = concat!(
+            "{\"type\":\"stdout\",\"data\":\"before-one\\nbefore-two\\n\"}\n",
+            "{\"type\":\"build\",\"id\":\"bld_123\",\"status\":\"started\"}\n",
+            "{\"type\":\"stderr\",\"data\":\"err-one\\nerr-two\\n\"}\n",
+            "{\"type\":\"exit\",\"code\":0,\"timed_out\":false}\n"
+        )
+        .to_string();
+        let (url, handle) = start_ndjson_server(body);
+        let response = Client::new().get(url).send().expect("send request");
+        let limits = OutputLimits {
+            stdout_max_lines: None,
+            stderr_max_lines: None,
+            stdout_tail_lines: 0,
+            stderr_tail_lines: 0,
+            capture_logs: true,
+            log_dir: Some(log_dir.clone()),
+        };
+
+        let result = read_responses(response, &limits).expect("read responses");
+        handle.join().expect("join server");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            fs::read_to_string(log_dir.join("bld_123/stdout.log")).expect("read stdout log"),
+            "before-one\nbefore-two\n"
+        );
+        assert_eq!(
+            fs::read_to_string(log_dir.join("bld_123/stderr.log")).expect("read stderr log"),
+            "err-one\nerr-two\n"
+        );
     }
 
     #[test]

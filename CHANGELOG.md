@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Add opt-in `build-cli` log capture with per-build `stdout.log` / `stderr.log`, path-based suppression notices, and final saved-log reporting. PR link pending.
 
 ## [0.4.2] - 2026-03-05
 

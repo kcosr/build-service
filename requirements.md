@@ -166,6 +166,8 @@ CFLAGS = "-O2 -g"
 # ttl_sec = 3600
 
 [output]
+# capture_logs = true
+# log_dir = "captured-logs"
 # stdout_max_lines = 2000
 # stderr_max_lines = 1000
 # stdout_tail_lines = 50
@@ -173,7 +175,10 @@ CFLAGS = "-O2 -g"
 ```
 
 Notes:
-- Output limits are optional; unset means unlimited, `0` disables output. Once reached, the CLI prints a `[build-service] suppressing <stream> output due to limits (increase output lines with BUILD_SERVICE_STDOUT_MAX_LINES/BUILD_SERVICE_STDERR_MAX_LINES)` notice and later summarizes suppressed lines.
+- When `output.capture_logs = true`, the client writes complete build transcripts to `<base>/<build_id>/stdout.log` and `<base>/<build_id>/stderr.log`. If `output.log_dir` is unset, `<base>` defaults to the OS temp directory under `build-service`; relative `log_dir` values resolve against the directory where `build-cli` starts.
+- Output limits remain terminal-only controls; unset means unlimited, `0` disables output. When capture is healthy, suppression notices point to the saved log path for that stream. If capture is unavailable, the client falls back to the existing `BUILD_SERVICE_STDOUT_MAX_LINES` / `BUILD_SERVICE_STDERR_MAX_LINES` hint and still prints the suppressed-line summary.
+- When capture succeeds, the client emits a final `stderr` notice listing both saved log paths.
+- Temp-dir retention is OS-managed and may be short-lived. Persistent log retention requires setting `output.log_dir` to a durable path and cleaning old build directories separately.
 - Source include patterns that match nothing are skipped.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
