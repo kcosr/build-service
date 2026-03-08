@@ -107,6 +107,8 @@ CFLAGS = "-O2 -g"
 # ttl_sec = 3600
 
 [output]
+# capture_logs = true
+# log_dir = "captured-logs"  # relative to the directory where build-cli starts
 # stdout_max_lines = 2000
 # stderr_max_lines = 1000
 # stdout_tail_lines = 50
@@ -116,7 +118,10 @@ CFLAGS = "-O2 -g"
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
 - Source include patterns that match nothing are skipped.
-- Output limits are optional; unset means unlimited, `0` disables output. Once reached, the CLI prints a `[build-service] suppressing <stream> output due to limits (increase output lines with BUILD_SERVICE_STDOUT_MAX_LINES/BUILD_SERVICE_STDERR_MAX_LINES)` notice and later summarizes suppressed lines.
+- When `output.capture_logs = true`, `build-cli` writes complete stream transcripts to `<base>/<build_id>/stdout.log` and `<base>/<build_id>/stderr.log`. If `output.log_dir` is unset, `<base>` defaults to `std::env::temp_dir().join("build-service")`; if it is relative, it is resolved against the directory where the `build-cli` process starts.
+- Output limits are optional and still apply only to terminal output; unset means unlimited, `0` disables output. When capture is healthy, the suppression notice points to the saved log path for that stream. If capture is unavailable, the CLI falls back to the existing env-var hint (`BUILD_SERVICE_STDOUT_MAX_LINES` / `BUILD_SERVICE_STDERR_MAX_LINES`) and later summarizes suppressed lines.
+- When log capture initializes successfully, the CLI prints a final `stderr` notice with both saved log paths even if no suppression occurred.
+- Temp-dir retention is OS-managed. If you rely on saved logs, set `output.log_dir` to a persistent location and clean up old build directories yourself.
 - When workspace reuse is enabled, the CLI reads `.build-service/workspace-id` if no workspace id is configured and writes it when the server returns `workspace_id`.
 - `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{branch}` and `{uid}`; the CLI expands `{branch}` to the current git branch and `{uid}` to the effective user id, and the server sanitizes the resulting workspace id.
 - Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force a full resync of sources for the next build.

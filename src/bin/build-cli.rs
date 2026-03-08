@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -107,6 +107,10 @@ struct OutputConfig {
     stdout_tail_lines: usize,
     #[serde(default)]
     stderr_tail_lines: usize,
+    #[serde(default)]
+    capture_logs: bool,
+    #[serde(default)]
+    log_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -183,15 +187,20 @@ fn is_connection_failure(err: &reqwest::Error) -> bool {
     false
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct OutputLimits {
     stdout_max_lines: Option<usize>,
     stderr_max_lines: Option<usize>,
     stdout_tail_lines: usize,
     stderr_tail_lines: usize,
+    capture_logs: bool,
+    log_dir: Option<PathBuf>,
 }
 
-fn resolve_output_limits(config: Option<&OutputConfig>) -> io::Result<OutputLimits> {
+fn resolve_output_limits(
+    config: Option<&OutputConfig>,
+    run_dir: &Path,
+) -> io::Result<OutputLimits> {
     let stdout_max_lines = if let Ok(raw) = env::var(STDOUT_MAX_LINES_ENV) {
         parse_output_limit(&raw, STDOUT_MAX_LINES_ENV)?
             .or_else(|| config.and_then(|config| config.stdout_max_lines))
@@ -212,13 +221,41 @@ fn resolve_output_limits(config: Option<&OutputConfig>) -> io::Result<OutputLimi
     let stderr_tail_lines = config
         .map(|config| config.stderr_tail_lines)
         .unwrap_or_default();
+    let capture_logs = config.map(|config| config.capture_logs).unwrap_or(false);
+    let log_dir = if capture_logs {
+        Some(match config.and_then(|config| config.log_dir.as_deref()) {
+            Some(raw) => resolve_log_dir(raw, run_dir)?,
+            None => env::temp_dir().join("build-service"),
+        })
+    } else {
+        None
+    };
 
     Ok(OutputLimits {
         stdout_max_lines,
         stderr_max_lines,
         stdout_tail_lines,
         stderr_tail_lines,
+        capture_logs,
+        log_dir,
     })
+}
+
+fn resolve_log_dir(raw: &str, run_dir: &Path) -> io::Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output.log_dir must not be empty",
+        ));
+    }
+
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(run_dir.join(path))
+    }
 }
 
 fn parse_output_limit(raw: &str, var: &str) -> io::Result<Option<usize>> {
@@ -242,7 +279,7 @@ struct OutputLimiter {
 }
 
 impl OutputLimiter {
-    fn new(limits: OutputLimits) -> Self {
+    fn new(limits: &OutputLimits) -> Self {
         Self {
             stdout: LineLimiter::new(
                 "stdout",
@@ -257,6 +294,16 @@ impl OutputLimiter {
                 limits.stderr_tail_lines,
             ),
         }
+    }
+
+    fn set_log_paths(&mut self, paths: &StreamLogPaths) {
+        self.stdout.set_log_path(paths.stdout.clone());
+        self.stderr.set_log_path(paths.stderr.clone());
+    }
+
+    fn clear_log_paths(&mut self) {
+        self.stdout.clear_log_path();
+        self.stderr.clear_log_path();
     }
 
     fn write_stdout(&mut self, data: &str) -> io::Result<()> {
@@ -282,6 +329,12 @@ impl OutputLimiter {
     }
 }
 
+#[derive(Debug, Clone)]
+enum BufferedStreamEvent {
+    Stdout(String),
+    Stderr(String),
+}
+
 struct LineLimiter {
     label: &'static str,
     env_var: &'static str,
@@ -294,6 +347,7 @@ struct LineLimiter {
     suppression_notified: bool,
     suppressed_line: String,
     tail_buffer: VecDeque<String>,
+    log_path: Option<PathBuf>,
 }
 
 impl LineLimiter {
@@ -315,7 +369,16 @@ impl LineLimiter {
             suppression_notified: false,
             suppressed_line: String::new(),
             tail_buffer: VecDeque::new(),
+            log_path: None,
         }
+    }
+
+    fn set_log_path(&mut self, path: PathBuf) {
+        self.log_path = Some(path);
+    }
+
+    fn clear_log_path(&mut self) {
+        self.log_path = None;
     }
 
     fn write_chunk(&mut self, data: &str, writer: &mut dyn Write) -> io::Result<()> {
@@ -335,11 +398,7 @@ impl LineLimiter {
                 self.at_line_start = false;
 
                 if !self.current_line_allowed && !self.suppression_notified {
-                    output.push_str(&format!(
-                        "{OUTPUT_PREFIX} suppressing {} output due to limits (increase output lines with {}=<lines>)\n",
-                        self.label,
-                        self.env_var
-                    ));
+                    output.push_str(&self.suppression_notice());
                     self.suppression_notified = true;
                 }
             }
@@ -421,12 +480,247 @@ impl LineLimiter {
             self.tail_buffer.pop_front();
         }
     }
+
+    fn suppression_notice(&self) -> String {
+        if let Some(log_path) = &self.log_path {
+            format!(
+                "{OUTPUT_PREFIX} suppressing {} output due to limits (full log: {})\n",
+                self.label,
+                log_path.display()
+            )
+        } else {
+            format!(
+                "{OUTPUT_PREFIX} suppressing {} output due to limits (increase output lines with {}=<lines>)\n",
+                self.label,
+                self.env_var
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StreamLogPaths {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+struct BuildLogSink {
+    paths: StreamLogPaths,
+    stdout_writer: BufWriter<Box<dyn Write>>,
+    stderr_writer: BufWriter<Box<dyn Write>>,
+}
+
+impl BuildLogSink {
+    fn new(base_dir: &Path, build_id: &str) -> io::Result<Self> {
+        validate_build_id(build_id)?;
+
+        let build_dir = base_dir.join(build_id);
+        fs::create_dir_all(&build_dir)?;
+
+        let stdout_path = build_dir.join("stdout.log");
+        let stderr_path = build_dir.join("stderr.log");
+        let stdout = BufWriter::new(Box::new(fs::File::create(&stdout_path)?) as Box<dyn Write>);
+        let stderr = BufWriter::new(Box::new(fs::File::create(&stderr_path)?) as Box<dyn Write>);
+
+        Ok(Self {
+            paths: StreamLogPaths {
+                stdout: stdout_path,
+                stderr: stderr_path,
+            },
+            stdout_writer: stdout,
+            stderr_writer: stderr,
+        })
+    }
+
+    fn paths(&self) -> &StreamLogPaths {
+        &self.paths
+    }
+
+    fn write_stdout(&mut self, data: &str) -> io::Result<()> {
+        self.stdout_writer.write_all(data.as_bytes())?;
+        self.stdout_writer.flush()
+    }
+
+    fn write_stderr(&mut self, data: &str) -> io::Result<()> {
+        self.stderr_writer.write_all(data.as_bytes())?;
+        self.stderr_writer.flush()
+    }
+
+    #[cfg(test)]
+    fn from_writers(
+        paths: StreamLogPaths,
+        stdout_writer: Box<dyn Write>,
+        stderr_writer: Box<dyn Write>,
+    ) -> Self {
+        Self {
+            paths,
+            stdout_writer: BufWriter::new(stdout_writer),
+            stderr_writer: BufWriter::new(stderr_writer),
+        }
+    }
+}
+
+#[derive(Default)]
+struct LogCaptureState {
+    base_dir: Option<PathBuf>,
+    sink: Option<BuildLogSink>,
+    warning_emitted: bool,
+    pending_events: VecDeque<BufferedStreamEvent>,
+}
+
+impl LogCaptureState {
+    fn new(output_limits: &OutputLimits) -> Self {
+        Self {
+            base_dir: if output_limits.capture_logs {
+                output_limits.log_dir.clone()
+            } else {
+                None
+            },
+            sink: None,
+            warning_emitted: false,
+            pending_events: VecDeque::new(),
+        }
+    }
+
+    fn initialize(&mut self, build_id: &str) -> io::Result<Option<StreamLogPaths>> {
+        let Some(base_dir) = self.base_dir.as_ref() else {
+            return Ok(None);
+        };
+
+        if let Some(existing) = self.sink.as_ref() {
+            return Ok(Some(existing.paths().clone()));
+        }
+
+        let sink = BuildLogSink::new(base_dir, build_id)?;
+        let paths = sink.paths().clone();
+        self.sink = Some(sink);
+        Ok(Some(paths))
+    }
+
+    fn disable(&mut self) {
+        self.base_dir = None;
+        self.sink = None;
+    }
+
+    fn capture_requested(&self) -> bool {
+        self.base_dir.is_some() || self.sink.is_some()
+    }
+
+    fn capture_active(&self) -> bool {
+        self.sink.is_some()
+    }
+
+    fn push_pending(&mut self, event: BufferedStreamEvent) {
+        self.pending_events.push_back(event);
+    }
+
+    fn drain_pending(&mut self, output: &mut OutputLimiter) -> io::Result<()> {
+        while let Some(event) = self.pending_events.pop_front() {
+            self.process_event(event, output)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_to_terminal(&mut self, output: &mut OutputLimiter) -> io::Result<()> {
+        while let Some(event) = self.pending_events.pop_front() {
+            write_event_to_terminal(event, output)?;
+        }
+        Ok(())
+    }
+
+    fn process_event(
+        &mut self,
+        event: BufferedStreamEvent,
+        output: &mut OutputLimiter,
+    ) -> io::Result<()> {
+        if let Some(sink) = self.sink.as_mut() {
+            let log_result = match &event {
+                BufferedStreamEvent::Stdout(data) => sink.write_stdout(data),
+                BufferedStreamEvent::Stderr(data) => sink.write_stderr(data),
+            };
+
+            if let Err(err) = log_result {
+                output.clear_log_paths();
+                self.disable();
+                self.write_warning(&err.to_string())?;
+            }
+        }
+
+        write_event_to_terminal(event, output)
+    }
+
+    fn completion_paths(&self) -> Option<&StreamLogPaths> {
+        self.sink.as_ref().map(|sink| sink.paths())
+    }
+
+    fn write_warning(&mut self, message: &str) -> io::Result<()> {
+        if self.warning_emitted {
+            return Ok(());
+        }
+
+        self.warning_emitted = true;
+        let mut stderr = io::stderr();
+        writeln!(stderr, "{OUTPUT_PREFIX} log capture unavailable: {message}")?;
+        stderr.flush()
+    }
+
+    fn write_completion_notice(&self) -> io::Result<()> {
+        let Some(paths) = self.completion_paths() else {
+            return Ok(());
+        };
+
+        let mut stderr = io::stderr();
+        writeln!(
+            stderr,
+            "{OUTPUT_PREFIX} saved full logs: stdout={}, stderr={}",
+            paths.stdout.display(),
+            paths.stderr.display()
+        )?;
+        stderr.flush()
+    }
+}
+
+fn write_event_to_terminal(
+    event: BufferedStreamEvent,
+    output: &mut OutputLimiter,
+) -> io::Result<()> {
+    match event {
+        BufferedStreamEvent::Stdout(data) => output.write_stdout(&data),
+        BufferedStreamEvent::Stderr(data) => output.write_stderr(&data),
+    }
+}
+
+fn validate_build_id(build_id: &str) -> io::Result<()> {
+    let trimmed = build_id.trim();
+    if trimmed.is_empty() || matches!(trimmed, "." | "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "build id must be a non-empty single path component",
+        ));
+    }
+
+    if trimmed.contains('\0') || trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "build id must not contain path separators or NUL bytes",
+        ));
+    }
+
+    Ok(())
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    let repo_root = match find_repo_root() {
+    let run_dir = match env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("failed to resolve current directory: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let repo_root = match find_repo_root(&run_dir) {
         Ok(root) => root,
         Err(err) => {
             eprintln!("{err}");
@@ -470,7 +764,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let cwd = match resolve_relative_cwd(&repo_root) {
+    let cwd = match resolve_relative_cwd(&repo_root, &run_dir) {
         Ok(cwd) => cwd,
         Err(err) => {
             eprintln!("failed to resolve cwd: {err}");
@@ -525,7 +819,7 @@ fn main() -> ExitCode {
         }
     };
     let token = resolve_token(args.token, connection);
-    let output_limits = match resolve_output_limits(client_config.output.as_ref()) {
+    let output_limits = match resolve_output_limits(client_config.output.as_ref(), &run_dir) {
         Ok(limits) => limits,
         Err(err) => {
             eprintln!("{err}");
@@ -574,8 +868,8 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn find_repo_root() -> io::Result<PathBuf> {
-    let mut dir = env::current_dir()?;
+fn find_repo_root(start_dir: &Path) -> io::Result<PathBuf> {
+    let mut dir = start_dir.to_path_buf();
     loop {
         let candidate = dir.join(CLIENT_CONFIG_DIR).join(CLIENT_CONFIG_FILE);
         if candidate.exists() {
@@ -616,8 +910,7 @@ fn validate_patterns(patterns: &PatternConfig, label: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn resolve_relative_cwd(root: &Path) -> io::Result<Option<String>> {
-    let cwd = env::current_dir()?;
+fn resolve_relative_cwd(root: &Path, cwd: &Path) -> io::Result<Option<String>> {
     let rel = cwd
         .strip_prefix(root)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd is outside repo root"))?;
@@ -1236,7 +1529,9 @@ fn read_responses(
     let mut timed_out = false;
     let mut artifacts: Option<ArtifactArchive> = None;
     let mut workspace_id: Option<String> = None;
-    let mut output = OutputLimiter::new(*output_limits);
+    let mut output = OutputLimiter::new(output_limits);
+    let mut log_capture = LogCaptureState::new(output_limits);
+    let mut build_event_seen = false;
 
     loop {
         line.clear();
@@ -1257,14 +1552,26 @@ fn read_responses(
 
         match event {
             ResponseEvent::Stdout { data } => {
-                output
-                    .write_stdout(&data)
-                    .map_err(|err| BuildError::Other(format!("failed to write stdout: {err}")))?;
+                if log_capture.capture_requested() && !log_capture.capture_active() {
+                    log_capture.push_pending(BufferedStreamEvent::Stdout(data));
+                } else {
+                    log_capture
+                        .process_event(BufferedStreamEvent::Stdout(data), &mut output)
+                        .map_err(|err| {
+                            BuildError::Other(format!("failed to write stdout: {err}"))
+                        })?;
+                }
             }
             ResponseEvent::Stderr { data } => {
-                output
-                    .write_stderr(&data)
-                    .map_err(|err| BuildError::Other(format!("failed to write stderr: {err}")))?;
+                if log_capture.capture_requested() && !log_capture.capture_active() {
+                    log_capture.push_pending(BufferedStreamEvent::Stderr(data));
+                } else {
+                    log_capture
+                        .process_event(BufferedStreamEvent::Stderr(data), &mut output)
+                        .map_err(|err| {
+                            BuildError::Other(format!("failed to write stderr: {err}"))
+                        })?;
+                }
             }
             ResponseEvent::Error { message, .. } => {
                 if let Some(message) = message {
@@ -1286,13 +1593,59 @@ fn read_responses(
                 workspace_id = event_workspace_id;
                 break;
             }
-            ResponseEvent::Build { .. } => {}
+            ResponseEvent::Build { id, .. } => {
+                build_event_seen = true;
+                match log_capture.initialize(&id) {
+                    Ok(Some(paths)) => {
+                        output.set_log_paths(&paths);
+                        log_capture.drain_pending(&mut output).map_err(|err| {
+                            BuildError::Other(format!("failed to write buffered output: {err}"))
+                        })?;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        output.clear_log_paths();
+                        log_capture.disable();
+                        log_capture
+                            .write_warning(&err.to_string())
+                            .map_err(|warn_err| {
+                                BuildError::Other(format!(
+                                    "failed to report log capture warning: {warn_err}"
+                                ))
+                            })?;
+                        log_capture.flush_pending_to_terminal(&mut output).map_err(
+                            |flush_err| {
+                                BuildError::Other(format!(
+                                    "failed to write buffered output: {flush_err}"
+                                ))
+                            },
+                        )?;
+                    }
+                }
+            }
         }
+    }
+
+    if log_capture.capture_requested() && !build_event_seen {
+        output.clear_log_paths();
+        log_capture.disable();
+        log_capture
+            .write_warning("build id was not received from the response stream")
+            .map_err(|err| {
+                BuildError::Other(format!("failed to report log capture warning: {err}"))
+            })?;
+        log_capture
+            .flush_pending_to_terminal(&mut output)
+            .map_err(|err| BuildError::Other(format!("failed to write buffered output: {err}")))?;
     }
 
     output
         .finish()
         .map_err(|err| BuildError::Other(format!("failed to flush output: {err}")))?;
+
+    log_capture.write_completion_notice().map_err(|err| {
+        BuildError::Other(format!("failed to write log completion notice: {err}"))
+    })?;
 
     match exit_code {
         Some(code) => Ok(BuildResult {
@@ -1431,9 +1784,11 @@ fn normalize_exit_code(code: i32) -> u8 {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{BufRead, BufReader, Read};
     use std::net::TcpListener;
     use std::path::Path;
     use std::sync::Mutex;
+    use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
     use zip::ZipArchive;
@@ -1467,6 +1822,68 @@ mod tests {
         fs::write(repo_root.join("README.md"), "test").expect("write readme");
         run_git(repo_root, &["add", "."]);
         run_git(repo_root, &["commit", "-m", "init"]);
+    }
+
+    fn start_ndjson_server(body: String) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let addr = listener.local_addr().expect("server addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read request line");
+            assert!(
+                request_line.starts_with("GET ") || request_line.starts_with("POST "),
+                "unexpected request line: {request_line:?}"
+            );
+
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read header line");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length =
+                            Some(value.trim().parse::<usize>().expect("parse content length"));
+                    }
+                }
+            }
+
+            if let Some(content_length) = content_length {
+                let mut discard = vec![0; content_length];
+                reader.read_exact(&mut discard).expect("read request body");
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("simulated write failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1609,17 +2026,22 @@ mod tests {
             stderr_max_lines: Some(6),
             stdout_tail_lines: 1,
             stderr_tail_lines: 2,
+            capture_logs: false,
+            log_dir: None,
         };
 
-        let limits = resolve_output_limits(Some(&config)).unwrap();
+        let temp = tempdir().expect("tempdir");
+        let limits = resolve_output_limits(Some(&config), temp.path()).unwrap();
         assert_eq!(limits.stdout_max_lines, Some(5));
         assert_eq!(limits.stderr_max_lines, Some(6));
         assert_eq!(limits.stdout_tail_lines, 1);
         assert_eq!(limits.stderr_tail_lines, 2);
+        assert!(!limits.capture_logs);
+        assert_eq!(limits.log_dir, None);
 
         env::set_var(STDOUT_MAX_LINES_ENV, "9");
         env::set_var(STDERR_MAX_LINES_ENV, "0");
-        let limits = resolve_output_limits(Some(&config)).unwrap();
+        let limits = resolve_output_limits(Some(&config), temp.path()).unwrap();
         assert_eq!(limits.stdout_max_lines, Some(9));
         assert_eq!(limits.stderr_max_lines, Some(0));
 
@@ -1634,6 +2056,151 @@ mod tests {
         } else {
             env::remove_var(STDERR_MAX_LINES_ENV);
         }
+    }
+
+    #[test]
+    fn resolve_output_limits_enables_capture_and_resolves_log_dir() {
+        let temp = tempdir().expect("tempdir");
+        let config = OutputConfig {
+            stdout_max_lines: None,
+            stderr_max_lines: None,
+            stdout_tail_lines: 0,
+            stderr_tail_lines: 0,
+            capture_logs: true,
+            log_dir: Some("captured-logs".to_string()),
+        };
+
+        let limits = resolve_output_limits(Some(&config), temp.path()).expect("resolve limits");
+        assert!(limits.capture_logs);
+        assert_eq!(limits.log_dir, Some(temp.path().join("captured-logs")));
+
+        let default_config = OutputConfig {
+            log_dir: None,
+            ..config
+        };
+        let default_limits =
+            resolve_output_limits(Some(&default_config), temp.path()).expect("default log dir");
+        assert_eq!(
+            default_limits.log_dir,
+            Some(env::temp_dir().join("build-service"))
+        );
+    }
+
+    #[test]
+    fn resolve_log_dir_accepts_absolute_and_rejects_empty_values() {
+        let temp = tempdir().expect("tempdir");
+        let absolute = temp.path().join("logs");
+        assert_eq!(
+            resolve_log_dir(absolute.to_str().expect("absolute path"), temp.path())
+                .expect("absolute log dir"),
+            absolute
+        );
+        assert!(resolve_log_dir("   ", temp.path()).is_err());
+    }
+
+    #[test]
+    fn validate_build_id_rejects_invalid_values() {
+        for invalid in ["", ".", "..", "bad/id", "bad\\id", "bad\0id"] {
+            assert!(
+                validate_build_id(invalid).is_err(),
+                "expected invalid build id: {invalid:?}"
+            );
+        }
+
+        validate_build_id("bld_123").expect("valid build id");
+    }
+
+    #[test]
+    fn line_limiter_uses_log_path_in_suppression_notice() {
+        let mut limiter = LineLimiter::new("stdout", STDOUT_MAX_LINES_ENV, Some(1), 0);
+        limiter.set_log_path(PathBuf::from("/tmp/build-service/bld_123/stdout.log"));
+        let mut output = Vec::new();
+
+        limiter.write_chunk("one\ntwo\n", &mut output).unwrap();
+        limiter.finish();
+        limiter.write_summary(&mut output, "stdout").unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(
+            rendered,
+            "one\n[build-service] suppressing stdout output due to limits (full log: /tmp/build-service/bld_123/stdout.log)\n[build-service] 1 more stdout lines suppressed\n"
+        );
+    }
+
+    #[test]
+    fn log_capture_state_disables_after_write_failure() {
+        let paths = StreamLogPaths {
+            stdout: PathBuf::from("/tmp/stdout.log"),
+            stderr: PathBuf::from("/tmp/stderr.log"),
+        };
+        let mut state = LogCaptureState {
+            base_dir: Some(PathBuf::from("/tmp/build-service")),
+            sink: Some(BuildLogSink::from_writers(
+                paths.clone(),
+                Box::new(FailingWriter),
+                Box::new(Vec::<u8>::new()),
+            )),
+            warning_emitted: false,
+            pending_events: VecDeque::new(),
+        };
+        let limits = OutputLimits {
+            stdout_max_lines: Some(10),
+            stderr_max_lines: Some(10),
+            stdout_tail_lines: 0,
+            stderr_tail_lines: 0,
+            capture_logs: true,
+            log_dir: Some(PathBuf::from("/tmp/build-service")),
+        };
+        let mut output = OutputLimiter::new(&limits);
+        output.set_log_paths(&paths);
+
+        state
+            .process_event(
+                BufferedStreamEvent::Stdout("one\ntwo\n".to_string()),
+                &mut output,
+            )
+            .expect("process event");
+
+        assert!(!state.capture_requested());
+        assert!(state.warning_emitted);
+        assert!(output.stdout.log_path.is_none());
+        assert!(output.stderr.log_path.is_none());
+    }
+
+    #[test]
+    fn read_responses_buffers_prebuild_events_and_writes_logs() {
+        let temp = tempdir().expect("tempdir");
+        let log_dir = temp.path().join("captured-logs");
+        let body = concat!(
+            "{\"type\":\"stdout\",\"data\":\"before-one\\nbefore-two\\n\"}\n",
+            "{\"type\":\"build\",\"id\":\"bld_123\",\"status\":\"started\"}\n",
+            "{\"type\":\"stderr\",\"data\":\"err-one\\nerr-two\\n\"}\n",
+            "{\"type\":\"exit\",\"code\":0,\"timed_out\":false}\n"
+        )
+        .to_string();
+        let (url, handle) = start_ndjson_server(body);
+        let response = Client::new().get(url).send().expect("send request");
+        let limits = OutputLimits {
+            stdout_max_lines: None,
+            stderr_max_lines: None,
+            stdout_tail_lines: 0,
+            stderr_tail_lines: 0,
+            capture_logs: true,
+            log_dir: Some(log_dir.clone()),
+        };
+
+        let result = read_responses(response, &limits).expect("read responses");
+        handle.join().expect("join server");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            fs::read_to_string(log_dir.join("bld_123/stdout.log")).expect("read stdout log"),
+            "before-one\nbefore-two\n"
+        );
+        assert_eq!(
+            fs::read_to_string(log_dir.join("bld_123/stderr.log")).expect("read stderr log"),
+            "err-one\nerr-two\n"
+        );
     }
 
     #[test]
