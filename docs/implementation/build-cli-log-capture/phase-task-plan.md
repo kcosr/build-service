@@ -151,10 +151,20 @@ For each phase, append an entry with:
 #### Phase H0: Contract Lock
 
 - Completion date: 2026-03-07
-- Commit hash(es):
+- Commit hash(es): `b842566`
 - Acceptance evidence:
+  - Locked docs updated to clarify that the final saved-log notice is emitted on `stderr`, invalid build IDs disable capture with a warning, and log-capture fallback is triggered by the first directory creation or file write failure.
+  - Verification passed before commit: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo build --release`.
 - Review run IDs + triage outcomes:
-- Go / No-Go decision:
+  - Gemini `r_20260308033519033_6aa9a948`
+    - `accept`: lock the completion notice to `stderr`.
+    - `reject`: add bounded early-stream buffering in v1; rationale: the locked v1 contract assumes the server emits the `build` event first, and adding a new buffer cap would expand scope beyond H0.
+  - PI `r_20260308033519055_35376925`
+    - `accept`: clarify safe handling for build IDs used as path components.
+    - `accept`: add explicit verification for relative `log_dir` resolution.
+    - `reject`: add new concurrency handling for duplicate build IDs; rationale: the existing UUID-based server contract makes collisions non-normative for v1.
+    - `reject`: add extra conversion-lifecycle wording for `String` to `PathBuf` and writer close semantics; rationale: the locked design already fixes path-resolution timing and flush-per-event behavior sufficiently for implementation.
+- Go / No-Go decision: Go
 
 ## 10. Handoff Contract
 
