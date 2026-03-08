@@ -329,6 +329,12 @@ impl OutputLimiter {
     }
 }
 
+#[derive(Debug, Clone)]
+enum BufferedStreamEvent {
+    Stdout(String),
+    Stderr(String),
+}
+
 struct LineLimiter {
     label: &'static str,
     env_var: &'static str,
@@ -392,11 +398,7 @@ impl LineLimiter {
                 self.at_line_start = false;
 
                 if !self.current_line_allowed && !self.suppression_notified {
-                    output.push_str(&format!(
-                        "{OUTPUT_PREFIX} suppressing {} output due to limits (increase output lines with {}=<lines>)\n",
-                        self.label,
-                        self.env_var
-                    ));
+                    output.push_str(&self.suppression_notice());
                     self.suppression_notified = true;
                 }
             }
@@ -478,6 +480,22 @@ impl LineLimiter {
             self.tail_buffer.pop_front();
         }
     }
+
+    fn suppression_notice(&self) -> String {
+        if let Some(log_path) = &self.log_path {
+            format!(
+                "{OUTPUT_PREFIX} suppressing {} output due to limits (full log: {})\n",
+                self.label,
+                log_path.display()
+            )
+        } else {
+            format!(
+                "{OUTPUT_PREFIX} suppressing {} output due to limits (increase output lines with {}=<lines>)\n",
+                self.label,
+                self.env_var
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -489,9 +507,7 @@ struct StreamLogPaths {
 #[derive(Debug)]
 struct BuildLogSink {
     paths: StreamLogPaths,
-    #[allow(dead_code)]
     stdout_writer: BufWriter<fs::File>,
-    #[allow(dead_code)]
     stderr_writer: BufWriter<fs::File>,
 }
 
@@ -520,6 +536,16 @@ impl BuildLogSink {
     fn paths(&self) -> &StreamLogPaths {
         &self.paths
     }
+
+    fn write_stdout(&mut self, data: &str) -> io::Result<()> {
+        self.stdout_writer.write_all(data.as_bytes())?;
+        self.stdout_writer.flush()
+    }
+
+    fn write_stderr(&mut self, data: &str) -> io::Result<()> {
+        self.stderr_writer.write_all(data.as_bytes())?;
+        self.stderr_writer.flush()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -527,6 +553,7 @@ struct LogCaptureState {
     base_dir: Option<PathBuf>,
     sink: Option<BuildLogSink>,
     warning_emitted: bool,
+    pending_events: VecDeque<BufferedStreamEvent>,
 }
 
 impl LogCaptureState {
@@ -539,6 +566,7 @@ impl LogCaptureState {
             },
             sink: None,
             warning_emitted: false,
+            pending_events: VecDeque::new(),
         }
     }
 
@@ -562,6 +590,57 @@ impl LogCaptureState {
         self.sink = None;
     }
 
+    fn capture_requested(&self) -> bool {
+        self.base_dir.is_some() || self.sink.is_some()
+    }
+
+    fn capture_active(&self) -> bool {
+        self.sink.is_some()
+    }
+
+    fn push_pending(&mut self, event: BufferedStreamEvent) {
+        self.pending_events.push_back(event);
+    }
+
+    fn drain_pending(&mut self, output: &mut OutputLimiter) -> io::Result<()> {
+        while let Some(event) = self.pending_events.pop_front() {
+            self.process_event(event, output)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_to_terminal(&mut self, output: &mut OutputLimiter) -> io::Result<()> {
+        while let Some(event) = self.pending_events.pop_front() {
+            write_event_to_terminal(event, output)?;
+        }
+        Ok(())
+    }
+
+    fn process_event(
+        &mut self,
+        event: BufferedStreamEvent,
+        output: &mut OutputLimiter,
+    ) -> io::Result<()> {
+        if let Some(sink) = self.sink.as_mut() {
+            let log_result = match &event {
+                BufferedStreamEvent::Stdout(data) => sink.write_stdout(data),
+                BufferedStreamEvent::Stderr(data) => sink.write_stderr(data),
+            };
+
+            if let Err(err) = log_result {
+                output.clear_log_paths();
+                self.disable();
+                self.write_warning(&err.to_string())?;
+            }
+        }
+
+        write_event_to_terminal(event, output)
+    }
+
+    fn completion_paths(&self) -> Option<&StreamLogPaths> {
+        self.sink.as_ref().map(|sink| sink.paths())
+    }
+
     fn write_warning(&mut self, message: &str) -> io::Result<()> {
         if self.warning_emitted {
             return Ok(());
@@ -571,6 +650,31 @@ impl LogCaptureState {
         let mut stderr = io::stderr();
         writeln!(stderr, "{OUTPUT_PREFIX} log capture unavailable: {message}")?;
         stderr.flush()
+    }
+
+    fn write_completion_notice(&self) -> io::Result<()> {
+        let Some(paths) = self.completion_paths() else {
+            return Ok(());
+        };
+
+        let mut stderr = io::stderr();
+        writeln!(
+            stderr,
+            "{OUTPUT_PREFIX} saved full logs: stdout={}, stderr={}",
+            paths.stdout.display(),
+            paths.stderr.display()
+        )?;
+        stderr.flush()
+    }
+}
+
+fn write_event_to_terminal(
+    event: BufferedStreamEvent,
+    output: &mut OutputLimiter,
+) -> io::Result<()> {
+    match event {
+        BufferedStreamEvent::Stdout(data) => output.write_stdout(&data),
+        BufferedStreamEvent::Stderr(data) => output.write_stderr(&data),
     }
 }
 
@@ -1415,6 +1519,7 @@ fn read_responses(
     let mut workspace_id: Option<String> = None;
     let mut output = OutputLimiter::new(output_limits);
     let mut log_capture = LogCaptureState::new(output_limits);
+    let mut build_event_seen = false;
 
     loop {
         line.clear();
@@ -1435,14 +1540,26 @@ fn read_responses(
 
         match event {
             ResponseEvent::Stdout { data } => {
-                output
-                    .write_stdout(&data)
-                    .map_err(|err| BuildError::Other(format!("failed to write stdout: {err}")))?;
+                if log_capture.capture_requested() && !log_capture.capture_active() {
+                    log_capture.push_pending(BufferedStreamEvent::Stdout(data));
+                } else {
+                    log_capture
+                        .process_event(BufferedStreamEvent::Stdout(data), &mut output)
+                        .map_err(|err| {
+                            BuildError::Other(format!("failed to write stdout: {err}"))
+                        })?;
+                }
             }
             ResponseEvent::Stderr { data } => {
-                output
-                    .write_stderr(&data)
-                    .map_err(|err| BuildError::Other(format!("failed to write stderr: {err}")))?;
+                if log_capture.capture_requested() && !log_capture.capture_active() {
+                    log_capture.push_pending(BufferedStreamEvent::Stderr(data));
+                } else {
+                    log_capture
+                        .process_event(BufferedStreamEvent::Stderr(data), &mut output)
+                        .map_err(|err| {
+                            BuildError::Other(format!("failed to write stderr: {err}"))
+                        })?;
+                }
             }
             ResponseEvent::Error { message, .. } => {
                 if let Some(message) = message {
@@ -1464,27 +1581,59 @@ fn read_responses(
                 workspace_id = event_workspace_id;
                 break;
             }
-            ResponseEvent::Build { id, .. } => match log_capture.initialize(&id) {
-                Ok(Some(paths)) => output.set_log_paths(&paths),
-                Ok(None) => {}
-                Err(err) => {
-                    output.clear_log_paths();
-                    log_capture.disable();
-                    log_capture
-                        .write_warning(&err.to_string())
-                        .map_err(|warn_err| {
-                            BuildError::Other(format!(
-                                "failed to report log capture warning: {warn_err}"
-                            ))
+            ResponseEvent::Build { id, .. } => {
+                build_event_seen = true;
+                match log_capture.initialize(&id) {
+                    Ok(Some(paths)) => {
+                        output.set_log_paths(&paths);
+                        log_capture.drain_pending(&mut output).map_err(|err| {
+                            BuildError::Other(format!("failed to write buffered output: {err}"))
                         })?;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        output.clear_log_paths();
+                        log_capture.disable();
+                        log_capture
+                            .write_warning(&err.to_string())
+                            .map_err(|warn_err| {
+                                BuildError::Other(format!(
+                                    "failed to report log capture warning: {warn_err}"
+                                ))
+                            })?;
+                        log_capture.flush_pending_to_terminal(&mut output).map_err(
+                            |flush_err| {
+                                BuildError::Other(format!(
+                                    "failed to write buffered output: {flush_err}"
+                                ))
+                            },
+                        )?;
+                    }
                 }
-            },
+            }
         }
+    }
+
+    if log_capture.capture_requested() && !build_event_seen {
+        output.clear_log_paths();
+        log_capture.disable();
+        log_capture
+            .write_warning("build id was not received from the response stream")
+            .map_err(|err| {
+                BuildError::Other(format!("failed to report log capture warning: {err}"))
+            })?;
+        log_capture
+            .flush_pending_to_terminal(&mut output)
+            .map_err(|err| BuildError::Other(format!("failed to write buffered output: {err}")))?;
     }
 
     output
         .finish()
         .map_err(|err| BuildError::Other(format!("failed to flush output: {err}")))?;
+
+    log_capture.write_completion_notice().map_err(|err| {
+        BuildError::Other(format!("failed to write log completion notice: {err}"))
+    })?;
 
     match exit_code {
         Some(code) => Ok(BuildResult {
