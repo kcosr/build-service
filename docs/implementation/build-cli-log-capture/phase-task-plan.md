@@ -166,6 +166,26 @@ For each phase, append an entry with:
     - `reject`: add extra conversion-lifecycle wording for `String` to `PathBuf` and writer close semantics; rationale: the locked design already fixes path-resolution timing and flush-per-event behavior sufficiently for implementation.
 - Go / No-Go decision: Go
 
+#### Phase H1: Config and Log Sink Plumbing
+
+- Completion date: 2026-03-07
+- Commit hash(es): `f03d862`
+- Acceptance evidence:
+  - `src/bin/build-cli.rs` now parses `output.capture_logs` and `output.log_dir`, resolves relative `log_dir` values against the process start directory, and defaults capture storage to `temp_dir()/build-service` when capture is enabled without an explicit directory.
+  - `read_responses()` now consumes `ResponseEvent::Build { id, .. }`, validates the build ID as a single path component, initializes `<base>/<build_id>/stdout.log` and `stderr.log`, and stores the late-bound log paths on `OutputLimiter` for H2 messaging.
+  - Verification passed before commit: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo build --release`.
+- Review run IDs + triage outcomes:
+  - Gemini `r_20260308034250353_8bd4ebaa`
+    - `reject`: downgrade empty `output.log_dir` to warning-and-fallback; rationale: malformed config remains a startup validation error, while the locked fallback semantics apply after capture is enabled at runtime.
+    - `reject`: avoid creating zero-byte log files in H1; rationale: H1 explicitly initializes the per-build sink and directory layout, and H2 will populate the already-open writers.
+    - `defer`: add dedicated config/log-sink tests in H1; rationale: the locked phase plan reserves the test expansion for H3.
+  - PI `r_20260308034250353_f746672c`
+    - `accept`: rename placeholder sink writer fields for clearer intent.
+    - `accept`: reject NUL bytes in `build_id` during client-side path validation.
+    - `reject`: canonicalize resolved relative `log_dir` paths; rationale: the locked contract requires resolution against the startup run directory, not path normalization.
+    - `defer`: add dedicated H1 unit coverage for path resolution and sink initialization in H3, per the locked phase ordering.
+- Go / No-Go decision: Go
+
 ## 10. Handoff Contract
 
 Use `$agent-runner-spec-execution` and `$agent-runner-review`.
