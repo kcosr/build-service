@@ -31,7 +31,7 @@ blake3 = "1.5"
 glob = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 hyper = { version = "1", features = ["http1"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls-native-roots"] }
 rustls = "0.23"
 rustls-pemfile = "2.1"
 tokio-stream = "0.1"

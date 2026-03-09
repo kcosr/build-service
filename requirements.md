@@ -182,6 +182,7 @@ Notes:
 - Source include patterns that match nothing are skipped.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
+- HTTPS endpoints use the OS trust store at runtime, so `build-cli` honors system-installed CA certificates (including local intercepting proxy CAs).
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
 - Env overrides: `BUILD_SERVICE_ENABLED`, `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
 - `connection.enabled = false` (or `BUILD_SERVICE_ENABLED=false`) skips build-service and runs the local tool. `BUILD_SERVICE_ENABLED` overrides the config when set.
