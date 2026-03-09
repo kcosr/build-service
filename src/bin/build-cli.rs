@@ -1304,6 +1304,17 @@ fn parse_env_u64(name: &str) -> io::Result<Option<u64>> {
     Ok(Some(parsed))
 }
 
+fn get_repo_name(repo_root: &Path) -> io::Result<String> {
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| io::Error::other("failed to resolve repo name from repo root"))?;
+
+    Ok(repo_name.to_string())
+}
+
 fn get_git_branch(repo_root: &Path) -> io::Result<String> {
     let output = Command::new("git")
         .arg("rev-parse")
@@ -1348,6 +1359,11 @@ fn expand_workspace_macros(id: &str, repo_root: &Path) -> io::Result<String> {
     if expanded.contains("{branch}") {
         let branch = get_git_branch(repo_root)?;
         expanded = expanded.replace("{branch}", branch.as_str());
+    }
+
+    if expanded.contains("{repo}") {
+        let repo_name = get_repo_name(repo_root)?;
+        expanded = expanded.replace("{repo}", repo_name.as_str());
     }
 
     Ok(expanded)
@@ -2244,6 +2260,19 @@ mod tests {
     }
 
     #[test]
+    fn expand_workspace_macros_replaces_repo() {
+        let temp = tempdir().expect("tempdir");
+        let repo_name = temp
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("repo name");
+
+        let id = expand_workspace_macros("custom-{repo}", temp.path()).expect("expand");
+        assert_eq!(id, format!("custom-{repo_name}"));
+    }
+
+    #[test]
     fn expand_workspace_macros_replaces_branch() {
         if !git_available() {
             eprintln!("git not available; skipping test");
@@ -2271,6 +2300,27 @@ mod tests {
 
         let id = expand_workspace_macros("build-{uid}-{branch}", temp.path()).expect("expand");
         assert_eq!(id, format!("build-{uid}-feature/add-auth"));
+    }
+
+    #[test]
+    fn expand_workspace_macros_replaces_repo_uid_and_branch() {
+        if !git_available() {
+            eprintln!("git not available; skipping test");
+            return;
+        }
+        let temp = tempdir().expect("tempdir");
+        init_git_repo(temp.path());
+        run_git(temp.path(), &["checkout", "-b", "feature/add-auth"]);
+        // SAFETY: `geteuid` has no preconditions and reads process metadata only.
+        let uid = unsafe { libc::geteuid() };
+        let repo_name = temp
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("repo name");
+
+        let id = expand_workspace_macros("{repo}-{uid}-{branch}", temp.path()).expect("expand");
+        assert_eq!(id, format!("{repo_name}-{uid}-feature/add-auth"));
     }
 
     #[test]

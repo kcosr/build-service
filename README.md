@@ -101,7 +101,7 @@ CFLAGS = "-O2 -g"
 
 [workspace]
 # reuse = true
-# id = "custom_id"   # supports {branch} macro
+# id = "custom_id"   # supports {repo}, {branch}, and {uid} macros
 # create = true
 # refresh = false
 # ttl_sec = 3600
@@ -123,7 +123,7 @@ Notes:
 - When log capture initializes successfully, the CLI prints a final `stderr` notice with both saved log paths even if no suppression occurred.
 - Temp-dir retention is OS-managed. If you rely on saved logs, set `output.log_dir` to a persistent location and clean up old build directories yourself.
 - When workspace reuse is enabled, the CLI reads `.build-service/workspace-id` if no workspace id is configured and writes it when the server returns `workspace_id`.
-- `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{branch}` and `{uid}`; the CLI expands `{branch}` to the current git branch and `{uid}` to the effective user id, and the server sanitizes the resulting workspace id.
+- `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{repo}`, `{branch}`, and `{uid}`; the CLI expands `{repo}` to the repo root directory name, `{branch}` to the current git branch, and `{uid}` to the effective user id, and the server sanitizes the resulting workspace id.
 - Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force a full resync of sources for the next build.
 - Set `connection.enabled = false` (or `BUILD_SERVICE_ENABLED=false`) to force the wrapper to skip build-service and run the local tool. `BUILD_SERVICE_ENABLED` overrides the config when set.
 - The CLI refuses to run if `.build-service/config.toml` is missing.

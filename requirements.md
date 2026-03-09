@@ -160,7 +160,7 @@ CFLAGS = "-O2 -g"
 
 [workspace]
 # reuse = true
-# id = "custom_id"
+# id = "custom_id"   # supports {repo}, {branch}, and {uid} macros
 # create = true
 # refresh = false
 # ttl_sec = 3600
@@ -180,6 +180,7 @@ Notes:
 - When capture succeeds, the client emits a final `stderr` notice listing both saved log paths.
 - Temp-dir retention is OS-managed and may be short-lived. Persistent log retention requires setting `output.log_dir` to a durable path and cleaning old build directories separately.
 - Source include patterns that match nothing are skipped.
+- `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{repo}`, `{branch}`, and `{uid}`; the client expands `{repo}` to the repo root directory name, `{branch}` to the current git branch, and `{uid}` to the effective user id before sending the request.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - HTTPS endpoints use the OS trust store at runtime, so `build-cli` honors system-installed CA certificates (including local intercepting proxy CAs).

@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Support `{repo}` macro expansion for workspace IDs in the CLI (`workspace.id` and `BUILD_SERVICE_WORKSPACE_ID`). PR link pending.
 
 ## [0.4.3] - 2026-03-09
 
