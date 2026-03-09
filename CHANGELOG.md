@@ -5,6 +5,9 @@
 ### Added
 - Add opt-in `build-cli` log capture with per-build `stdout.log` / `stderr.log`, path-based suppression notices, and final saved-log reporting ([#11](https://github.com/kcosr/build-service/pull/11)).
 
+### Changed
+- Make `build-cli` read HTTPS CA certificates from the OS trust store at runtime by switching `reqwest` to `rustls-tls-native-roots` ([#12](https://github.com/kcosr/build-service/pull/12)).
+
 ## [0.4.2] - 2026-03-05
 
 ### Added
