@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- Support `{repo}` macro expansion for workspace IDs in the CLI (`workspace.id` and `BUILD_SERVICE_WORKSPACE_ID`). PR link pending.
+- Support `{repo}` macro expansion for workspace IDs in the CLI (`workspace.id` and `BUILD_SERVICE_WORKSPACE_ID`) ([#13](https://github.com/kcosr/build-service/pull/13)).
 
 ## [0.4.3] - 2026-03-09
 
