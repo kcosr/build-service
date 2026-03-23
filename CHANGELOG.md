@@ -3,14 +3,14 @@
 ## [Unreleased]
 
 ### Breaking Changes
-- Require a configured default workspace or explicit reusable workspace request for builds that do not use `workspace.reuse`, and drop the old implicit ephemeral-workspace path ([#000](https://github.com/kcosr/build-service/pull/000))
+- Require a configured default workspace or explicit reusable workspace request for builds that do not use `workspace.reuse`, and drop the old implicit ephemeral-workspace path ([#14](https://github.com/kcosr/build-service/pull/14))
 
 ### Added
-- Add `build.default_workspace_path`, optional source uploads, env-only wrapper mode, and CLI/env pattern overrides for `build-cli` ([#000](https://github.com/kcosr/build-service/pull/000))
-- Add `artifacts.max_artifact_bytes` to cap the artifact zip size produced for a single request ([#000](https://github.com/kcosr/build-service/pull/000))
+- Add `build.default_workspace_path`, optional source uploads, env-only wrapper mode, and CLI/env pattern overrides for `build-cli` ([#14](https://github.com/kcosr/build-service/pull/14))
+- Add `artifacts.max_artifact_bytes` to cap the artifact zip size produced for a single request ([#14](https://github.com/kcosr/build-service/pull/14))
 
 ### Changed
-- Make `.build-service/config.toml` optional for `build-cli`; it now layers config file, env vars, and CLI flags, and only requires an explicit endpoint when no client config file is present ([#000](https://github.com/kcosr/build-service/pull/000))
+- Make `.build-service/config.toml` optional for `build-cli`; it now layers config file, env vars, and CLI flags, and only requires an explicit endpoint when no client config file is present ([#14](https://github.com/kcosr/build-service/pull/14))
 
 ## [0.4.4] - 2026-03-09
 
