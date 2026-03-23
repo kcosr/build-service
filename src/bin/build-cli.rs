@@ -2238,6 +2238,15 @@ mod tests {
     }
 
     #[test]
+    fn resolve_endpoint_uses_default_socket_when_config_is_present() {
+        let endpoint = resolve_endpoint(None, None, true).expect("endpoint");
+        match endpoint {
+            Endpoint::Unix { path } => assert_eq!(path, PathBuf::from(DEFAULT_SOCKET_PATH)),
+            Endpoint::Http { .. } => panic!("expected unix endpoint"),
+        }
+    }
+
+    #[test]
     fn resolve_request_env_merges_config_and_cli_values() {
         let request = RequestConfig {
             timeout_sec: None,
@@ -2249,6 +2258,76 @@ mod tests {
         let env_map = resolved.expect("request env");
         assert_eq!(env_map.get("CC").map(String::as_str), Some("clang"));
         assert_eq!(env_map.get("VERBOSE").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn parse_request_env_entry_preserves_equals_in_values() {
+        let (key, value) = parse_request_env_entry("TOKEN=abc=def").expect("env entry");
+        assert_eq!(key, "TOKEN");
+        assert_eq!(value, "abc=def");
+    }
+
+    #[test]
+    fn resolve_request_cwd_prefers_explicit_then_env_then_config_then_relative() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = env::var(CWD_ENV).ok();
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path().join("repo");
+        let nested = repo_root.join("nested");
+        fs::create_dir_all(&nested).expect("nested dir");
+
+        let request = RequestConfig {
+            timeout_sec: None,
+            cwd: Some("from-config".to_string()),
+            env: HashMap::new(),
+        };
+
+        env::remove_var(CWD_ENV);
+        assert_eq!(
+            resolve_request_cwd(
+                Some("from-cli".to_string()),
+                Some(&request),
+                &repo_root,
+                &nested
+            )
+            .expect("cwd"),
+            Some("from-cli".to_string())
+        );
+
+        env::set_var(CWD_ENV, "from-env");
+        assert_eq!(
+            resolve_request_cwd(None, Some(&request), &repo_root, &nested).expect("cwd"),
+            Some("from-env".to_string())
+        );
+
+        env::remove_var(CWD_ENV);
+        assert_eq!(
+            resolve_request_cwd(None, Some(&request), &repo_root, &nested).expect("cwd"),
+            Some("from-config".to_string())
+        );
+
+        assert_eq!(
+            resolve_request_cwd(None, None, &repo_root, &nested).expect("cwd"),
+            Some("nested".to_string())
+        );
+
+        if let Some(prev) = prev {
+            env::set_var(CWD_ENV, prev);
+        } else {
+            env::remove_var(CWD_ENV);
+        }
+    }
+
+    #[test]
+    fn resolve_workspace_config_rejects_cli_id_without_reuse() {
+        let temp = tempdir().expect("tempdir");
+        let err = resolve_workspace_config(false, Some("ws-id".to_string()), None, temp.path())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--workspace-id requires --workspace-reuse"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

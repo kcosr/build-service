@@ -187,8 +187,10 @@ Notes:
 - Source include patterns that match nothing are skipped.
 - Source upload is optional. With no source include patterns, the client sends metadata only.
 - Artifact download is optional. With no artifact include patterns, the server omits `artifacts` and the client skips extraction.
+- In env-only mode, source packaging and artifact extraction are rooted at the current working directory because there is no repo config root.
 - `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{repo}`, `{branch}`, and `{uid}`; the client expands `{repo}` to the repo root directory name, `{branch}` to the current git branch, and `{uid}` to the effective user id before sending the request.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
+- The configured default workspace is serialized behind a single lock; concurrent requests return `workspace_busy`.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - HTTPS endpoints use the OS trust store at runtime, so `build-cli` honors system-installed CA certificates (including local intercepting proxy CAs).
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml`. With a config file present, the final endpoint fallback is `unix:///run/build-service.sock`.

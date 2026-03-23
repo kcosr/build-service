@@ -126,6 +126,7 @@ Notes:
 - Source include patterns that match nothing are skipped.
 - Source upload is optional. If no source include patterns are configured anywhere, the client sends metadata only.
 - Artifact download is optional. If no artifact include patterns are configured anywhere, the client skips artifact download entirely.
+- In env-only mode, source packaging and artifact extraction are rooted at the current working directory because there is no repo config root to anchor them.
 - When `output.capture_logs = true`, `build-cli` writes complete stream transcripts to `<base>/<build_id>/stdout.log` and `<base>/<build_id>/stderr.log`. If `output.log_dir` is unset, `<base>` defaults to `std::env::temp_dir().join("build-service")`; if it is relative, it is resolved against the directory where the `build-cli` process starts.
 - Output limits are optional and still apply only to terminal output; unset means unlimited, `0` disables output. When capture is healthy, the suppression notice points to the saved log path for that stream. If capture is unavailable, the CLI falls back to the existing env-var hint (`BUILD_SERVICE_STDOUT_MAX_LINES` / `BUILD_SERVICE_STDERR_MAX_LINES`) and later summarizes suppressed lines.
 - When log capture initializes successfully, the CLI prints a final `stderr` notice with both saved log paths even if no suppression occurred.
@@ -137,6 +138,7 @@ Notes:
 - If no config file is found, `BUILD_SERVICE_ENDPOINT` or `--endpoint` is required.
 - When a config file is present, endpoint resolution still falls back to `unix:///run/build-service.sock`.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
+- The configured default workspace is serialized behind a single lock; concurrent requests against it return `workspace_busy`.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - HTTPS endpoints use the OS trust store at runtime, so `build-cli` honors system-installed CA certificates (including local intercepting proxy CAs).
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml`. With a config file present, the final fallback endpoint is `unix:///run/build-service.sock`.

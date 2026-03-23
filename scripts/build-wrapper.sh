@@ -35,15 +35,12 @@ while :; do
 done
 
 if [ "$disabled" != "true" ] && [ -n "$endpoint_env" ]; then
-    if [ -n "${BUILD_SERVICE_ENDPOINT+x}" ]; then
-        build-cli "$cmd" "$@"
-        exit_code=$?
-        # Exit code 222 means connection failed, or build-service was explicitly disabled
-        # Fall through to execute local build tool
-        if [ $exit_code -ne 222 ]; then
-            exit $exit_code
-        fi
-        # If we get here, exit code was 222, fall back to local build
+    build-cli "$cmd" "$@"
+    exit_code=$?
+    # Exit code 222 means connection failed, or build-service was explicitly disabled
+    # Fall through to execute local build tool
+    if [ $exit_code -ne 222 ]; then
+        exit $exit_code
     fi
 fi
 

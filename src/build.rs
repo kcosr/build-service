@@ -233,7 +233,7 @@ fn run_build(
 
     let run_as = resolve_run_as(config)?;
 
-    let workspace = prepare_workspace(config, workspace_state, workspace_plan, source_archive)?;
+    let workspace = prepare_workspace(config, workspace_plan, source_archive)?;
     let workspace_id = workspace_plan.managed_id.as_deref();
     let result = run_build_in_workspace(
         &validated,
@@ -454,7 +454,6 @@ fn map_artifact_error(err: ArtifactError) -> BuildError {
 
 fn prepare_workspace(
     config: &Config,
-    _workspace_state: &WorkspaceState,
     plan: &WorkspacePlan,
     source_archive: Option<&Path>,
 ) -> Result<PathBuf, BuildError> {

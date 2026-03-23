@@ -16,11 +16,12 @@ fn setup_wrapper_env() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let temp = TempDir::new().expect("temp dir");
     let wrapper_bin = temp.path().join("wrapper-bin");
     let local_bin = temp.path().join("local-bin");
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     fs::create_dir_all(&wrapper_bin).expect("create wrapper bin");
     fs::create_dir_all(&local_bin).expect("create local bin");
 
     symlink(
-        "/home/kevin/worktrees/build-service/scripts/build-wrapper.sh",
+        manifest_dir.join("scripts/build-wrapper.sh"),
         wrapper_bin.join("make"),
     )
     .expect("symlink wrapper");
