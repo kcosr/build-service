@@ -484,12 +484,19 @@ fn prepare_workspace(
     }
 
     if !existed {
-        std::fs::create_dir_all(&workspace).map_err(|err| {
-            BuildError::new(
-                "workspace_create_failed",
-                format!("failed to create workspace: {err}"),
-            )
-        })?;
+        if plan.record_use {
+            std::fs::create_dir_all(&workspace).map_err(|err| {
+                BuildError::new(
+                    "workspace_create_failed",
+                    format!("failed to create workspace: {err}"),
+                )
+            })?;
+        } else {
+            return Err(BuildError::new(
+                "workspace_not_found",
+                "default workspace not found",
+            ));
+        }
     }
 
     if plan.record_use {
@@ -506,7 +513,7 @@ fn prepare_workspace(
         extract_source_archive(
             source_archive,
             &workspace,
-            config.build.max_extracted_bytes,
+            config.sources.max_uncompressed_bytes,
             plan.record_use,
             plan.refresh,
         )?;
@@ -518,7 +525,7 @@ fn prepare_workspace(
 fn extract_source_archive(
     source_archive: &Path,
     dest: &Path,
-    max_extracted_bytes: u64,
+    max_uncompressed_bytes: u64,
     use_manifest: bool,
     refresh: bool,
 ) -> Result<(), BuildError> {
@@ -606,11 +613,11 @@ fn extract_source_archive(
                 }
 
                 extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
-                if extracted_bytes > max_extracted_bytes {
+                if extracted_bytes > max_uncompressed_bytes {
                     return Err(BuildError::new(
                         "source_archive",
                         format!(
-                            "extracted size exceeds max_extracted_bytes ({max_extracted_bytes} bytes)"
+                            "extracted size exceeds sources.max_uncompressed_bytes ({max_uncompressed_bytes} bytes)"
                         ),
                     ));
                 }
@@ -671,11 +678,11 @@ fn extract_source_archive(
                 }
 
                 extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
-                if extracted_bytes > max_extracted_bytes {
+                if extracted_bytes > max_uncompressed_bytes {
                     return Err(BuildError::new(
                         "source_archive",
                         format!(
-                            "extracted size exceeds max_extracted_bytes ({max_extracted_bytes} bytes)"
+                            "extracted size exceeds sources.max_uncompressed_bytes ({max_uncompressed_bytes} bytes)"
                         ),
                     ));
                 }
@@ -1079,12 +1086,16 @@ pub fn artifacts_for_build(build_id: &str, config: &Config) -> Option<ArtifactAr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        ArtifactsConfig, BuildConfig, Config, LoggingConfig, ServiceConfig, SourcesConfig,
+    };
+    use crate::workspace::WorkspacePlan;
     use tempfile::{tempdir, NamedTempFile};
     use zip::write::FileOptions;
     use zip::ZipWriter;
 
     #[test]
-    fn extract_source_archive_enforces_max_extracted_bytes() {
+    fn extract_source_archive_enforces_max_uncompressed_bytes() {
         let temp = tempdir().expect("tempdir");
         let source = create_test_zip("input.txt", b"0123456789").expect("zip");
         let dest = temp.path().join("workspace");
@@ -1093,7 +1104,7 @@ mod tests {
         let err = extract_source_archive(source.path(), &dest, 5, false, false).unwrap_err();
         assert_eq!(err.code, "source_archive");
         assert!(
-            err.message.contains("max_extracted_bytes"),
+            err.message.contains("sources.max_uncompressed_bytes"),
             "unexpected error: {}",
             err.message
         );
@@ -1117,6 +1128,38 @@ mod tests {
         let outcome = wait_with_timeout(&mut child, 60, &cancellation).expect("wait result");
         assert!(matches!(outcome, WaitOutcome::Cancelled));
         let _ = child.wait();
+    }
+
+    #[test]
+    fn prepare_workspace_rejects_missing_default_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path().join("missing-default");
+        let config = Config {
+            schema_version: "3".to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        let plan = WorkspacePlan {
+            path: workspace,
+            managed_id: None,
+            record_use: false,
+            ttl_sec: None,
+            create: false,
+            client_supplied: false,
+            refresh: false,
+            lock_key: None,
+        };
+
+        let err = prepare_workspace(&config, &plan, None).unwrap_err();
+        assert_eq!(err.code, "workspace_not_found");
+        assert!(
+            err.message.contains("default workspace not found"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     fn create_test_zip(name: &str, contents: &[u8]) -> io::Result<NamedTempFile> {

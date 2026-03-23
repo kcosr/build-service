@@ -202,26 +202,39 @@ elif source_archive is None:
 
 The rest of the build pipeline is unchanged: `cwd` resolves relative to the workspace, command runs there, artifacts collect relative to there.
 
-### 4. Artifact Download Size Limit
+### 4. Symmetric Source And Artifact Limits
 
-**New config field:**
+**New server config fields:**
 
 ```toml
+[sources]
+max_transfer_bytes = 134217728        # NEW: source archive transfer size limit (128 MB)
+max_uncompressed_bytes = 1342177280   # NEW: extracted source size limit (1.28 GB)
+
 [artifacts]
 storage_root = "/var/lib/build-service/artifacts"
-max_artifact_bytes = 536870912    # NEW: optional, max size of artifact zip per request (512 MB)
+max_transfer_bytes = 536870912        # NEW: optional, max artifact zip transfer size (512 MB)
+max_uncompressed_bytes = 2147483648   # NEW: optional, max total artifact content size (2 GB)
 # ... existing fields ...
 ```
 
-**Server-side enforcement** — during artifact collection, if the zip exceeds `max_artifact_bytes`, the build fails with an error. This is enforced in `src/artifacts.rs` when packaging the zip, before it's written to storage.
+**Server-side enforcement**
 
-This complements the existing upload limits (`max_upload_bytes`, `max_extracted_bytes`) with a download-side cap:
+- Source uploads:
+  - `sources.max_transfer_bytes` is enforced while reading the multipart `source` upload.
+  - `sources.max_uncompressed_bytes` is enforced while extracting the uploaded archive.
+- Artifact packaging:
+  - `artifacts.max_uncompressed_bytes` is checked before packaging by summing matched file sizes, and enforced again while copying file contents into the zip.
+  - `artifacts.max_transfer_bytes` is enforced while writing the zip stream to storage.
+
+This gives the server one symmetric pair of limits on each side of the request:
 
 | Limit | Direction | Scope | Config Field |
 |-------|-----------|-------|-------------|
-| `max_upload_bytes` | Upload | Source archive size | `[build]` |
-| `max_extracted_bytes` | Upload | Extracted source size | `[build]` |
-| `max_artifact_bytes` | Download | Artifact zip size per request | `[artifacts]` — **NEW** |
+| `max_transfer_bytes` | Upload | Source archive size | `[sources]` |
+| `max_uncompressed_bytes` | Upload | Extracted source size | `[sources]` |
+| `max_transfer_bytes` | Download | Artifact zip size per request | `[artifacts]` |
+| `max_uncompressed_bytes` | Download | Matched artifact content size per request | `[artifacts]` |
 | `max_bytes` | Storage | Total artifact storage on disk | `[artifacts]` |
 
 ### 5. Server Config Summary
@@ -234,13 +247,18 @@ workspace_root = "/var/lib/build-service/workspaces"
 default_workspace_path = "/home/user/workspace"     # NEW (optional)
 # ... rest unchanged ...
 
+[sources]
+max_transfer_bytes = 134217728                      # NEW
+max_uncompressed_bytes = 1342177280                # NEW
+
 [artifacts]
 storage_root = "/var/lib/build-service/artifacts"
-max_artifact_bytes = 536870912                       # NEW (optional)
+max_transfer_bytes = 536870912                     # NEW (optional)
+max_uncompressed_bytes = 2147483648                # NEW (optional)
 # ... rest unchanged ...
 ```
 
-Two new fields total. Everything else stays the same.
+The server now has a symmetric pair of transfer/uncompressed limits for both uploaded sources and downloaded artifacts.
 
 ---
 
@@ -295,7 +313,7 @@ No changes to the security model:
 - **Auth** — bearer token for HTTP; UDS file permissions
 - **No shell interpretation** — commands exec'd directly
 - **`cwd` validation** — relative path, resolved within workspace (existing behavior)
-- **Artifact size limit** — `max_artifact_bytes` prevents oversized downloads (new)
+- **Source and artifact size limits** — `sources.max_transfer_bytes`, `sources.max_uncompressed_bytes`, `artifacts.max_transfer_bytes`, and `artifacts.max_uncompressed_bytes` bound request and response size (new/renamed)
 
 The command allowlist is the real security boundary. Once a command is allowed, it can access any path the process user can, regardless of workspace or cwd.
 
@@ -331,10 +349,11 @@ export BUILD_SERVICE_ENDPOINT="unix:///tmp/build-service.sock"
 5. Skip source extraction in `prepare_workspace` when source is `None`
 6. Tests: sourceless request with default workspace, sourceless request without default (expect error), sources with default workspace (extraction works), startup validation failure
 
-### Phase 2: Server — Artifact Download Limit
-7. Add `max_artifact_bytes` to `[artifacts]` config
-8. Enforce during artifact zip creation in `src/artifacts.rs`
-9. Tests: artifact exceeding limit returns error
+### Phase 2: Server — Symmetric Transfer And Content Limits
+7. Move upload limits into `[sources]` as `max_transfer_bytes` and `max_uncompressed_bytes`
+8. Add `artifacts.max_transfer_bytes` and `artifacts.max_uncompressed_bytes`
+9. Enforce source limits during upload/extraction and artifact limits during sizing/packaging
+10. Tests: source/artifact transfer and uncompressed limit failures
 
 ### Phase 3: Client — CLI Flags & Optional Config
 10. Add new CLI flags to `build-cli` (clap): `--source`, `--source-exclude`, `--artifact`, `--artifact-exclude`, `--cwd`, `--env`
@@ -363,4 +382,4 @@ export BUILD_SERVICE_ENDPOINT="unix:///tmp/build-service.sock"
 | 2 | Naming | Keep `build-cli` / `build-service` | Builds are still the primary use case; exec is an extension |
 | 3 | Default workspace creation | Server fails to start if path doesn't exist | Fail loud; admin must create the directory. No surprises at request time |
 | 4 | Default workspace location | Any path, not restricted to `workspace_root` | It's a fixed configured path, not managed by workspace GC |
-| 5 | Artifact download limit | Server-side `max_artifact_bytes` in `[artifacts]` config | Server packages the zip; server enforces the limit. Complements upload-side limits |
+| 5 | Source/artifact size limits | Symmetric `max_transfer_bytes` / `max_uncompressed_bytes` pairs in `[sources]` and `[artifacts]` | Server enforces transport bytes separately from uncompressed content bytes on both upload and download |

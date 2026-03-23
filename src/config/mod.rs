@@ -9,8 +9,8 @@ use crate::logging::LoggingSettings;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/build-service/config.toml";
 const DEFAULT_SCHEMA_VERSION: &str = "3";
-const DEFAULT_MAX_UPLOAD_BYTES: u64 = 134_217_728;
-const DEFAULT_MAX_EXTRACTED_BYTES: u64 = DEFAULT_MAX_UPLOAD_BYTES * 10;
+const DEFAULT_SOURCE_TRANSFER_BYTES: u64 = 134_217_728;
+const DEFAULT_SOURCE_UNCOMPRESSED_BYTES: u64 = DEFAULT_SOURCE_TRANSFER_BYTES * 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -49,6 +49,9 @@ pub struct Config {
 
     #[serde(default)]
     pub build: BuildConfig,
+
+    #[serde(default)]
+    pub sources: SourcesConfig,
 
     #[serde(default)]
     pub artifacts: ArtifactsConfig,
@@ -184,15 +187,15 @@ impl Config {
             }
         }
 
-        if self.build.max_upload_bytes == 0 {
+        if self.sources.max_transfer_bytes == 0 {
             return Err(ConfigError::Invalid(
-                "build.max_upload_bytes must be greater than zero".to_string(),
+                "sources.max_transfer_bytes must be greater than zero".to_string(),
             ));
         }
 
-        if self.build.max_extracted_bytes == 0 {
+        if self.sources.max_uncompressed_bytes == 0 {
             return Err(ConfigError::Invalid(
-                "build.max_extracted_bytes must be greater than zero".to_string(),
+                "sources.max_uncompressed_bytes must be greater than zero".to_string(),
             ));
         }
 
@@ -419,12 +422,6 @@ pub struct BuildConfig {
     #[serde(default)]
     pub run_as_group: Option<String>,
 
-    #[serde(default = "default_max_upload_bytes")]
-    pub max_upload_bytes: u64,
-
-    #[serde(default = "default_max_extracted_bytes")]
-    pub max_extracted_bytes: u64,
-
     #[serde(default)]
     pub commands: HashMap<String, PathBuf>,
 
@@ -443,8 +440,6 @@ impl Default for BuildConfig {
             workspace: WorkspaceConfig::default(),
             run_as_user: None,
             run_as_group: None,
-            max_upload_bytes: default_max_upload_bytes(),
-            max_extracted_bytes: default_max_extracted_bytes(),
             commands: HashMap::new(),
             timeouts: TimeoutConfig::default(),
             environment: EnvironmentConfig::default(),
@@ -454,14 +449,6 @@ impl Default for BuildConfig {
 
 fn default_workspace_root() -> PathBuf {
     PathBuf::from("/var/lib/build-service/workspaces")
-}
-
-fn default_max_upload_bytes() -> u64 {
-    DEFAULT_MAX_UPLOAD_BYTES
-}
-
-fn default_max_extracted_bytes() -> u64 {
-    DEFAULT_MAX_EXTRACTED_BYTES
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -558,7 +545,10 @@ pub struct ArtifactsConfig {
     pub max_bytes: Option<u64>,
 
     #[serde(default)]
-    pub max_artifact_bytes: Option<u64>,
+    pub max_transfer_bytes: Option<u64>,
+
+    #[serde(default)]
+    pub max_uncompressed_bytes: Option<u64>,
 }
 
 impl Default for ArtifactsConfig {
@@ -568,7 +558,8 @@ impl Default for ArtifactsConfig {
             ttl_sec: None,
             gc_interval_sec: None,
             max_bytes: None,
-            max_artifact_bytes: None,
+            max_transfer_bytes: None,
+            max_uncompressed_bytes: None,
         }
     }
 }
@@ -611,10 +602,18 @@ impl ArtifactsConfig {
             }
         }
 
-        if let Some(max_artifact_bytes) = self.max_artifact_bytes {
-            if max_artifact_bytes == 0 {
+        if let Some(max_transfer_bytes) = self.max_transfer_bytes {
+            if max_transfer_bytes == 0 {
                 return Err(ConfigError::Invalid(
-                    "artifacts.max_artifact_bytes must be greater than zero".to_string(),
+                    "artifacts.max_transfer_bytes must be greater than zero".to_string(),
+                ));
+            }
+        }
+
+        if let Some(max_uncompressed_bytes) = self.max_uncompressed_bytes {
+            if max_uncompressed_bytes == 0 {
+                return Err(ConfigError::Invalid(
+                    "artifacts.max_uncompressed_bytes must be greater than zero".to_string(),
                 ));
             }
         }
@@ -639,6 +638,32 @@ pub struct LoggingConfig {
 
     #[serde(default = "default_logging_console")]
     pub console: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourcesConfig {
+    #[serde(default = "default_source_transfer_bytes")]
+    pub max_transfer_bytes: u64,
+
+    #[serde(default = "default_source_uncompressed_bytes")]
+    pub max_uncompressed_bytes: u64,
+}
+
+impl Default for SourcesConfig {
+    fn default() -> Self {
+        Self {
+            max_transfer_bytes: default_source_transfer_bytes(),
+            max_uncompressed_bytes: default_source_uncompressed_bytes(),
+        }
+    }
+}
+
+fn default_source_transfer_bytes() -> u64 {
+    DEFAULT_SOURCE_TRANSFER_BYTES
+}
+
+fn default_source_uncompressed_bytes() -> u64 {
+    DEFAULT_SOURCE_UNCOMPRESSED_BYTES
 }
 
 impl Default for LoggingConfig {
@@ -714,6 +739,7 @@ mod tests {
             schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
             service: ServiceConfig::default(),
             build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
             artifacts: ArtifactsConfig::default(),
             logging: LoggingConfig::default(),
         };
@@ -732,6 +758,7 @@ mod tests {
             schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
             service: ServiceConfig::default(),
             build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
             artifacts: ArtifactsConfig::default(),
             logging: LoggingConfig::default(),
         };

@@ -97,7 +97,7 @@ async fn run_tcp(
         auth_required: config.service.http.auth.required,
         workspace_state,
     };
-    let app = build_router(state, config.build.max_upload_bytes);
+    let app = build_router(state, config.sources.max_transfer_bytes);
 
     if config.service.http.tls.enabled {
         let tls_config = build_tls_config(config.as_ref())?;
@@ -125,7 +125,7 @@ async fn run_uds(
         auth_required: false,
         workspace_state,
     };
-    let app = build_router(state, config.build.max_upload_bytes);
+    let app = build_router(state, config.sources.max_transfer_bytes);
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -143,8 +143,8 @@ async fn run_uds(
     }
 }
 
-fn build_router(state: AppState, max_upload_bytes: u64) -> Router {
-    let max_body = max_upload_bytes.saturating_add(1024 * 1024) as usize;
+fn build_router(state: AppState, max_transfer_bytes: u64) -> Router {
+    let max_body = max_transfer_bytes.saturating_add(1024 * 1024) as usize;
     Router::new()
         .route("/v1/builds", post(start_build))
         .route("/v1/builds/:build_id/artifacts.zip", get(get_artifact))
@@ -217,8 +217,10 @@ async fn start_build(
                 match field.chunk().await {
                     Ok(Some(chunk)) => {
                         source_bytes = source_bytes.saturating_add(chunk.len() as u64);
-                        if source_bytes > state.config.build.max_upload_bytes {
-                            return payload_too_large("source archive exceeds max_upload_bytes");
+                        if source_bytes > state.config.sources.max_transfer_bytes {
+                            return payload_too_large(
+                                "source archive exceeds sources.max_transfer_bytes",
+                            );
                         }
                         if let Err(err) = temp.write_all(&chunk) {
                             return server_error(&format!("failed to write source: {err}"));
@@ -635,6 +637,7 @@ mod tests {
             schema_version: "3".to_string(),
             service: ServiceConfig::default(),
             build: BuildConfig::default(),
+            sources: crate::config::SourcesConfig::default(),
             artifacts: ArtifactsConfig::default(),
             logging: LoggingConfig::default(),
         };
@@ -708,6 +711,7 @@ mod tests {
             schema_version: "3".to_string(),
             service: ServiceConfig::default(),
             build: BuildConfig::default(),
+            sources: crate::config::SourcesConfig::default(),
             artifacts: ArtifactsConfig::default(),
             logging: LoggingConfig::default(),
         };
@@ -958,6 +962,7 @@ echo "Build finished successfully"
             schema_version: "3".to_string(),
             service: ServiceConfig::default(),
             build: BuildConfig::default(),
+            sources: crate::config::SourcesConfig::default(),
             artifacts: ArtifactsConfig::default(),
             logging: LoggingConfig::default(),
         };
@@ -1000,6 +1005,7 @@ echo "Build finished successfully"
             schema_version: "3".to_string(),
             service: ServiceConfig::default(),
             build: BuildConfig::default(),
+            sources: crate::config::SourcesConfig::default(),
             artifacts: ArtifactsConfig::default(),
             logging: LoggingConfig::default(),
         };
@@ -1016,7 +1022,7 @@ echo "Build finished successfully"
     }
 
     fn build_app(config: Config) -> Router {
-        let max_upload_bytes = config.build.max_upload_bytes;
+        let max_transfer_bytes = config.sources.max_transfer_bytes;
         let workspace_state = Arc::new(WorkspaceState::new(
             config.build.workspace_root.clone(),
             config.build.default_workspace_path.clone(),
@@ -1027,7 +1033,7 @@ echo "Build finished successfully"
             auth_required: false,
             workspace_state,
         };
-        build_router(state, max_upload_bytes)
+        build_router(state, max_transfer_bytes)
     }
 
     async fn start_http_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {

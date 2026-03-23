@@ -91,11 +91,9 @@ enabled = false
 
 [build]
 workspace_root = "/var/lib/build-service/workspaces"
-# default_workspace_path = "/home/build/workspace"
+# default_workspace_path = "/home/build/workspace"  # server never GC's or cleans this path
 # run_as_user = "build"
 # run_as_group = "build"
-max_upload_bytes = 134217728
-max_extracted_bytes = 1342177280
 
 [build.workspace]
 # default_ttl_sec = 7200
@@ -125,12 +123,17 @@ allow = [
     "MAKEFLAGS",
 ]
 
+[sources]
+max_transfer_bytes = 134217728
+max_uncompressed_bytes = 1342177280
+
 [artifacts]
 storage_root = "/var/lib/build-service/artifacts"
 # ttl_sec = 86400
 # gc_interval_sec = 3600
 # max_bytes = 1073741824
-# max_artifact_bytes = 536870912
+# max_transfer_bytes = 536870912
+# max_uncompressed_bytes = 2147483648
 ```
 
 ### Client (repo)

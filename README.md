@@ -12,7 +12,7 @@ Built-in protections to review and tune:
 - **Command allowlist** (`build.commands`)
 - **Environment allowlist** (`build.environment.allow`)
 - **Workspace scoping** (managed reusable workspaces or a configured default workspace, with relative path validation for sources/artifacts/cwd)
-- **Upload size and timeouts** (`build.max_upload_bytes`, `build.timeouts`)
+- **Transfer size and timeouts** (`sources.max_transfer_bytes`, `sources.max_uncompressed_bytes`, `build.timeouts`)
 - **Transport controls** (socket permissions, optional HTTP auth)
 
 If your environment includes untrusted or semi-trusted workloads, consider additional isolation around the service.
@@ -58,16 +58,18 @@ Key fields:
 - `service.socket.*`: Unix socket enablement, path, group, mode.
 - `service.http.*`: HTTP enablement, listen address, auth, and optional TLS.
 - `build.workspace_root`: base directory for temp workspaces.
-- `build.default_workspace_path`: optional permanent workspace used when no reusable workspace is requested.
+- `build.default_workspace_path`: optional permanent workspace used when no reusable workspace is requested; the server does not GC or clean this directory.
 - `build.workspace.*`: defaults and GC settings for reusable workspaces.
-- `build.max_upload_bytes`: max source upload size (default 128MB).
-- `build.max_extracted_bytes`: max total extracted source size (default 10x upload limit).
+- `sources.max_transfer_bytes`: max source archive size accepted by the server (default 128MB).
+- `sources.max_uncompressed_bytes`: max total extracted source size accepted by the server (default 10x transfer limit).
 - `build.run_as_user` / `build.run_as_group`: optional run-as user/group.
 - `build.commands`: allowlist mapping `command` -> absolute binary path.
 - `build.timeouts.*`: default timeout and max timeout.
 - `build.environment.allow`: allowlist of environment variables passed to the build.
+- `sources.*`: upload-side transfer and uncompressed-content limits for source archives.
 - `artifacts.storage_root`: artifact storage root (per-build subdirs).
-- `artifacts.max_artifact_bytes`: optional max artifact zip size per request.
+- `artifacts.max_transfer_bytes`: optional max artifact zip size per request.
+- `artifacts.max_uncompressed_bytes`: optional max total uncompressed artifact content size per request.
 - `artifacts.*`: TTL/GC settings for artifact retention.
 
 Environment overrides:
