@@ -47,6 +47,9 @@ pub enum ArtifactError {
 
     #[error("invalid artifact pattern: {message}")]
     InvalidPattern { message: String },
+
+    #[error("artifact archive exceeds max_artifact_bytes ({max_bytes} bytes)")]
+    TooLarge { max_bytes: u64 },
 }
 
 pub fn collect_artifacts_zip(
@@ -143,7 +146,7 @@ pub fn collect_artifacts_zip(
     })?;
 
     let dest = dest_dir.join("artifacts.zip");
-    write_artifacts_zip(&dest, &matched_files)?;
+    write_artifacts_zip(&dest, &matched_files, config.max_artifact_bytes)?;
 
     let size = fs::metadata(&dest).map_err(|source| ArtifactError::Io {
         context: "stat artifacts.zip",
@@ -265,6 +268,7 @@ fn is_excluded(path: &Path, patterns: &[glob::Pattern]) -> bool {
 fn write_artifacts_zip(
     dest: &Path,
     matched_files: &HashMap<PathBuf, PathBuf>,
+    max_artifact_bytes: Option<u64>,
 ) -> Result<(), ArtifactError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -305,6 +309,20 @@ fn write_artifacts_zip(
 
     zip.finish()
         .map_err(|source| ArtifactError::Zip { source })?;
+
+    if let Some(max_artifact_bytes) = max_artifact_bytes {
+        let size = fs::metadata(dest).map_err(|source| ArtifactError::Io {
+            context: "stat artifacts.zip",
+            source,
+        })?;
+        if size.len() > max_artifact_bytes {
+            let _ = fs::remove_file(dest);
+            return Err(ArtifactError::TooLarge {
+                max_bytes: max_artifact_bytes,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -458,6 +476,7 @@ mod tests {
             ttl_sec: None,
             gc_interval_sec: None,
             max_bytes: None,
+            max_artifact_bytes: None,
         };
         let spec = ArtifactSpec {
             include: vec!["out/*.bin".to_string()],
@@ -477,6 +496,7 @@ mod tests {
             ttl_sec: None,
             gc_interval_sec: None,
             max_bytes: None,
+            max_artifact_bytes: None,
         };
         let output = root.path().join("out");
         std::fs::create_dir_all(&output).expect("mkdir");
@@ -510,6 +530,7 @@ mod tests {
             ttl_sec: None,
             gc_interval_sec: None,
             max_bytes: None,
+            max_artifact_bytes: None,
         };
         let spec = ArtifactSpec {
             include: vec!["link.txt".to_string()],
@@ -521,5 +542,35 @@ mod tests {
             ArtifactError::OutsideRoot { .. } => {}
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn collect_artifacts_enforces_max_artifact_bytes() {
+        let root = tempdir().expect("tempdir");
+        let output = root.path().join("out");
+        std::fs::create_dir_all(&output).expect("mkdir");
+        std::fs::write(output.join("app.txt"), "artifact payload").expect("write");
+        let config = ArtifactsConfig {
+            storage_root: root.path().join("artifacts"),
+            ttl_sec: None,
+            gc_interval_sec: None,
+            max_bytes: None,
+            max_artifact_bytes: Some(32),
+        };
+        let spec = ArtifactSpec {
+            include: vec!["out/**".to_string()],
+            exclude: vec![],
+        };
+
+        let err = collect_artifacts_zip(root.path(), &spec, &config, "bld").unwrap_err();
+        assert!(matches!(err, ArtifactError::TooLarge { max_bytes: 32 }));
+        assert!(
+            !config
+                .storage_root
+                .join("bld")
+                .join("artifacts.zip")
+                .exists(),
+            "oversized archives should be removed"
+        );
     }
 }

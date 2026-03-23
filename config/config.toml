@@ -25,6 +25,7 @@ enabled = false
 
 [build]
 workspace_root = "/var/lib/build-service/workspaces"
+# default_workspace_path = "/home/build/workspace"
 # optional: run builds as this user/group (default: service process user)
 # run_as_user = "build"
 # run_as_group = "build"
@@ -64,6 +65,7 @@ storage_root = "/var/lib/build-service/artifacts"
 # ttl_sec = 86400
 # gc_interval_sec = 3600
 # max_bytes = 1073741824
+# max_artifact_bytes = 536870912
 
 [logging]
 level = "info"

@@ -253,15 +253,12 @@ async fn start_build(
         }
     };
 
-    let source = match source_path {
-        Some(path) => path,
-        None => return bad_request("missing source field"),
-    };
-
     let validated = match validate_request(request, &state.config) {
         Ok(validated) => validated,
         Err(err) => {
-            let _ = std::fs::remove_file(&source);
+            if let Some(path) = &source_path {
+                let _ = std::fs::remove_file(path);
+            }
             let body = Json(ErrorResponse { error: err.message });
             return (StatusCode::BAD_REQUEST, body).into_response();
         }
@@ -270,28 +267,37 @@ async fn start_build(
     let workspace_plan = match state.workspace_state.plan_request(&validated.request) {
         Ok(plan) => plan,
         Err(err) => {
-            let _ = std::fs::remove_file(&source);
+            if let Some(path) = &source_path {
+                let _ = std::fs::remove_file(path);
+            }
             return bad_request(&err.to_string());
         }
     };
 
-    if workspace_plan.reuse && workspace_plan.client_supplied && !workspace_plan.create {
-        let workspace_path = state.workspace_state.workspace_path(&workspace_plan.id);
-        if !workspace_path.is_dir() {
-            let _ = std::fs::remove_file(&source);
-            return bad_request("workspace not found");
+    if workspace_plan.record_use
+        && workspace_plan.client_supplied
+        && !workspace_plan.create
+        && !workspace_plan.path.is_dir()
+    {
+        if let Some(path) = &source_path {
+            let _ = std::fs::remove_file(path);
         }
+        return bad_request("workspace not found");
     }
 
-    let workspace_guard = if workspace_plan.reuse {
-        match state.workspace_state.try_acquire(&workspace_plan.id) {
+    let workspace_guard = if let Some(lock_key) = workspace_plan.lock_key.as_deref() {
+        match state.workspace_state.try_acquire(lock_key) {
             Ok(guard) => Some(guard),
             Err(WorkspaceError::Busy) => {
-                let _ = std::fs::remove_file(&source);
+                if let Some(path) = &source_path {
+                    let _ = std::fs::remove_file(path);
+                }
                 return conflict("workspace_busy");
             }
             Err(err) => {
-                let _ = std::fs::remove_file(&source);
+                if let Some(path) = &source_path {
+                    let _ = std::fs::remove_file(path);
+                }
                 return bad_request(&err.to_string());
             }
         }
@@ -315,7 +321,7 @@ async fn start_build(
             config,
             workspace_state,
             workspace_plan,
-            source,
+            source_path,
             tx,
             cancellation,
             workspace_guard,
@@ -585,6 +591,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_build_allows_missing_source_with_default_workspace() {
+        let env = setup_env();
+        let (addr, server_handle) = start_http_server(env.app).await;
+
+        let zip_bytes = tokio::task::spawn_blocking(move || {
+            let request = build_request();
+            let client = Client::new();
+            let base_url = format!("http://{addr}");
+            let archive_path = post_build(&client, &base_url, &request, None);
+            fetch_zip(&client, &base_url, &archive_path)
+        })
+        .await
+        .expect("build task");
+
+        assert_zip_contains(&zip_bytes, "out/hello.txt", "hello");
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_build_rejects_missing_source_without_default_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let artifacts_root = temp.path().join("artifacts");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&workspace_root).expect("workspace root");
+        std::fs::create_dir_all(&artifacts_root).expect("artifacts root");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+
+        let script_path = bin_dir.join("build.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nmkdir -p out\necho hello > out/hello.txt\n",
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let mut config = Config {
+            schema_version: "3".to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        config.build.workspace_root = workspace_root;
+        config
+            .build
+            .commands
+            .insert("build".to_string(), script_path);
+        config.artifacts.storage_root = artifacts_root;
+
+        let app = build_app(config);
+        let (addr, server_handle) = start_http_server(app).await;
+
+        let (status, body) = tokio::task::spawn_blocking(move || {
+            let request = build_request();
+            let client = Client::new();
+            let metadata = serde_json::to_string(&request).expect("metadata");
+            let response = client
+                .post(format!("http://{addr}/v1/builds"))
+                .multipart(
+                    Form::new().part(
+                        "metadata",
+                        Part::text(metadata)
+                            .mime_str("application/json")
+                            .expect("metadata mime"),
+                    ),
+                )
+                .send()
+                .expect("send");
+            let status = response.status();
+            let body = response.text().expect("body");
+            (status, body)
+        })
+        .await
+        .expect("request task");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("workspace ID required (no default workspace configured)"),
+            "unexpected body: {body}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_build_extracts_sources_into_default_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let default_workspace = temp.path().join("default-workspace");
+        let artifacts_root = temp.path().join("artifacts");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&workspace_root).expect("workspace root");
+        std::fs::create_dir_all(&default_workspace).expect("default workspace");
+        std::fs::create_dir_all(&artifacts_root).expect("artifacts root");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+
+        let script_path = bin_dir.join("copy.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nmkdir -p out\ncat input.txt > out/copied.txt\n",
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let mut config = Config {
+            schema_version: "3".to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        config.build.workspace_root = workspace_root;
+        config.build.default_workspace_path = Some(default_workspace);
+        config
+            .build
+            .commands
+            .insert("copy".to_string(), script_path);
+        config.artifacts.storage_root = artifacts_root;
+
+        let app = build_app(config);
+        let (addr, server_handle) = start_http_server(app).await;
+
+        let zip_bytes = tokio::task::spawn_blocking(move || {
+            let source_archive = create_source_zip().expect("source zip");
+            let request = Request {
+                command: "copy".to_string(),
+                ..build_request()
+            };
+            let client = Client::new();
+            let base_url = format!("http://{addr}");
+            let archive_path = post_build(&client, &base_url, &request, Some(&source_archive));
+            fetch_zip(&client, &base_url, &archive_path)
+        })
+        .await
+        .expect("build task");
+
+        assert_zip_contains(&zip_bytes, "out/copied.txt", "source");
+        server_handle.abort();
+    }
+
+    #[tokio::test]
     #[ignore] // Long-running test (~90s) - run with `cargo test -- --ignored`
     async fn http_slow_build_streams_output() {
         let env = setup_slow_env();
@@ -766,9 +922,11 @@ mod tests {
     fn setup_slow_env() -> TestEnv {
         let temp = tempdir().expect("tempdir");
         let workspace_root = temp.path().join("workspace");
+        let default_workspace = temp.path().join("default-workspace");
         let artifacts_root = temp.path().join("artifacts");
         let bin_dir = temp.path().join("bin");
         std::fs::create_dir_all(&workspace_root).expect("workspace root");
+        std::fs::create_dir_all(&default_workspace).expect("default workspace");
         std::fs::create_dir_all(&artifacts_root).expect("artifacts root");
         std::fs::create_dir_all(&bin_dir).expect("bin dir");
 
@@ -804,6 +962,7 @@ echo "Build finished successfully"
             logging: LoggingConfig::default(),
         };
         config.build.workspace_root = workspace_root.clone();
+        config.build.default_workspace_path = Some(default_workspace);
         config
             .build
             .commands
@@ -817,9 +976,11 @@ echo "Build finished successfully"
     fn setup_env() -> TestEnv {
         let temp = tempdir().expect("tempdir");
         let workspace_root = temp.path().join("workspace");
+        let default_workspace = temp.path().join("default-workspace");
         let artifacts_root = temp.path().join("artifacts");
         let bin_dir = temp.path().join("bin");
         std::fs::create_dir_all(&workspace_root).expect("workspace root");
+        std::fs::create_dir_all(&default_workspace).expect("default workspace");
         std::fs::create_dir_all(&artifacts_root).expect("artifacts root");
         std::fs::create_dir_all(&bin_dir).expect("bin dir");
 
@@ -843,6 +1004,7 @@ echo "Build finished successfully"
             logging: LoggingConfig::default(),
         };
         config.build.workspace_root = workspace_root.clone();
+        config.build.default_workspace_path = Some(default_workspace);
         config
             .build
             .commands
@@ -857,6 +1019,7 @@ echo "Build finished successfully"
         let max_upload_bytes = config.build.max_upload_bytes;
         let workspace_state = Arc::new(WorkspaceState::new(
             config.build.workspace_root.clone(),
+            config.build.default_workspace_path.clone(),
             config.build.workspace.clone(),
         ));
         let state = AppState {
@@ -916,7 +1079,7 @@ echo "Build finished successfully"
             let source_archive = create_source_zip().expect("source zip");
             let request = build_request();
             let (client, base_url) = build_client(&transport);
-            let archive_path = post_build(&client, &base_url, &request, &source_archive);
+            let archive_path = post_build(&client, &base_url, &request, Some(&source_archive));
             fetch_zip(&client, &base_url, &archive_path)
         })
         .await
@@ -940,23 +1103,24 @@ echo "Build finished successfully"
         client: &Client,
         base_url: &str,
         request: &Request,
-        source_archive: &NamedTempFile,
+        source_archive: Option<&NamedTempFile>,
     ) -> String {
         let metadata = serde_json::to_string(request).expect("metadata");
-        let form = Form::new()
-            .part(
-                "metadata",
-                Part::text(metadata)
-                    .mime_str("application/json")
-                    .expect("metadata mime"),
-            )
-            .part(
+        let mut form = Form::new().part(
+            "metadata",
+            Part::text(metadata)
+                .mime_str("application/json")
+                .expect("metadata mime"),
+        );
+        if let Some(source_archive) = source_archive {
+            form = form.part(
                 "source",
                 Part::file(source_archive.path())
                     .expect("source part")
                     .mime_str("application/zip")
                     .expect("source mime"),
             );
+        }
 
         let base = base_url.trim_end_matches('/');
         let url = format!("{base}/v1/builds");

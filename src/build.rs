@@ -173,24 +173,20 @@ pub fn execute_build(
     config: std::sync::Arc<Config>,
     workspace_state: Arc<WorkspaceState>,
     workspace_plan: WorkspacePlan,
-    source_archive: PathBuf,
+    source_archive: Option<PathBuf>,
     sender: Sender<ResponseEvent>,
     cancellation: CancellationFlag,
     workspace_guard: Option<WorkspaceGuard>,
 ) {
     let _workspace_guard = workspace_guard;
-    let workspace_id = if workspace_plan.reuse {
-        Some(workspace_plan.id.clone())
-    } else {
-        None
-    };
+    let workspace_id = workspace_plan.managed_id.clone();
 
     if let Err(err) = run_build(
         validated,
         &config,
         &workspace_state,
         &workspace_plan,
-        &source_archive,
+        source_archive.as_deref(),
         &sender,
         &cancellation,
     ) {
@@ -207,11 +203,13 @@ pub fn execute_build(
         });
     }
 
-    if let Err(err) = std::fs::remove_file(&source_archive) {
-        warn!(
-            "failed to remove source archive {:?}: {err}",
-            source_archive
-        );
+    if let Some(source_archive) = source_archive {
+        if let Err(err) = std::fs::remove_file(&source_archive) {
+            warn!(
+                "failed to remove source archive {:?}: {err}",
+                source_archive
+            );
+        }
     }
 }
 
@@ -220,7 +218,7 @@ fn run_build(
     config: &Config,
     workspace_state: &WorkspaceState,
     workspace_plan: &WorkspacePlan,
-    source_archive: &Path,
+    source_archive: Option<&Path>,
     sender: &Sender<ResponseEvent>,
     cancellation: &CancellationFlag,
 ) -> Result<(), BuildError> {
@@ -236,13 +234,7 @@ fn run_build(
     let run_as = resolve_run_as(config)?;
 
     let workspace = prepare_workspace(config, workspace_state, workspace_plan, source_archive)?;
-    let cleanup_path = workspace.clone();
-
-    let workspace_id = if workspace_plan.reuse {
-        Some(workspace_plan.id.as_str())
-    } else {
-        None
-    };
+    let workspace_id = workspace_plan.managed_id.as_deref();
     let result = run_build_in_workspace(
         &validated,
         config,
@@ -254,15 +246,13 @@ fn run_build(
         cancellation,
     );
 
-    if workspace_plan.reuse {
+    if workspace_plan.record_use {
         if let Err(err) = workspace_state.record_use(workspace_plan) {
             warn!(
                 "failed to update workspace metadata {:?}: {err}",
-                workspace_plan.id
+                workspace_plan.managed_id
             );
         }
-    } else if let Err(err) = std::fs::remove_dir_all(&cleanup_path) {
-        warn!("failed to cleanup workspace {:?}: {err}", cleanup_path);
     }
 
     result
@@ -464,18 +454,11 @@ fn map_artifact_error(err: ArtifactError) -> BuildError {
 
 fn prepare_workspace(
     config: &Config,
-    workspace_state: &WorkspaceState,
+    _workspace_state: &WorkspaceState,
     plan: &WorkspacePlan,
-    source_archive: &Path,
+    source_archive: Option<&Path>,
 ) -> Result<PathBuf, BuildError> {
-    std::fs::create_dir_all(&config.build.workspace_root).map_err(|err| {
-        BuildError::new(
-            "workspace_create_failed",
-            format!("failed to create workspace root: {err}"),
-        )
-    })?;
-
-    let workspace = workspace_state.workspace_path(&plan.id);
+    let workspace = plan.path.clone();
     let existed = workspace.exists();
 
     if existed && !workspace.is_dir() {
@@ -485,14 +468,16 @@ fn prepare_workspace(
         ));
     }
 
-    if !plan.reuse && existed {
-        return Err(BuildError::new(
-            "workspace_exists",
-            "workspace already exists",
-        ));
+    if plan.record_use {
+        std::fs::create_dir_all(&config.build.workspace_root).map_err(|err| {
+            BuildError::new(
+                "workspace_create_failed",
+                format!("failed to create workspace root: {err}"),
+            )
+        })?;
     }
 
-    if plan.reuse && plan.client_supplied && !plan.create && !existed {
+    if plan.record_use && plan.client_supplied && !plan.create && !existed {
         return Err(BuildError::new(
             "workspace_not_found",
             "workspace not found",
@@ -508,7 +493,7 @@ fn prepare_workspace(
         })?;
     }
 
-    if plan.reuse {
+    if plan.record_use {
         let meta_dir = workspace.join(".build-service");
         std::fs::create_dir_all(&meta_dir).map_err(|err| {
             BuildError::new(
@@ -518,17 +503,14 @@ fn prepare_workspace(
         })?;
     }
 
-    if let Err(err) = extract_source_archive(
-        source_archive,
-        &workspace,
-        config.build.max_extracted_bytes,
-        plan.reuse,
-        plan.refresh,
-    ) {
-        if !plan.reuse {
-            let _ = std::fs::remove_dir_all(&workspace);
-        }
-        return Err(err);
+    if let Some(source_archive) = source_archive {
+        extract_source_archive(
+            source_archive,
+            &workspace,
+            config.build.max_extracted_bytes,
+            plan.record_use,
+            plan.refresh,
+        )?;
     }
 
     Ok(workspace)

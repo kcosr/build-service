@@ -154,6 +154,21 @@ impl Config {
             ));
         }
 
+        if let Some(path) = &self.build.default_workspace_path {
+            if !path.is_absolute() {
+                return Err(ConfigError::Invalid(
+                    "build.default_workspace_path must be an absolute path".to_string(),
+                ));
+            }
+
+            if !path.is_dir() {
+                return Err(ConfigError::Invalid(format!(
+                    "build.default_workspace_path does not exist or is not a directory: {}",
+                    path.display()
+                )));
+            }
+        }
+
         if self.build.workspace.default_ttl_sec == 0 && !self.build.workspace.allow_permanent {
             return Err(ConfigError::Invalid(
                 "build.workspace.default_ttl_sec must be > 0 unless allow_permanent is true"
@@ -393,6 +408,9 @@ pub struct BuildConfig {
     pub workspace_root: PathBuf,
 
     #[serde(default)]
+    pub default_workspace_path: Option<PathBuf>,
+
+    #[serde(default)]
     pub workspace: WorkspaceConfig,
 
     #[serde(default)]
@@ -421,6 +439,7 @@ impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             workspace_root: default_workspace_root(),
+            default_workspace_path: None,
             workspace: WorkspaceConfig::default(),
             run_as_user: None,
             run_as_group: None,
@@ -537,6 +556,9 @@ pub struct ArtifactsConfig {
 
     #[serde(default)]
     pub max_bytes: Option<u64>,
+
+    #[serde(default)]
+    pub max_artifact_bytes: Option<u64>,
 }
 
 impl Default for ArtifactsConfig {
@@ -546,6 +568,7 @@ impl Default for ArtifactsConfig {
             ttl_sec: None,
             gc_interval_sec: None,
             max_bytes: None,
+            max_artifact_bytes: None,
         }
     }
 }
@@ -584,6 +607,14 @@ impl ArtifactsConfig {
             if max_bytes == 0 {
                 return Err(ConfigError::Invalid(
                     "artifacts.max_bytes must be greater than zero".to_string(),
+                ));
+            }
+        }
+
+        if let Some(max_artifact_bytes) = self.max_artifact_bytes {
+            if max_artifact_bytes == 0 {
+                return Err(ConfigError::Invalid(
+                    "artifacts.max_artifact_bytes must be greater than zero".to_string(),
                 ));
             }
         }
@@ -692,5 +723,30 @@ mod tests {
 
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("service.socket.enabled"));
+    }
+
+    #[test]
+    fn validate_requires_existing_default_workspace_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+
+        config.build.commands.insert(
+            "make".to_string(),
+            std::env::current_exe().expect("current exe"),
+        );
+        config.artifacts.storage_root = temp.path().join("artifacts");
+        config.build.default_workspace_path = Some(temp.path().join("missing"));
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("build.default_workspace_path"),
+            "unexpected error: {err}"
+        );
     }
 }
