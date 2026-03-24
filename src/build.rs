@@ -893,9 +893,7 @@ fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildE
             if should_set_ids {
                 let c_username = CString::new(username.clone())
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid username"))?;
-                if libc::initgroups(c_username.as_ptr(), gid as libc::gid_t) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
+                initgroups_for_platform(c_username.as_ptr(), gid)?;
                 if libc::setgid(gid as libc::gid_t) != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -907,6 +905,25 @@ fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildE
         });
     }
 
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn initgroups_for_platform(user: *const libc::c_char, gid: u32) -> io::Result<()> {
+    let basegroup: libc::c_int = gid
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "gid out of range"))?;
+    if unsafe { libc::initgroups(user, basegroup) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn initgroups_for_platform(user: *const libc::c_char, gid: u32) -> io::Result<()> {
+    if unsafe { libc::initgroups(user, gid as libc::gid_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
