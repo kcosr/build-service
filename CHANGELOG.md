@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] - 2026-03-24
 
 ### Breaking Changes
 - Require a configured default workspace or explicit reusable workspace request for builds that do not use `workspace.reuse`, and drop the old implicit ephemeral-workspace path ([#14](https://github.com/kcosr/build-service/pull/14))
