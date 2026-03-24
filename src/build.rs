@@ -173,24 +173,20 @@ pub fn execute_build(
     config: std::sync::Arc<Config>,
     workspace_state: Arc<WorkspaceState>,
     workspace_plan: WorkspacePlan,
-    source_archive: PathBuf,
+    source_archive: Option<PathBuf>,
     sender: Sender<ResponseEvent>,
     cancellation: CancellationFlag,
     workspace_guard: Option<WorkspaceGuard>,
 ) {
     let _workspace_guard = workspace_guard;
-    let workspace_id = if workspace_plan.reuse {
-        Some(workspace_plan.id.clone())
-    } else {
-        None
-    };
+    let workspace_id = workspace_plan.managed_id.clone();
 
     if let Err(err) = run_build(
         validated,
         &config,
         &workspace_state,
         &workspace_plan,
-        &source_archive,
+        source_archive.as_deref(),
         &sender,
         &cancellation,
     ) {
@@ -207,11 +203,13 @@ pub fn execute_build(
         });
     }
 
-    if let Err(err) = std::fs::remove_file(&source_archive) {
-        warn!(
-            "failed to remove source archive {:?}: {err}",
-            source_archive
-        );
+    if let Some(source_archive) = source_archive {
+        if let Err(err) = std::fs::remove_file(&source_archive) {
+            warn!(
+                "failed to remove source archive {:?}: {err}",
+                source_archive
+            );
+        }
     }
 }
 
@@ -220,7 +218,7 @@ fn run_build(
     config: &Config,
     workspace_state: &WorkspaceState,
     workspace_plan: &WorkspacePlan,
-    source_archive: &Path,
+    source_archive: Option<&Path>,
     sender: &Sender<ResponseEvent>,
     cancellation: &CancellationFlag,
 ) -> Result<(), BuildError> {
@@ -235,14 +233,8 @@ fn run_build(
 
     let run_as = resolve_run_as(config)?;
 
-    let workspace = prepare_workspace(config, workspace_state, workspace_plan, source_archive)?;
-    let cleanup_path = workspace.clone();
-
-    let workspace_id = if workspace_plan.reuse {
-        Some(workspace_plan.id.as_str())
-    } else {
-        None
-    };
+    let workspace = prepare_workspace(config, workspace_plan, source_archive)?;
+    let workspace_id = workspace_plan.managed_id.as_deref();
     let result = run_build_in_workspace(
         &validated,
         config,
@@ -254,15 +246,13 @@ fn run_build(
         cancellation,
     );
 
-    if workspace_plan.reuse {
+    if workspace_plan.record_use {
         if let Err(err) = workspace_state.record_use(workspace_plan) {
             warn!(
                 "failed to update workspace metadata {:?}: {err}",
-                workspace_plan.id
+                workspace_plan.managed_id
             );
         }
-    } else if let Err(err) = std::fs::remove_dir_all(&cleanup_path) {
-        warn!("failed to cleanup workspace {:?}: {err}", cleanup_path);
     }
 
     result
@@ -464,18 +454,10 @@ fn map_artifact_error(err: ArtifactError) -> BuildError {
 
 fn prepare_workspace(
     config: &Config,
-    workspace_state: &WorkspaceState,
     plan: &WorkspacePlan,
-    source_archive: &Path,
+    source_archive: Option<&Path>,
 ) -> Result<PathBuf, BuildError> {
-    std::fs::create_dir_all(&config.build.workspace_root).map_err(|err| {
-        BuildError::new(
-            "workspace_create_failed",
-            format!("failed to create workspace root: {err}"),
-        )
-    })?;
-
-    let workspace = workspace_state.workspace_path(&plan.id);
+    let workspace = plan.path.clone();
     let existed = workspace.exists();
 
     if existed && !workspace.is_dir() {
@@ -485,14 +467,16 @@ fn prepare_workspace(
         ));
     }
 
-    if !plan.reuse && existed {
-        return Err(BuildError::new(
-            "workspace_exists",
-            "workspace already exists",
-        ));
+    if plan.record_use {
+        std::fs::create_dir_all(&config.build.workspace_root).map_err(|err| {
+            BuildError::new(
+                "workspace_create_failed",
+                format!("failed to create workspace root: {err}"),
+            )
+        })?;
     }
 
-    if plan.reuse && plan.client_supplied && !plan.create && !existed {
+    if plan.record_use && plan.client_supplied && !plan.create && !existed {
         return Err(BuildError::new(
             "workspace_not_found",
             "workspace not found",
@@ -500,15 +484,22 @@ fn prepare_workspace(
     }
 
     if !existed {
-        std::fs::create_dir_all(&workspace).map_err(|err| {
-            BuildError::new(
-                "workspace_create_failed",
-                format!("failed to create workspace: {err}"),
-            )
-        })?;
+        if plan.record_use {
+            std::fs::create_dir_all(&workspace).map_err(|err| {
+                BuildError::new(
+                    "workspace_create_failed",
+                    format!("failed to create workspace: {err}"),
+                )
+            })?;
+        } else {
+            return Err(BuildError::new(
+                "workspace_not_found",
+                "default workspace not found",
+            ));
+        }
     }
 
-    if plan.reuse {
+    if plan.record_use {
         let meta_dir = workspace.join(".build-service");
         std::fs::create_dir_all(&meta_dir).map_err(|err| {
             BuildError::new(
@@ -518,17 +509,14 @@ fn prepare_workspace(
         })?;
     }
 
-    if let Err(err) = extract_source_archive(
-        source_archive,
-        &workspace,
-        config.build.max_extracted_bytes,
-        plan.reuse,
-        plan.refresh,
-    ) {
-        if !plan.reuse {
-            let _ = std::fs::remove_dir_all(&workspace);
-        }
-        return Err(err);
+    if let Some(source_archive) = source_archive {
+        extract_source_archive(
+            source_archive,
+            &workspace,
+            config.sources.max_uncompressed_bytes,
+            plan.record_use,
+            plan.refresh,
+        )?;
     }
 
     Ok(workspace)
@@ -537,7 +525,7 @@ fn prepare_workspace(
 fn extract_source_archive(
     source_archive: &Path,
     dest: &Path,
-    max_extracted_bytes: u64,
+    max_uncompressed_bytes: u64,
     use_manifest: bool,
     refresh: bool,
 ) -> Result<(), BuildError> {
@@ -625,11 +613,11 @@ fn extract_source_archive(
                 }
 
                 extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
-                if extracted_bytes > max_extracted_bytes {
+                if extracted_bytes > max_uncompressed_bytes {
                     return Err(BuildError::new(
                         "source_archive",
                         format!(
-                            "extracted size exceeds max_extracted_bytes ({max_extracted_bytes} bytes)"
+                            "extracted size exceeds sources.max_uncompressed_bytes ({max_uncompressed_bytes} bytes)"
                         ),
                     ));
                 }
@@ -690,11 +678,11 @@ fn extract_source_archive(
                 }
 
                 extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
-                if extracted_bytes > max_extracted_bytes {
+                if extracted_bytes > max_uncompressed_bytes {
                     return Err(BuildError::new(
                         "source_archive",
                         format!(
-                            "extracted size exceeds max_extracted_bytes ({max_extracted_bytes} bytes)"
+                            "extracted size exceeds sources.max_uncompressed_bytes ({max_uncompressed_bytes} bytes)"
                         ),
                     ));
                 }
@@ -905,9 +893,7 @@ fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildE
             if should_set_ids {
                 let c_username = CString::new(username.clone())
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid username"))?;
-                if libc::initgroups(c_username.as_ptr(), gid as libc::gid_t) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
+                initgroups_for_platform(c_username.as_ptr(), gid)?;
                 if libc::setgid(gid as libc::gid_t) != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -919,6 +905,25 @@ fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildE
         });
     }
 
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn initgroups_for_platform(user: *const libc::c_char, gid: u32) -> io::Result<()> {
+    let basegroup: libc::c_int = gid
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "gid out of range"))?;
+    if unsafe { libc::initgroups(user, basegroup) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn initgroups_for_platform(user: *const libc::c_char, gid: u32) -> io::Result<()> {
+    if unsafe { libc::initgroups(user, gid as libc::gid_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -1098,12 +1103,16 @@ pub fn artifacts_for_build(build_id: &str, config: &Config) -> Option<ArtifactAr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        ArtifactsConfig, BuildConfig, Config, LoggingConfig, ServiceConfig, SourcesConfig,
+    };
+    use crate::workspace::WorkspacePlan;
     use tempfile::{tempdir, NamedTempFile};
     use zip::write::FileOptions;
     use zip::ZipWriter;
 
     #[test]
-    fn extract_source_archive_enforces_max_extracted_bytes() {
+    fn extract_source_archive_enforces_max_uncompressed_bytes() {
         let temp = tempdir().expect("tempdir");
         let source = create_test_zip("input.txt", b"0123456789").expect("zip");
         let dest = temp.path().join("workspace");
@@ -1112,7 +1121,7 @@ mod tests {
         let err = extract_source_archive(source.path(), &dest, 5, false, false).unwrap_err();
         assert_eq!(err.code, "source_archive");
         assert!(
-            err.message.contains("max_extracted_bytes"),
+            err.message.contains("sources.max_uncompressed_bytes"),
             "unexpected error: {}",
             err.message
         );
@@ -1136,6 +1145,38 @@ mod tests {
         let outcome = wait_with_timeout(&mut child, 60, &cancellation).expect("wait result");
         assert!(matches!(outcome, WaitOutcome::Cancelled));
         let _ = child.wait();
+    }
+
+    #[test]
+    fn prepare_workspace_rejects_missing_default_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path().join("missing-default");
+        let config = Config {
+            schema_version: "3".to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        let plan = WorkspacePlan {
+            path: workspace,
+            managed_id: None,
+            record_use: false,
+            ttl_sec: None,
+            create: false,
+            client_supplied: false,
+            refresh: false,
+            lock_key: None,
+        };
+
+        let err = prepare_workspace(&config, &plan, None).unwrap_err();
+        assert_eq!(err.code, "workspace_not_found");
+        assert!(
+            err.message.contains("default workspace not found"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     fn create_test_zip(name: &str, contents: &[u8]) -> io::Result<NamedTempFile> {

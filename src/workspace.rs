@@ -15,16 +15,19 @@ use crate::config::WorkspaceConfig;
 use crate::protocol::Request;
 
 const DEFAULT_GC_INTERVAL_SECS: u64 = 3600;
+const DEFAULT_WORKSPACE_LOCK_ID: &str = "__default__";
 const MAX_WORKSPACE_ID_LEN: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct WorkspacePlan {
-    pub id: String,
-    pub reuse: bool,
+    pub path: PathBuf,
+    pub managed_id: Option<String>,
+    pub record_use: bool,
     pub ttl_sec: Option<u64>,
     pub create: bool,
     pub client_supplied: bool,
     pub refresh: bool,
+    pub lock_key: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +40,8 @@ pub enum WorkspaceError {
     InvalidId,
     #[error("workspace ttl_sec=0 requires build.workspace.allow_permanent=true")]
     PermanentNotAllowed,
+    #[error("workspace ID required (no default workspace configured)")]
+    DefaultWorkspaceRequired,
     #[error("workspace is busy")]
     Busy,
     #[error("workspace error: {0}")]
@@ -61,6 +66,7 @@ struct WorkspaceMetaFile {
 #[derive(Debug)]
 pub struct WorkspaceState {
     root: PathBuf,
+    default_workspace_path: Option<PathBuf>,
     settings: WorkspaceConfig,
     active: Mutex<HashSet<String>>,
     metadata: Mutex<HashMap<String, WorkspaceMeta>>,
@@ -80,10 +86,15 @@ impl Drop for WorkspaceGuard {
 }
 
 impl WorkspaceState {
-    pub fn new(root: PathBuf, settings: WorkspaceConfig) -> Self {
+    pub fn new(
+        root: PathBuf,
+        default_workspace_path: Option<PathBuf>,
+        settings: WorkspaceConfig,
+    ) -> Self {
         let metadata = load_metadata(&root);
         Self {
             root,
+            default_workspace_path,
             settings,
             active: Mutex::new(HashSet::new()),
             metadata: Mutex::new(metadata),
@@ -109,14 +120,19 @@ impl WorkspaceState {
                 }
             }
 
-            return Ok(WorkspacePlan {
-                id: format!("ws_{}", Uuid::new_v4().simple()),
-                reuse: false,
-                ttl_sec: None,
-                create: false,
-                client_supplied: false,
-                refresh: false,
-            });
+            return match &self.default_workspace_path {
+                Some(path) => Ok(WorkspacePlan {
+                    path: path.clone(),
+                    managed_id: None,
+                    record_use: false,
+                    ttl_sec: None,
+                    create: false,
+                    client_supplied: false,
+                    refresh: false,
+                    lock_key: Some(DEFAULT_WORKSPACE_LOCK_ID.to_string()),
+                }),
+                None => Err(WorkspaceError::DefaultWorkspaceRequired),
+            };
         }
 
         let workspace = workspace.expect("workspace must be present when reuse is true");
@@ -148,12 +164,14 @@ impl WorkspaceState {
         }
 
         Ok(WorkspacePlan {
-            id,
-            reuse: true,
+            path: self.workspace_path(&id),
+            managed_id: Some(id.clone()),
+            record_use: true,
             ttl_sec: Some(ttl_sec),
             create,
             client_supplied,
             refresh: workspace.refresh.unwrap_or(false),
+            lock_key: Some(id),
         })
     }
 
@@ -173,17 +191,22 @@ impl WorkspaceState {
     }
 
     pub fn record_use(&self, plan: &WorkspacePlan) -> Result<(), WorkspaceError> {
-        if !plan.reuse {
+        if !plan.record_use {
             return Ok(());
         }
+
+        let workspace_id = plan
+            .managed_id
+            .as_ref()
+            .expect("managed workspace id required when record_use is enabled");
         let ttl_sec = plan.ttl_sec.unwrap_or(self.settings.default_ttl_sec);
         let last_used = SystemTime::now();
         let meta = WorkspaceMeta { ttl_sec, last_used };
-        let meta_dir = self.workspace_path(&plan.id).join(".build-service");
+        let meta_dir = self.workspace_path(workspace_id).join(".build-service");
         fs::create_dir_all(&meta_dir)?;
 
         let meta_file = WorkspaceMetaFile {
-            workspace_id: plan.id.clone(),
+            workspace_id: workspace_id.clone(),
             ttl_sec,
             last_used: format_timestamp(last_used)?,
         };
@@ -193,7 +216,7 @@ impl WorkspaceState {
         fs::write(&meta_path, payload)?;
 
         let mut metadata = self.metadata.lock().expect("workspace metadata lock");
-        metadata.insert(plan.id.clone(), meta);
+        metadata.insert(workspace_id.clone(), meta);
         Ok(())
     }
 }
@@ -405,7 +428,8 @@ mod tests {
     #[test]
     fn plan_request_sanitizes_client_id() {
         let temp = tempdir().expect("tempdir");
-        let state = WorkspaceState::new(temp.path().to_path_buf(), WorkspaceConfig::default());
+        let state =
+            WorkspaceState::new(temp.path().to_path_buf(), None, WorkspaceConfig::default());
         let request = Request {
             schema_version: None,
             request_id: None,
@@ -425,6 +449,55 @@ mod tests {
         };
 
         let plan = state.plan_request(&request).expect("plan");
-        assert_eq!(plan.id, "feature-add-auth");
+        assert_eq!(plan.managed_id.as_deref(), Some("feature-add-auth"));
+        assert_eq!(plan.path, temp.path().join("feature-add-auth"));
+    }
+
+    #[test]
+    fn plan_request_requires_default_workspace_when_reuse_is_disabled() {
+        let temp = tempdir().expect("tempdir");
+        let state =
+            WorkspaceState::new(temp.path().to_path_buf(), None, WorkspaceConfig::default());
+        let request = Request {
+            schema_version: None,
+            request_id: None,
+            command: "make".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_sec: None,
+            artifacts: ArtifactSpec::default(),
+            env: None,
+            workspace: None,
+        };
+
+        let err = state.plan_request(&request).unwrap_err();
+        assert!(matches!(err, WorkspaceError::DefaultWorkspaceRequired));
+    }
+
+    #[test]
+    fn plan_request_uses_default_workspace_when_available() {
+        let temp = tempdir().expect("tempdir");
+        let default_workspace = temp.path().join("default");
+        std::fs::create_dir_all(&default_workspace).expect("default workspace");
+        let state = WorkspaceState::new(
+            temp.path().to_path_buf(),
+            Some(default_workspace.clone()),
+            WorkspaceConfig::default(),
+        );
+        let request = Request {
+            schema_version: None,
+            request_id: None,
+            command: "make".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_sec: None,
+            artifacts: ArtifactSpec::default(),
+            env: None,
+            workspace: None,
+        };
+
+        let plan = state.plan_request(&request).expect("plan");
+        assert_eq!(plan.path, default_workspace);
+        assert_eq!(plan.managed_id, None);
     }
 }

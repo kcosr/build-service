@@ -10,7 +10,7 @@
 
 - Host OS: Rocky Linux
 - Container runtime: Podman (rootless)
-- Socket access group: configurable (e.g., `users`)
+- Socket access group: optional; configure it only when the socket must be shared across users
 
 ## Architecture
 
@@ -37,18 +37,18 @@
 Responsibilities:
 - Listen on HTTP (TCP) and/or HTTP-over-UDS.
 - Enforce command allowlist and timeouts.
-- Extract uploaded source into a workspace (ephemeral by default, reusable when requested).
+- Extract uploaded source into a managed reusable workspace or a configured default workspace.
 - Execute build command and stream NDJSON output.
 - Collect artifacts into a single `artifacts.zip`.
 
 ### 2) build-cli (client)
 
 Responsibilities:
-- Read `.build-service/config.toml` from repo root.
-- Package sources into a zip based on include/exclude patterns.
-- Send multipart request (`metadata` + `source`) over HTTP or UDS.
+- Resolve client config from `.build-service/config.toml`, `BUILD_SERVICE_*` env vars, and CLI flags.
+- Package sources into a zip based on include/exclude patterns when sources are configured.
+- Send multipart request (`metadata` + optional `source`) over HTTP or UDS.
 - Stream NDJSON output to stdout/stderr.
-- Download `artifacts.zip` and extract into repo root (overwrite).
+- Download `artifacts.zip` and extract into repo root when artifacts are returned.
 
 ### 3) make wrapper
 
@@ -71,7 +71,7 @@ schema_version = "3"
 [service.socket]
 enabled = true
 path = "/run/build-service.sock"
-group = "users"
+# group = "users"
 mode = "0660"
 
 [service.http]
@@ -91,10 +91,9 @@ enabled = false
 
 [build]
 workspace_root = "/var/lib/build-service/workspaces"
+# default_workspace_path = "/home/build/workspace"  # server never GC's or cleans this path
 # run_as_user = "build"
 # run_as_group = "build"
-max_upload_bytes = 134217728
-max_extracted_bytes = 1342177280
 
 [build.workspace]
 # default_ttl_sec = 7200
@@ -124,16 +123,24 @@ allow = [
     "MAKEFLAGS",
 ]
 
+[sources]
+max_transfer_bytes = 134217728
+max_uncompressed_bytes = 1342177280
+
 [artifacts]
 storage_root = "/var/lib/build-service/artifacts"
 # ttl_sec = 86400
 # gc_interval_sec = 3600
 # max_bytes = 1073741824
+# max_transfer_bytes = 536870912
+# max_uncompressed_bytes = 2147483648
 ```
 
 ### Client (repo)
 
 Location: `.build-service/config.toml`
+
+Optional. If absent, CLI flags and `BUILD_SERVICE_*` env vars can provide all required settings.
 
 ```toml
 [sources]
@@ -153,6 +160,7 @@ exclude = ["**/*.tmp"]
 
 [request]
 # timeout_sec = 900
+# cwd = "subdir"
 
 [request.env]
 CC = "clang"
@@ -180,14 +188,19 @@ Notes:
 - When capture succeeds, the client emits a final `stderr` notice listing both saved log paths.
 - Temp-dir retention is OS-managed and may be short-lived. Persistent log retention requires setting `output.log_dir` to a durable path and cleaning old build directories separately.
 - Source include patterns that match nothing are skipped.
+- Source upload is optional. With no source include patterns, the client sends metadata only.
+- Artifact download is optional. With no artifact include patterns, the server omits `artifacts` and the client skips extraction.
+- In env-only mode, source packaging and artifact extraction are rooted at the current working directory because there is no repo config root.
 - `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{repo}`, `{branch}`, and `{uid}`; the client expands `{repo}` to the repo root directory name, `{branch}` to the current git branch, and `{uid}` to the effective user id before sending the request.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
+- The configured default workspace is serialized behind a single lock; concurrent requests return `workspace_busy`.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - HTTPS endpoints use the OS trust store at runtime, so `build-cli` honors system-installed CA certificates (including local intercepting proxy CAs).
-- Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
-- Env overrides: `BUILD_SERVICE_ENABLED`, `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
+- Connection precedence: CLI flags > env vars > `.build-service/config.toml`. With a config file present, the final endpoint fallback is `unix:///run/build-service.sock`.
+- Pattern precedence is additive: config values, then comma-separated env vars, then repeatable CLI flags.
+- Env overrides: `BUILD_SERVICE_ENABLED`, `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_SOURCES`, `BUILD_SERVICE_SOURCES_EXCLUDE`, `BUILD_SERVICE_ARTIFACTS`, `BUILD_SERVICE_ARTIFACTS_EXCLUDE`, `BUILD_SERVICE_CWD`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
 - `connection.enabled = false` (or `BUILD_SERVICE_ENABLED=false`) skips build-service and runs the local tool. `BUILD_SERVICE_ENABLED` overrides the config when set.
-- The wrapper falls back to the local command when `.build-service/config.toml` is missing.
+- If no config file is found, `BUILD_SERVICE_ENDPOINT` or `--endpoint` is required.
 
 ## Protocol
 
@@ -197,7 +210,7 @@ Notes:
 
 Parts:
 - `metadata` (JSON)
-- `source` (zip)
+- `source` (zip, optional)
 
 Example metadata:
 

@@ -49,6 +49,7 @@ async fn main() -> ExitCode {
 
     let workspace_state = Arc::new(WorkspaceState::new(
         config.build.workspace_root.clone(),
+        config.build.default_workspace_path.clone(),
         config.build.workspace.clone(),
     ));
 

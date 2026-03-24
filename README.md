@@ -1,6 +1,6 @@
 # Build Service
 
-A build service that accepts source uploads from clients, runs an allowed command on the host, streams NDJSON output, and returns a single `artifacts.zip` that the client automatically extracts into the local workspace.
+A build service that optionally accepts source uploads from clients, runs an allowed command on the host, streams NDJSON output, and optionally returns a single `artifacts.zip` that the client automatically extracts into the local workspace.
 
 It can be used for builds that depend on proprietary host libraries that cannot be exposed inside containers, as well as for offloading builds to remote, more powerful servers or centralizing build tooling.
 
@@ -11,42 +11,45 @@ This service executes build commands on the host (or the configured run-as user)
 Built-in protections to review and tune:
 - **Command allowlist** (`build.commands`)
 - **Environment allowlist** (`build.environment.allow`)
-- **Workspace isolation** (temp workspace per build, with relative path validation for sources/artifacts/cwd)
-- **Upload size and timeouts** (`build.max_upload_bytes`, `build.timeouts`)
+- **Workspace scoping** (managed reusable workspaces or a configured default workspace, with relative path validation for sources/artifacts/cwd)
+- **Transfer size and timeouts** (`sources.max_transfer_bytes`, `sources.max_uncompressed_bytes`, `build.timeouts`)
 - **Transport controls** (socket permissions, optional HTTP auth)
 
 If your environment includes untrusted or semi-trusted workloads, consider additional isolation around the service.
 
 ## Components
 
-- **build-service**: host daemon. Validates requests, extracts uploaded sources to a temp workspace, runs the configured command, streams output, and packages artifacts.
-- **build-cli**: client that packages sources, sends requests (HTTP or UDS), relays NDJSON output, and extracts artifacts.
+- **build-service**: host daemon. Validates requests, optionally extracts uploaded sources into a workspace, runs the configured command, streams output, and packages artifacts.
+- **build-cli**: client that resolves config from CLI/env/config file, optionally packages sources, sends requests (HTTP or UDS), relays NDJSON output, and extracts artifacts when present.
 - **build wrapper**: a POSIX shell shim that replaces build tools in containers.
 
 ## Architecture
 
-```
-+---------------------+         +----------------------+
-|  Client             |         |  Host                |
-|                     |         |                      |
-|  build-cli          |-- source.zip --> build-service |
-|   (HTTP / UDS)      |         |   validate request   |
-|                     |<- NDJSON ------+               |
-|                     |<- artifacts.zip+               |
-|                     |         |      v               |
-+---------------------+         |   exec allowed cmd   |
-                                |                      |
-                                +----------------------+
+```mermaid
+flowchart LR
+    subgraph Client
+        CLI[build-cli]
+    end
+
+    subgraph Host
+        SERVICE[build-service]
+        CMD[exec allowed command]
+    end
+
+    CLI -->|metadata + optional source.zip| SERVICE
+    SERVICE -->|NDJSON stream| CLI
+    SERVICE -->|artifacts.zip| CLI
+    SERVICE -->|validate request| CMD
 ```
 
 ## Build Flow
 
-- You run `make` (or another tool) through the wrapper (typically via a symlink so it is transparent); it looks for `.build-service/config.toml` up the tree.
-- If config exists, the wrapper execs `build-cli <tool> ...`; otherwise it falls back to the local tool.
-- `build-cli` applies `[sources]` include/exclude globs from the repo config, zips matching files, and posts `metadata` + `source.zip` to the endpoint.
-- The server validates the request, extracts into a workspace (ephemeral by default; reusable when requested), and runs the allowlisted command.
-- The client streams stdout/stderr from NDJSON; on success the server emits `artifacts.zip` info.
-- `build-cli` downloads and extracts `artifacts.zip` back into the repo root, using `[artifacts]` include/exclude globs to decide what the server packages.
+- You run `make` (or another tool) through the wrapper; it uses `build-cli` when `.build-service/config.toml` exists or `BUILD_SERVICE_ENDPOINT` is set.
+- `build-cli` layers client settings as config file -> env vars -> CLI flags.
+- If source patterns are configured, `build-cli` zips matching files and posts `metadata` + `source.zip`; otherwise it sends metadata only.
+- The server resolves either a managed reusable workspace (`workspace.reuse = true`) or the configured `build.default_workspace_path`.
+- The client streams stdout/stderr from NDJSON; on success the server emits `artifacts.zip` info only when artifacts were requested and collected.
+- `build-cli` downloads and extracts `artifacts.zip` back into the local working tree only when the exit event includes artifacts.
 
 ## Configuration
 
@@ -54,17 +57,21 @@ Sample config: `config/config.toml`
 
 Key fields:
 - `schema_version`: config schema version (currently "3").
-- `service.socket.*`: Unix socket enablement, path, group, mode.
+- `service.socket.*`: Unix socket enablement, path, optional group ownership, and mode.
 - `service.http.*`: HTTP enablement, listen address, auth, and optional TLS.
 - `build.workspace_root`: base directory for temp workspaces.
+- `build.default_workspace_path`: optional permanent workspace used when no reusable workspace is requested; the server does not GC or clean this directory.
 - `build.workspace.*`: defaults and GC settings for reusable workspaces.
-- `build.max_upload_bytes`: max source upload size (default 128MB).
-- `build.max_extracted_bytes`: max total extracted source size (default 10x upload limit).
+- `sources.max_transfer_bytes`: max source archive size accepted by the server (default 128MB).
+- `sources.max_uncompressed_bytes`: max total extracted source size accepted by the server (default 10x transfer limit).
 - `build.run_as_user` / `build.run_as_group`: optional run-as user/group.
 - `build.commands`: allowlist mapping `command` -> absolute binary path.
 - `build.timeouts.*`: default timeout and max timeout.
 - `build.environment.allow`: allowlist of environment variables passed to the build.
+- `sources.*`: upload-side transfer and uncompressed-content limits for source archives.
 - `artifacts.storage_root`: artifact storage root (per-build subdirs).
+- `artifacts.max_transfer_bytes`: optional max artifact zip size per request.
+- `artifacts.max_uncompressed_bytes`: optional max total uncompressed artifact content size per request.
 - `artifacts.*`: TTL/GC settings for artifact retention.
 
 Environment overrides:
@@ -74,6 +81,8 @@ Environment overrides:
 ## Repo-local Client Config
 
 File: `.build-service/config.toml`
+
+This file is optional. If it is absent, `build-cli` can run from CLI flags and `BUILD_SERVICE_*` env vars alone.
 
 ```toml
 [sources]
@@ -94,6 +103,7 @@ exclude = ["**/*.tmp"]
 [request]
 # optional defaults
 # timeout_sec = 900
+# cwd = "subdir"
 
 [request.env]
 CC = "clang"
@@ -118,6 +128,9 @@ CFLAGS = "-O2 -g"
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
 - Source include patterns that match nothing are skipped.
+- Source upload is optional. If no source include patterns are configured anywhere, the client sends metadata only.
+- Artifact download is optional. If no artifact include patterns are configured anywhere, the client skips artifact download entirely.
+- In env-only mode, source packaging and artifact extraction are rooted at the current working directory because there is no repo config root to anchor them.
 - When `output.capture_logs = true`, `build-cli` writes complete stream transcripts to `<base>/<build_id>/stdout.log` and `<base>/<build_id>/stderr.log`. If `output.log_dir` is unset, `<base>` defaults to `std::env::temp_dir().join("build-service")`; if it is relative, it is resolved against the directory where the `build-cli` process starts.
 - Output limits are optional and still apply only to terminal output; unset means unlimited, `0` disables output. When capture is healthy, the suppression notice points to the saved log path for that stream. If capture is unavailable, the CLI falls back to the existing env-var hint (`BUILD_SERVICE_STDOUT_MAX_LINES` / `BUILD_SERVICE_STDERR_MAX_LINES`) and later summarizes suppressed lines.
 - When log capture initializes successfully, the CLI prints a final `stderr` notice with both saved log paths even if no suppression occurred.
@@ -126,13 +139,15 @@ Notes:
 - `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{repo}`, `{branch}`, and `{uid}`; the CLI expands `{repo}` to the repo root directory name, `{branch}` to the current git branch, and `{uid}` to the effective user id, and the server sanitizes the resulting workspace id.
 - Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force a full resync of sources for the next build.
 - Set `connection.enabled = false` (or `BUILD_SERVICE_ENABLED=false`) to force the wrapper to skip build-service and run the local tool. `BUILD_SERVICE_ENABLED` overrides the config when set.
-- The CLI refuses to run if `.build-service/config.toml` is missing.
-- The wrapper falls back to the local command when `.build-service/config.toml` is missing.
+- If no config file is found, `BUILD_SERVICE_ENDPOINT` or `--endpoint` is required.
+- When a config file is present, endpoint resolution still falls back to `unix:///run/build-service.sock`.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
+- The configured default workspace is serialized behind a single lock; concurrent requests against it return `workspace_busy`.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
 - HTTPS endpoints use the OS trust store at runtime, so `build-cli` honors system-installed CA certificates (including local intercepting proxy CAs).
-- Connection precedence: CLI flags > env vars > `.build-service/config.toml` > default endpoint (`unix:///run/build-service.sock`).
-- Env overrides: `BUILD_SERVICE_ENABLED`, `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
+- Connection precedence: CLI flags > env vars > `.build-service/config.toml`. With a config file present, the final fallback endpoint is `unix:///run/build-service.sock`.
+- Source/artifact pattern precedence is additive: config file, then comma-separated env vars, then repeatable CLI flags.
+- Env overrides: `BUILD_SERVICE_ENABLED`, `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_SOURCES`, `BUILD_SERVICE_SOURCES_EXCLUDE`, `BUILD_SERVICE_ARTIFACTS`, `BUILD_SERVICE_ARTIFACTS_EXCLUDE`, `BUILD_SERVICE_CWD`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
 
 ## Protocol
 
@@ -142,7 +157,7 @@ Notes:
 
 `multipart/form-data` parts:
 - `metadata` (application/json)
-- `source` (application/zip)
+- `source` (application/zip, optional)
 
 Metadata JSON:
 
@@ -173,7 +188,7 @@ Streamed as `application/x-ndjson` until exit.
 ```
 
 Artifact patterns that match no files are skipped (logged at info level). If no files match any pattern, `artifacts` is `null` in the exit event.
-For reuse builds, the exit event includes `workspace_id`; ephemeral builds omit it.
+For managed reusable workspaces, the exit event includes `workspace_id`. Builds that use the default workspace omit it.
 
 ### Artifact Download
 `GET /v1/builds/{build_id}/artifacts.zip`
@@ -215,9 +230,14 @@ sudo systemctl enable --now build-service
 ## CLI Usage
 
 ```
-# Unix socket (default)
+# Config-backed mode
 build-cli make -j4 all
 build-cli --timeout 1800 make clean all
+
+# Env-only mode
+BUILD_SERVICE_ENDPOINT=unix:///tmp/build-service.sock build-cli make -j4 all
+build-cli --endpoint unix:///tmp/build-service.sock --cwd project cargo test
+build-cli --endpoint unix:///tmp/build-service.sock --source 'src/**' --artifact 'dist/**' make
 
 # HTTP
 build-cli --endpoint https://builds.example.com --token <token> make -j4 all
@@ -226,6 +246,9 @@ build-cli --endpoint https://builds.example.com --token <token> make -j4 all
 Environment:
 - `BUILD_SERVICE_ENDPOINT`: endpoint URL (`http://`, `https://`, or `unix://`)
 - `BUILD_SERVICE_TOKEN`: bearer token (HTTP only)
+- `BUILD_SERVICE_SOURCES` / `BUILD_SERVICE_SOURCES_EXCLUDE`: comma-separated source patterns
+- `BUILD_SERVICE_ARTIFACTS` / `BUILD_SERVICE_ARTIFACTS_EXCLUDE`: comma-separated artifact patterns
+- `BUILD_SERVICE_CWD`: request working directory relative to the remote workspace
 - `BUILD_SERVICE_TIMEOUT`: timeout in seconds
 - `BUILD_SERVICE_STDOUT_MAX_LINES`: override stdout line limit
 - `BUILD_SERVICE_STDERR_MAX_LINES`: override stderr line limit
@@ -248,17 +271,120 @@ ln -s /usr/local/bin/build-wrapper /usr/local/bin/cargo
 
 Ensure the real tools are still available later in `PATH` (for example in `/usr/bin`). The wrapper removes its own directory from `PATH` before falling back, so it will pick the system tool instead of re-invoking itself.
 
-The wrapper runs `build-cli` with the command name it was invoked as (for example `make` or `cargo`). The wrapper falls back to the local command in two cases:
-1. No repo-local config (`.build-service/config.toml`) is found
-2. Config has `connection.local_fallback = true` and the build service endpoint is unreachable
+The wrapper runs `build-cli` with the command name it was invoked as (for example `make` or `cargo`) when either a repo-local config exists or `BUILD_SERVICE_ENDPOINT` is set. The wrapper falls back to the local command in two cases:
+1. Neither `.build-service/config.toml` nor `BUILD_SERVICE_ENDPOINT` is present
+2. `build-cli` exits with code `222` because build-service is disabled or the endpoint is unreachable with local fallback enabled
 
 ## Logging
 
 Logs are written using `tracing` in a plain-text format. Configure log directory/rotation in `[logging]`.
 
+## Non-Build Example
+
+This service is not limited to build tools. If a command is whitelisted in `build.commands`, a remote client can upload input files and ask your local machine to run that command inside the configured default workspace.
+
+One concrete example is previewing an HTML file with a local [`glimpseui`](https://github.com/hazat/glimpse) install while driving it from a remote shell on `srv`.
+
+1. On your local machine, create a config that keeps everything under `/tmp/build-service` and whitelists `glimpseui`.
+
+```toml
+schema_version = "3"
+
+[service.socket]
+enabled = true
+path = "/tmp/build-service/build-service.sock"
+mode = "0660"
+
+[service.http]
+enabled = false
+
+[build]
+workspace_root = "/tmp/build-service/workspaces"
+default_workspace_path = "/tmp/build-service/default"
+
+[build.commands]
+glimpseui = "/usr/local/bin/glimpseui"
+
+[sources]
+max_transfer_bytes = 134217728
+max_uncompressed_bytes = 1342177280
+
+[artifacts]
+storage_root = "/tmp/build-service/artifacts"
+```
+
+2. On your local machine, create the directories and start `build-service`.
+
+```bash
+mkdir -p /tmp/build-service/default
+mkdir -p /tmp/build-service/workspaces
+mkdir -p /tmp/build-service/artifacts
+build-service --config /path/to/build-service.toml
+```
+
+3. On your local machine, create a reverse Unix-socket tunnel so `srv` can reach your local daemon.
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
+  -R /tmp/build-service.sock:/tmp/build-service/build-service.sock \
+  srv
+```
+
+4. On `srv`, run `build-cli` against the forwarded socket and upload the HTML file you want to open locally.
+
+```bash
+build-cli \
+  --endpoint unix:///tmp/build-service.sock \
+  --source demo.html \
+  glimpseui demo.html
+```
+
+Or create a small `glimpseui` wrapper script on `srv` and place it earlier in `PATH`. This version resolves the input file, changes into its directory, and invokes `build-cli` with the right relative arguments:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: $0 <html-file>" >&2
+  exit 2
+fi
+
+input="$1"
+
+if [ ! -f "$input" ]; then
+  echo "file not found: $input" >&2
+  exit 1
+fi
+
+endpoint="${BUILD_SERVICE_ENDPOINT:-unix:///tmp/build-service.sock}"
+abs_dir="$(cd "$(dirname "$input")" && pwd)"
+base="$(basename "$input")"
+
+cd "$abs_dir"
+
+exec build-cli \
+  --endpoint "$endpoint" \
+  --source "$base" \
+  glimpseui "$base"
+```
+
+With that wrapper in `PATH`, usage on `srv` becomes:
+
+```bash
+glimpseui demo.html
+```
+
+What happens:
+- `build-cli` on `srv` uploads `demo.html`
+- your local daemon extracts it into `/tmp/build-service/default`
+- your local machine runs the whitelisted command `glimpseui demo.html`
+
+This same pattern works for other whitelisted local commands. The important constraint is that the daemon only executes commands listed in `build.commands`; the remote client cannot invoke arbitrary binaries.
+
 ## Notes
 
 - Builds run as the service process user by default, or `build.run_as_user`/`build.run_as_group` if set.
 - If the client disconnects, the service cancels the build and terminates the process group.
-- Artifacts are bundled into `artifacts.zip` and extracted by the client into the repo root.
+- Artifacts are bundled into `artifacts.zip` and extracted by the client only when requested and returned.
 - Unix file permissions are preserved in both source and artifact archives.

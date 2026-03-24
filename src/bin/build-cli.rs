@@ -6,7 +6,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -25,6 +25,14 @@ const CLIENT_CONFIG_FILE: &str = "config.toml";
 const CONNECTION_FALLBACK_EXIT_CODE: u8 = 222;
 const OUTPUT_PREFIX: &str = "[build-service]";
 const ENABLED_ENV: &str = "BUILD_SERVICE_ENABLED";
+const ENDPOINT_ENV: &str = "BUILD_SERVICE_ENDPOINT";
+const TOKEN_ENV: &str = "BUILD_SERVICE_TOKEN";
+const SOURCES_ENV: &str = "BUILD_SERVICE_SOURCES";
+const SOURCES_EXCLUDE_ENV: &str = "BUILD_SERVICE_SOURCES_EXCLUDE";
+const ARTIFACTS_ENV: &str = "BUILD_SERVICE_ARTIFACTS";
+const ARTIFACTS_EXCLUDE_ENV: &str = "BUILD_SERVICE_ARTIFACTS_EXCLUDE";
+const CWD_ENV: &str = "BUILD_SERVICE_CWD";
+const TIMEOUT_ENV: &str = "BUILD_SERVICE_TIMEOUT";
 const STDOUT_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDOUT_MAX_LINES";
 const STDERR_MAX_LINES_ENV: &str = "BUILD_SERVICE_STDERR_MAX_LINES";
 const WORKSPACE_REUSE_ENV: &str = "BUILD_SERVICE_WORKSPACE_REUSE";
@@ -45,6 +53,30 @@ struct Args {
     #[arg(long)]
     token: Option<String>,
 
+    #[arg(long = "source", action = ArgAction::Append)]
+    source: Vec<String>,
+
+    #[arg(long = "source-exclude", action = ArgAction::Append)]
+    source_exclude: Vec<String>,
+
+    #[arg(long = "artifact", action = ArgAction::Append)]
+    artifact: Vec<String>,
+
+    #[arg(long = "artifact-exclude", action = ArgAction::Append)]
+    artifact_exclude: Vec<String>,
+
+    #[arg(long)]
+    cwd: Option<String>,
+
+    #[arg(long = "env", action = ArgAction::Append)]
+    request_env: Vec<String>,
+
+    #[arg(long)]
+    workspace_reuse: bool,
+
+    #[arg(long)]
+    workspace_id: Option<String>,
+
     #[arg(long)]
     request_id: Option<String>,
 
@@ -55,9 +87,11 @@ struct Args {
     args: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ClientConfig {
+    #[serde(default)]
     sources: PatternConfig,
+    #[serde(default)]
     artifacts: PatternConfig,
     #[serde(default)]
     request: Option<RequestConfig>,
@@ -81,6 +115,8 @@ struct PatternConfig {
 struct RequestConfig {
     #[serde(default)]
     timeout_sec: Option<u64>,
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     env: HashMap<String, String>,
 }
@@ -720,22 +756,21 @@ fn main() -> ExitCode {
         }
     };
 
-    let repo_root = match find_repo_root(&run_dir) {
-        Ok(root) => root,
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let config_path = repo_root.join(CLIENT_CONFIG_DIR).join(CLIENT_CONFIG_FILE);
-    let client_config = match load_client_config(&config_path) {
+    let config_path = find_client_config_path(&run_dir);
+    let repo_root = config_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| run_dir.clone());
+    let client_config = match load_client_config(config_path.as_deref()) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("{err}");
             return ExitCode::from(1);
         }
     };
+    let config_loaded = config_path.is_some();
 
     let connection = client_config.connection.as_ref();
     if !resolve_connection_enabled(connection) {
@@ -743,20 +778,43 @@ fn main() -> ExitCode {
         return ExitCode::from(CONNECTION_FALLBACK_EXIT_CODE);
     }
 
-    if let Err(err) = validate_patterns(&client_config.sources, "sources") {
+    let source_patterns = match resolve_patterns(
+        &client_config.sources,
+        SOURCES_ENV,
+        &args.source,
+        SOURCES_EXCLUDE_ENV,
+        &args.source_exclude,
+    ) {
+        Ok(patterns) => patterns,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    let artifact_patterns = match resolve_patterns(
+        &client_config.artifacts,
+        ARTIFACTS_ENV,
+        &args.artifact,
+        ARTIFACTS_EXCLUDE_ENV,
+        &args.artifact_exclude,
+    ) {
+        Ok(patterns) => patterns,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Err(err) = validate_patterns(&source_patterns, "sources") {
         eprintln!("{err}");
         return ExitCode::from(1);
     }
-    if let Err(err) = validate_patterns(&client_config.artifacts, "artifacts") {
+    if let Err(err) = validate_patterns(&artifact_patterns, "artifacts") {
         eprintln!("{err}");
-        return ExitCode::from(1);
-    }
-    if client_config.sources.include.is_empty() {
-        eprintln!("sources.include must not be empty");
         return ExitCode::from(1);
     }
 
-    let source_archive = match build_source_archive(&repo_root, &client_config.sources) {
+    let source_archive = match build_source_archive(&repo_root, &source_patterns) {
         Ok(archive) => archive,
         Err(err) => {
             eprintln!("failed to package sources: {err}");
@@ -764,7 +822,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let cwd = match resolve_relative_cwd(&repo_root, &run_dir) {
+    let cwd = match resolve_request_cwd(
+        args.cwd,
+        client_config.request.as_ref(),
+        &repo_root,
+        &run_dir,
+    ) {
         Ok(cwd) => cwd,
         Err(err) => {
             eprintln!("failed to resolve cwd: {err}");
@@ -773,15 +836,17 @@ fn main() -> ExitCode {
     };
 
     let artifacts = ArtifactSpec {
-        include: client_config.artifacts.include,
-        exclude: client_config.artifacts.exclude,
+        include: artifact_patterns.include,
+        exclude: artifact_patterns.exclude,
     };
 
-    let env = client_config
-        .request
-        .as_ref()
-        .map(|request| request.env.clone())
-        .filter(|env| !env.is_empty());
+    let env = match resolve_request_env(client_config.request.as_ref(), &args.request_env) {
+        Ok(env) => env,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
 
     let timeout_sec = match resolve_timeout(args.timeout, client_config.request.as_ref()) {
         Ok(timeout) => timeout,
@@ -791,7 +856,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let workspace = match resolve_workspace_config(client_config.workspace.as_ref(), &repo_root) {
+    let workspace = match resolve_workspace_config(
+        args.workspace_reuse,
+        args.workspace_id,
+        client_config.workspace.as_ref(),
+        &repo_root,
+    ) {
         Ok(workspace) => workspace,
         Err(err) => {
             eprintln!("{err}");
@@ -811,7 +881,7 @@ fn main() -> ExitCode {
         workspace,
     };
 
-    let endpoint = match resolve_endpoint(args.endpoint, connection) {
+    let endpoint = match resolve_endpoint(args.endpoint, connection, config_loaded) {
         Ok(endpoint) => endpoint,
         Err(err) => {
             eprintln!("{err}");
@@ -829,7 +899,7 @@ fn main() -> ExitCode {
 
     let build = match run_build(
         &request,
-        &source_archive,
+        source_archive.as_ref(),
         &endpoint,
         token.as_deref(),
         &output_limits,
@@ -868,32 +938,71 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn find_repo_root(start_dir: &Path) -> io::Result<PathBuf> {
+fn find_client_config_path(start_dir: &Path) -> Option<PathBuf> {
     let mut dir = start_dir.to_path_buf();
     loop {
         let candidate = dir.join(CLIENT_CONFIG_DIR).join(CLIENT_CONFIG_FILE);
         if candidate.exists() {
-            return Ok(dir);
+            return Some(candidate);
         }
         if !dir.pop() {
             break;
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!(
-            "{} not found in current directory or parents",
-            Path::new(CLIENT_CONFIG_DIR)
-                .join(CLIENT_CONFIG_FILE)
-                .display()
-        ),
-    ))
+    None
 }
 
-fn load_client_config(path: &Path) -> io::Result<ClientConfig> {
+fn load_client_config(path: Option<&Path>) -> io::Result<ClientConfig> {
+    let Some(path) = path else {
+        return Ok(ClientConfig::default());
+    };
+
     let raw = fs::read_to_string(path)?;
     toml::from_str(&raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn resolve_patterns(
+    config: &PatternConfig,
+    include_env: &str,
+    include_args: &[String],
+    exclude_env: &str,
+    exclude_args: &[String],
+) -> io::Result<PatternConfig> {
+    Ok(PatternConfig {
+        include: merge_pattern_values(&config.include, include_env, include_args)?,
+        exclude: merge_pattern_values(&config.exclude, exclude_env, exclude_args)?,
+    })
+}
+
+fn merge_pattern_values(
+    config_values: &[String],
+    env_name: &str,
+    cli_values: &[String],
+) -> io::Result<Vec<String>> {
+    let mut values = config_values.to_vec();
+    values.extend(parse_csv_env_values(env_name)?);
+    values.extend(
+        cli_values
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    );
+    Ok(values)
+}
+
+fn parse_csv_env_values(name: &str) -> io::Result<Vec<String>> {
+    let raw = match env::var(name) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    Ok(raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect())
 }
 
 fn validate_patterns(patterns: &PatternConfig, label: &str) -> io::Result<()> {
@@ -926,7 +1035,87 @@ fn resolve_relative_cwd(root: &Path, cwd: &Path) -> io::Result<Option<String>> {
     Ok(Some(rel_str))
 }
 
-fn build_source_archive(root: &Path, patterns: &PatternConfig) -> io::Result<NamedTempFile> {
+fn resolve_request_cwd(
+    explicit: Option<String>,
+    request: Option<&RequestConfig>,
+    repo_root: &Path,
+    run_dir: &Path,
+) -> io::Result<Option<String>> {
+    if let Some(value) = explicit {
+        return normalize_request_cwd(&value);
+    }
+
+    if let Ok(value) = env::var(CWD_ENV) {
+        if !value.trim().is_empty() {
+            return normalize_request_cwd(&value);
+        }
+    }
+
+    if let Some(value) = request.and_then(|request| request.cwd.as_deref()) {
+        if !value.trim().is_empty() {
+            return normalize_request_cwd(value);
+        }
+    }
+
+    resolve_relative_cwd(repo_root, run_dir)
+}
+
+fn normalize_request_cwd(value: &str) -> io::Result<Option<String>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    validate_relative_path(trimmed, "cwd")
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    Ok(Some(trimmed.to_string()))
+}
+
+fn resolve_request_env(
+    request: Option<&RequestConfig>,
+    cli_entries: &[String],
+) -> io::Result<Option<HashMap<String, String>>> {
+    let mut env_map = request
+        .map(|request| request.env.clone())
+        .unwrap_or_default();
+    for entry in cli_entries {
+        let (key, value) = parse_request_env_entry(entry)?;
+        env_map.insert(key, value);
+    }
+
+    if env_map.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(env_map))
+    }
+}
+
+fn parse_request_env_entry(entry: &str) -> io::Result<(String, String)> {
+    let (key, value) = entry.split_once('=').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid --env value {entry:?}, expected KEY=VALUE"),
+        )
+    })?;
+
+    if key.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid --env value {entry:?}, key must not be empty"),
+        ));
+    }
+
+    Ok((key.trim().to_string(), value.to_string()))
+}
+
+fn build_source_archive(
+    root: &Path,
+    patterns: &PatternConfig,
+) -> io::Result<Option<NamedTempFile>> {
+    if patterns.include.is_empty() {
+        return Ok(None);
+    }
+
     let root = fs::canonicalize(root)?;
     let mut matched_files: HashMap<PathBuf, PathBuf> = HashMap::new();
     let exclude_patterns = compile_patterns(&patterns.exclude)?;
@@ -976,7 +1165,7 @@ fn build_source_archive(root: &Path, patterns: &PatternConfig) -> io::Result<Nam
         .tempfile()?;
 
     write_zip(&temp, &matched_files)?;
-    Ok(temp)
+    Ok(Some(temp))
 }
 
 fn collect_recursive_prefix(
@@ -1149,6 +1338,7 @@ fn parse_endpoint(raw: &str) -> io::Result<Endpoint> {
 fn resolve_endpoint(
     explicit: Option<String>,
     config: Option<&ConnectionConfig>,
+    config_loaded: bool,
 ) -> io::Result<Endpoint> {
     if let Some(endpoint) = explicit {
         if !endpoint.trim().is_empty() {
@@ -1156,7 +1346,7 @@ fn resolve_endpoint(
         }
     }
 
-    if let Ok(env_endpoint) = env::var("BUILD_SERVICE_ENDPOINT") {
+    if let Ok(env_endpoint) = env::var(ENDPOINT_ENV) {
         if !env_endpoint.trim().is_empty() {
             return parse_endpoint(&env_endpoint);
         }
@@ -1170,8 +1360,15 @@ fn resolve_endpoint(
         }
     }
 
-    let default_endpoint = format!("unix://{DEFAULT_SOCKET_PATH}");
-    parse_endpoint(&default_endpoint)
+    if config_loaded {
+        let default_endpoint = format!("unix://{DEFAULT_SOCKET_PATH}");
+        return parse_endpoint(&default_endpoint);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "endpoint must be provided via --endpoint, BUILD_SERVICE_ENDPOINT, or client config",
+    ))
 }
 
 fn resolve_timeout(
@@ -1188,19 +1385,19 @@ fn resolve_timeout(
         return Ok(Some(timeout));
     }
 
-    if let Ok(env_timeout) = env::var("BUILD_SERVICE_TIMEOUT") {
+    if let Ok(env_timeout) = env::var(TIMEOUT_ENV) {
         let trimmed = env_timeout.trim();
         if !trimmed.is_empty() {
             let parsed: u64 = trimmed.parse().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("BUILD_SERVICE_TIMEOUT must be a positive integer, got {trimmed}"),
+                    format!("{TIMEOUT_ENV} must be a positive integer, got {trimmed}"),
                 )
             })?;
             if parsed == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "BUILD_SERVICE_TIMEOUT must be greater than zero",
+                    format!("{TIMEOUT_ENV} must be greater than zero"),
                 ));
             }
             return Ok(Some(parsed));
@@ -1229,7 +1426,7 @@ fn resolve_token(explicit: Option<String>, config: Option<&ConnectionConfig>) ->
         }
     }
 
-    if let Ok(env_token) = env::var("BUILD_SERVICE_TOKEN") {
+    if let Ok(env_token) = env::var(TOKEN_ENV) {
         if !env_token.trim().is_empty() {
             return Some(env_token);
         }
@@ -1370,19 +1567,41 @@ fn expand_workspace_macros(id: &str, repo_root: &Path) -> io::Result<String> {
 }
 
 fn resolve_workspace_config(
+    cli_reuse: bool,
+    cli_id: Option<String>,
     config: Option<&WorkspaceConfig>,
     repo_root: &Path,
 ) -> io::Result<Option<WorkspaceRequest>> {
-    let reuse = if let Some(value) = parse_env_bool(WORKSPACE_REUSE_ENV)? {
+    let reuse = if cli_reuse {
+        true
+    } else if let Some(value) = parse_env_bool(WORKSPACE_REUSE_ENV)? {
         value
     } else {
         config.map(|cfg| cfg.reuse).unwrap_or(false)
     };
 
     if !reuse {
+        if cli_id
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--workspace-id requires --workspace-reuse",
+            ));
+        }
         return Ok(None);
     }
 
+    let cli_id = cli_id.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
     let env_id = env::var(WORKSPACE_ID_ENV).ok().and_then(|value| {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -1392,7 +1611,7 @@ fn resolve_workspace_config(
         }
     });
     let config_id = config.and_then(|cfg| cfg.id.as_ref().map(|id| id.trim().to_string()));
-    let mut id = env_id.or(config_id);
+    let mut id = cli_id.or(env_id).or(config_id);
     if let Some(ref raw_id) = id {
         id = Some(expand_workspace_macros(raw_id, repo_root)?);
     }
@@ -1470,7 +1689,7 @@ struct BuildResult {
 
 fn run_build(
     request: &Request,
-    source_archive: &NamedTempFile,
+    source_archive: Option<&NamedTempFile>,
     endpoint: &Endpoint,
     token: Option<&str>,
     output_limits: &OutputLimits,
@@ -1496,14 +1715,15 @@ fn run_build(
 
     let metadata = serde_json::to_string(request)
         .map_err(|err| BuildError::Other(format!("failed to serialize request: {err}")))?;
-    let source_part = Part::file(source_archive.path())
-        .map_err(|err| BuildError::Other(format!("failed to read source archive: {err}")))?;
-    let form = Form::new()
-        .part(
-            "metadata",
-            Part::text(metadata).mime_str("application/json").unwrap(),
-        )
-        .part("source", source_part.mime_str("application/zip").unwrap());
+    let mut form = Form::new().part(
+        "metadata",
+        Part::text(metadata).mime_str("application/json").unwrap(),
+    );
+    if let Some(source_archive) = source_archive {
+        let source_part = Part::file(source_archive.path())
+            .map_err(|err| BuildError::Other(format!("failed to read source archive: {err}")))?;
+        form = form.part("source", source_part.mime_str("application/zip").unwrap());
+    }
 
     let mut builder = client.post(url).multipart(form);
     if send_auth {
@@ -1945,10 +2165,169 @@ mod tests {
             exclude: Vec::new(),
         };
 
-        let archive = build_source_archive(root, &patterns).expect("archive");
+        let archive = build_source_archive(root, &patterns)
+            .expect("archive")
+            .expect("source archive");
         let file = fs::File::open(archive.path()).expect("open zip");
         let archive = ZipArchive::new(file).expect("read zip");
         assert!(!archive.is_empty(), "archive should have entries");
+    }
+
+    #[test]
+    fn build_source_archive_returns_none_when_sources_are_empty() {
+        let temp = tempdir().expect("tempdir");
+        let archive =
+            build_source_archive(temp.path(), &PatternConfig::default()).expect("archive");
+        assert!(archive.is_none());
+    }
+
+    #[test]
+    fn resolve_patterns_appends_config_env_and_cli_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = env::var(SOURCES_ENV).ok();
+        let prev_exclude = env::var(SOURCES_EXCLUDE_ENV).ok();
+        env::set_var(SOURCES_ENV, "env-a, env-b");
+        env::set_var(SOURCES_EXCLUDE_ENV, "env-ignore");
+
+        let config = PatternConfig {
+            include: vec!["config-a".to_string()],
+            exclude: vec!["config-ignore".to_string()],
+        };
+        let merged = resolve_patterns(
+            &config,
+            SOURCES_ENV,
+            &["cli-a".to_string()],
+            SOURCES_EXCLUDE_ENV,
+            &["cli-ignore".to_string()],
+        )
+        .expect("patterns");
+
+        assert_eq!(merged.include, vec!["config-a", "env-a", "env-b", "cli-a"]);
+        assert_eq!(
+            merged.exclude,
+            vec!["config-ignore", "env-ignore", "cli-ignore"]
+        );
+
+        if let Some(prev) = prev {
+            env::set_var(SOURCES_ENV, prev);
+        } else {
+            env::remove_var(SOURCES_ENV);
+        }
+        if let Some(prev) = prev_exclude {
+            env::set_var(SOURCES_EXCLUDE_ENV, prev);
+        } else {
+            env::remove_var(SOURCES_EXCLUDE_ENV);
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_requires_explicit_source_without_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = env::var(ENDPOINT_ENV).ok();
+        env::remove_var(ENDPOINT_ENV);
+
+        let err = resolve_endpoint(None, None, false).unwrap_err();
+        assert!(
+            err.to_string().contains("BUILD_SERVICE_ENDPOINT"),
+            "unexpected error: {err}"
+        );
+
+        if let Some(prev) = prev {
+            env::set_var(ENDPOINT_ENV, prev);
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_uses_default_socket_when_config_is_present() {
+        let endpoint = resolve_endpoint(None, None, true).expect("endpoint");
+        match endpoint {
+            Endpoint::Unix { path } => assert_eq!(path, PathBuf::from(DEFAULT_SOCKET_PATH)),
+            Endpoint::Http { .. } => panic!("expected unix endpoint"),
+        }
+    }
+
+    #[test]
+    fn resolve_request_env_merges_config_and_cli_values() {
+        let request = RequestConfig {
+            timeout_sec: None,
+            cwd: None,
+            env: HashMap::from([("CC".to_string(), "clang".to_string())]),
+        };
+        let resolved =
+            resolve_request_env(Some(&request), &["VERBOSE=1".to_string()]).expect("env");
+        let env_map = resolved.expect("request env");
+        assert_eq!(env_map.get("CC").map(String::as_str), Some("clang"));
+        assert_eq!(env_map.get("VERBOSE").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn parse_request_env_entry_preserves_equals_in_values() {
+        let (key, value) = parse_request_env_entry("TOKEN=abc=def").expect("env entry");
+        assert_eq!(key, "TOKEN");
+        assert_eq!(value, "abc=def");
+    }
+
+    #[test]
+    fn resolve_request_cwd_prefers_explicit_then_env_then_config_then_relative() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = env::var(CWD_ENV).ok();
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path().join("repo");
+        let nested = repo_root.join("nested");
+        fs::create_dir_all(&nested).expect("nested dir");
+
+        let request = RequestConfig {
+            timeout_sec: None,
+            cwd: Some("from-config".to_string()),
+            env: HashMap::new(),
+        };
+
+        env::remove_var(CWD_ENV);
+        assert_eq!(
+            resolve_request_cwd(
+                Some("from-cli".to_string()),
+                Some(&request),
+                &repo_root,
+                &nested
+            )
+            .expect("cwd"),
+            Some("from-cli".to_string())
+        );
+
+        env::set_var(CWD_ENV, "from-env");
+        assert_eq!(
+            resolve_request_cwd(None, Some(&request), &repo_root, &nested).expect("cwd"),
+            Some("from-env".to_string())
+        );
+
+        env::remove_var(CWD_ENV);
+        assert_eq!(
+            resolve_request_cwd(None, Some(&request), &repo_root, &nested).expect("cwd"),
+            Some("from-config".to_string())
+        );
+
+        assert_eq!(
+            resolve_request_cwd(None, None, &repo_root, &nested).expect("cwd"),
+            Some("nested".to_string())
+        );
+
+        if let Some(prev) = prev {
+            env::set_var(CWD_ENV, prev);
+        } else {
+            env::remove_var(CWD_ENV);
+        }
+    }
+
+    #[test]
+    fn resolve_workspace_config_rejects_cli_id_without_reuse() {
+        let temp = tempdir().expect("tempdir");
+        let err = resolve_workspace_config(false, Some("ws-id".to_string()), None, temp.path())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--workspace-id requires --workspace-reuse"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2227,6 +2606,7 @@ mod tests {
         env::remove_var("BUILD_SERVICE_TIMEOUT");
         let request = RequestConfig {
             timeout_sec: Some(12),
+            cwd: None,
             env: HashMap::new(),
         };
         assert_eq!(resolve_timeout(None, Some(&request)).unwrap(), Some(12));

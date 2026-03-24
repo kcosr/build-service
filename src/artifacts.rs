@@ -1,7 +1,9 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use glob::glob;
@@ -16,6 +18,7 @@ use crate::validation::validate_relative_pattern;
 
 const DEFAULT_GC_INTERVAL_SECS: u64 = 3600;
 const INTERNAL_EXCLUDE_PATTERN: &str = ".build-service/**";
+const TRANSFER_LIMIT_SENTINEL: &str = "artifacts.max_transfer_bytes exceeded";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactError {
@@ -47,6 +50,12 @@ pub enum ArtifactError {
 
     #[error("invalid artifact pattern: {message}")]
     InvalidPattern { message: String },
+
+    #[error("artifact archive exceeds artifacts.max_transfer_bytes ({max_bytes} bytes)")]
+    TransferTooLarge { max_bytes: u64 },
+
+    #[error("artifact contents exceed artifacts.max_uncompressed_bytes ({max_bytes} bytes)")]
+    UncompressedTooLarge { max_bytes: u64 },
 }
 
 pub fn collect_artifacts_zip(
@@ -142,18 +151,39 @@ pub fn collect_artifacts_zip(
         source,
     })?;
 
-    let dest = dest_dir.join("artifacts.zip");
-    write_artifacts_zip(&dest, &matched_files)?;
+    let total_uncompressed_bytes = sum_matched_file_sizes(&matched_files)?;
+    if let Some(max_uncompressed_bytes) = config.max_uncompressed_bytes {
+        if total_uncompressed_bytes > max_uncompressed_bytes {
+            return Err(ArtifactError::UncompressedTooLarge {
+                max_bytes: max_uncompressed_bytes,
+            });
+        }
+    }
 
-    let size = fs::metadata(&dest).map_err(|source| ArtifactError::Io {
-        context: "stat artifacts.zip",
-        source,
-    })?;
+    let dest = dest_dir.join("artifacts.zip");
+    let size = write_artifacts_zip(
+        &dest,
+        &matched_files,
+        config.max_transfer_bytes,
+        config.max_uncompressed_bytes,
+    )?;
 
     Ok(Some(ArtifactArchive {
         path: format!("/v1/builds/{build_id}/artifacts.zip"),
-        size: size.len(),
+        size,
     }))
+}
+
+fn sum_matched_file_sizes(matched_files: &HashMap<PathBuf, PathBuf>) -> Result<u64, ArtifactError> {
+    let mut total = 0u64;
+    for source in matched_files.keys() {
+        let metadata = fs::metadata(source).map_err(|source| ArtifactError::Io {
+            context: "stat artifact for size",
+            source,
+        })?;
+        total = total.saturating_add(metadata.len());
+    }
+    Ok(total)
 }
 
 fn collect_recursive_prefix(
@@ -265,47 +295,167 @@ fn is_excluded(path: &Path, patterns: &[glob::Pattern]) -> bool {
 fn write_artifacts_zip(
     dest: &Path,
     matched_files: &HashMap<PathBuf, PathBuf>,
-) -> Result<(), ArtifactError> {
+    max_transfer_bytes: Option<u64>,
+    max_uncompressed_bytes: Option<u64>,
+) -> Result<u64, ArtifactError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let file = File::create(dest).map_err(|source| ArtifactError::Io {
-        context: "create artifacts.zip",
-        source,
-    })?;
-    let mut zip = ZipWriter::new(file);
-
-    let mut items: Vec<_> = matched_files.iter().collect();
-    items.sort_by(|a, b| a.1.cmp(b.1));
-
-    for (source, rel) in items {
-        let name = rel.to_string_lossy().replace('\\', "/");
-
-        // Get file permissions and preserve them in the zip
-        let metadata = fs::metadata(source).map_err(|source| ArtifactError::Io {
-            context: "stat artifact for permissions",
+    let result = (|| {
+        let file = File::create(dest).map_err(|source| ArtifactError::Io {
+            context: "create artifacts.zip",
             source,
         })?;
-        let mode = metadata.permissions().mode();
+        let transfer_limit = Rc::new(Cell::new(max_transfer_bytes));
+        let mut zip = ZipWriter::new(LimitedWriter::new(file, Rc::clone(&transfer_limit)));
 
-        let options = FileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .unix_permissions(mode);
+        let mut items: Vec<_> = matched_files.iter().collect();
+        items.sort_by(|a, b| a.1.cmp(b.1));
 
-        zip.start_file(name, options)
-            .map_err(|source| ArtifactError::Zip { source })?;
-        let mut input = File::open(source).map_err(|source| ArtifactError::Io {
-            context: "open artifact",
-            source,
-        })?;
-        io::copy(&mut input, &mut zip).map_err(|source| ArtifactError::Io {
-            context: "write artifact",
-            source,
-        })?;
+        let mut uncompressed_bytes = 0u64;
+        let mut buffer = [0u8; 8192];
+
+        for (source, rel) in items {
+            let name = rel.to_string_lossy().replace('\\', "/");
+
+            // Preserve source permissions inside the archive.
+            let metadata = fs::metadata(source).map_err(|source| ArtifactError::Io {
+                context: "stat artifact for permissions",
+                source,
+            })?;
+            let mode = metadata.permissions().mode();
+
+            let options = FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(mode);
+
+            if let Err(source) = zip.start_file(name, options) {
+                if is_transfer_limit_zip_error(&source) {
+                    finish_after_transfer_limit(&mut zip, &transfer_limit);
+                    return Err(ArtifactError::TransferTooLarge {
+                        max_bytes: max_transfer_bytes.expect("transfer limit must be set"),
+                    });
+                }
+                return Err(ArtifactError::Zip { source });
+            }
+
+            let mut input = File::open(source).map_err(|source| ArtifactError::Io {
+                context: "open artifact",
+                source,
+            })?;
+
+            loop {
+                let bytes = input
+                    .read(&mut buffer)
+                    .map_err(|source| ArtifactError::Io {
+                        context: "read artifact",
+                        source,
+                    })?;
+                if bytes == 0 {
+                    break;
+                }
+
+                uncompressed_bytes = uncompressed_bytes.saturating_add(bytes as u64);
+                if let Some(limit) = max_uncompressed_bytes {
+                    if uncompressed_bytes > limit {
+                        return Err(ArtifactError::UncompressedTooLarge { max_bytes: limit });
+                    }
+                }
+
+                if let Err(source) = zip.write_all(&buffer[..bytes]) {
+                    if is_transfer_limit_error(&source) {
+                        finish_after_transfer_limit(&mut zip, &transfer_limit);
+                        return Err(ArtifactError::TransferTooLarge {
+                            max_bytes: max_transfer_bytes.expect("transfer limit must be set"),
+                        });
+                    }
+                    return Err(ArtifactError::Io {
+                        context: "write artifact",
+                        source,
+                    });
+                }
+            }
+        }
+
+        let writer = match zip.finish() {
+            Ok(writer) => writer,
+            Err(source) => {
+                if is_transfer_limit_zip_error(&source) {
+                    finish_after_transfer_limit(&mut zip, &transfer_limit);
+                    return Err(ArtifactError::TransferTooLarge {
+                        max_bytes: max_transfer_bytes.expect("transfer limit must be set"),
+                    });
+                }
+                return Err(ArtifactError::Zip { source });
+            }
+        };
+        Ok(writer.bytes_written())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(dest);
     }
 
-    zip.finish()
-        .map_err(|source| ArtifactError::Zip { source })?;
-    Ok(())
+    result
+}
+
+fn finish_after_transfer_limit<W: io::Write + io::Seek>(
+    zip: &mut ZipWriter<LimitedWriter<W>>,
+    transfer_limit: &Rc<Cell<Option<u64>>>,
+) {
+    transfer_limit.set(None);
+    let _ = zip.finish();
+}
+
+fn is_transfer_limit_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Other && err.to_string() == TRANSFER_LIMIT_SENTINEL
+}
+
+fn is_transfer_limit_zip_error(err: &zip::result::ZipError) -> bool {
+    matches!(err, zip::result::ZipError::Io(source) if is_transfer_limit_error(source))
+}
+
+struct LimitedWriter<W> {
+    inner: W,
+    bytes_written: u64,
+    max_bytes: Rc<Cell<Option<u64>>>,
+}
+
+impl<W> LimitedWriter<W> {
+    fn new(inner: W, max_bytes: Rc<Cell<Option<u64>>>) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+            max_bytes,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W: io::Write> io::Write for LimitedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(max_bytes) = self.max_bytes.get() {
+            if self.bytes_written.saturating_add(buf.len() as u64) > max_bytes {
+                return Err(io::Error::other(TRANSFER_LIMIT_SENTINEL));
+            }
+        }
+
+        let written = self.inner.write(buf)?;
+        self.bytes_written = self.bytes_written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: io::Seek> io::Seek for LimitedWriter<W> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
 }
 
 pub fn spawn_gc_task(config: crate::config::Config) {
@@ -458,6 +608,8 @@ mod tests {
             ttl_sec: None,
             gc_interval_sec: None,
             max_bytes: None,
+            max_transfer_bytes: None,
+            max_uncompressed_bytes: None,
         };
         let spec = ArtifactSpec {
             include: vec!["out/*.bin".to_string()],
@@ -477,6 +629,8 @@ mod tests {
             ttl_sec: None,
             gc_interval_sec: None,
             max_bytes: None,
+            max_transfer_bytes: None,
+            max_uncompressed_bytes: None,
         };
         let output = root.path().join("out");
         std::fs::create_dir_all(&output).expect("mkdir");
@@ -510,6 +664,8 @@ mod tests {
             ttl_sec: None,
             gc_interval_sec: None,
             max_bytes: None,
+            max_transfer_bytes: None,
+            max_uncompressed_bytes: None,
         };
         let spec = ArtifactSpec {
             include: vec!["link.txt".to_string()],
@@ -521,5 +677,73 @@ mod tests {
             ArtifactError::OutsideRoot { .. } => {}
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn collect_artifacts_enforces_max_uncompressed_bytes() {
+        let root = tempdir().expect("tempdir");
+        let output = root.path().join("out");
+        std::fs::create_dir_all(&output).expect("mkdir");
+        std::fs::write(output.join("app.txt"), "artifact payload").expect("write");
+        let config = ArtifactsConfig {
+            storage_root: root.path().join("artifacts"),
+            ttl_sec: None,
+            gc_interval_sec: None,
+            max_bytes: None,
+            max_transfer_bytes: None,
+            max_uncompressed_bytes: Some(8),
+        };
+        let spec = ArtifactSpec {
+            include: vec!["out/**".to_string()],
+            exclude: vec![],
+        };
+
+        let err = collect_artifacts_zip(root.path(), &spec, &config, "bld").unwrap_err();
+        assert!(matches!(
+            err,
+            ArtifactError::UncompressedTooLarge { max_bytes: 8 }
+        ));
+        assert!(
+            !config
+                .storage_root
+                .join("bld")
+                .join("artifacts.zip")
+                .exists(),
+            "oversized archives should be removed"
+        );
+    }
+
+    #[test]
+    fn collect_artifacts_enforces_max_transfer_bytes() {
+        let root = tempdir().expect("tempdir");
+        let output = root.path().join("out");
+        std::fs::create_dir_all(&output).expect("mkdir");
+        std::fs::write(output.join("app.txt"), "artifact payload").expect("write");
+        let config = ArtifactsConfig {
+            storage_root: root.path().join("artifacts"),
+            ttl_sec: None,
+            gc_interval_sec: None,
+            max_bytes: None,
+            max_transfer_bytes: Some(1),
+            max_uncompressed_bytes: None,
+        };
+        let spec = ArtifactSpec {
+            include: vec!["out/**".to_string()],
+            exclude: vec![],
+        };
+
+        let err = collect_artifacts_zip(root.path(), &spec, &config, "bld").unwrap_err();
+        assert!(matches!(
+            err,
+            ArtifactError::TransferTooLarge { max_bytes: 1 }
+        ));
+        assert!(
+            !config
+                .storage_root
+                .join("bld")
+                .join("artifacts.zip")
+                .exists(),
+            "oversized archives should be removed"
+        );
     }
 }

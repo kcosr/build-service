@@ -4,6 +4,7 @@ cmd=$(basename -- "$0")
 config_dir=".build-service"
 config_file="config.toml"
 enabled_env=${BUILD_SERVICE_ENABLED-}
+endpoint_env=${BUILD_SERVICE_ENDPOINT-}
 disabled="false"
 if [ -n "${BUILD_SERVICE_ENABLED+x}" ]; then
     lower=$(printf '%s' "$enabled_env" | tr '[:upper:]' '[:lower:]')
@@ -32,6 +33,16 @@ while :; do
     fi
     dir=$(dirname -- "$dir")
 done
+
+if [ "$disabled" != "true" ] && [ -n "$endpoint_env" ]; then
+    build-cli "$cmd" "$@"
+    exit_code=$?
+    # Exit code 222 means connection failed, or build-service was explicitly disabled
+    # Fall through to execute local build tool
+    if [ $exit_code -ne 222 ]; then
+        exit $exit_code
+    fi
+fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 old_ifs=$IFS

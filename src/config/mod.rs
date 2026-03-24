@@ -9,8 +9,8 @@ use crate::logging::LoggingSettings;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/build-service/config.toml";
 const DEFAULT_SCHEMA_VERSION: &str = "3";
-const DEFAULT_MAX_UPLOAD_BYTES: u64 = 134_217_728;
-const DEFAULT_MAX_EXTRACTED_BYTES: u64 = DEFAULT_MAX_UPLOAD_BYTES * 10;
+const DEFAULT_SOURCE_TRANSFER_BYTES: u64 = 134_217_728;
+const DEFAULT_SOURCE_UNCOMPRESSED_BYTES: u64 = DEFAULT_SOURCE_TRANSFER_BYTES * 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -49,6 +49,9 @@ pub struct Config {
 
     #[serde(default)]
     pub build: BuildConfig,
+
+    #[serde(default)]
+    pub sources: SourcesConfig,
 
     #[serde(default)]
     pub artifacts: ArtifactsConfig,
@@ -110,10 +113,12 @@ impl Config {
         }
 
         if self.service.socket.enabled {
-            if self.service.socket.group.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "service.socket.group must not be empty".to_string(),
-                ));
+            if let Some(group) = &self.service.socket.group {
+                if group.trim().is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "service.socket.group must not be empty when set".to_string(),
+                    ));
+                }
             }
 
             if !self.service.socket.path.is_absolute() {
@@ -154,6 +159,21 @@ impl Config {
             ));
         }
 
+        if let Some(path) = &self.build.default_workspace_path {
+            if !path.is_absolute() {
+                return Err(ConfigError::Invalid(
+                    "build.default_workspace_path must be an absolute path".to_string(),
+                ));
+            }
+
+            if !path.is_dir() {
+                return Err(ConfigError::Invalid(format!(
+                    "build.default_workspace_path does not exist or is not a directory: {}",
+                    path.display()
+                )));
+            }
+        }
+
         if self.build.workspace.default_ttl_sec == 0 && !self.build.workspace.allow_permanent {
             return Err(ConfigError::Invalid(
                 "build.workspace.default_ttl_sec must be > 0 unless allow_permanent is true"
@@ -169,15 +189,15 @@ impl Config {
             }
         }
 
-        if self.build.max_upload_bytes == 0 {
+        if self.sources.max_transfer_bytes == 0 {
             return Err(ConfigError::Invalid(
-                "build.max_upload_bytes must be greater than zero".to_string(),
+                "sources.max_transfer_bytes must be greater than zero".to_string(),
             ));
         }
 
-        if self.build.max_extracted_bytes == 0 {
+        if self.sources.max_uncompressed_bytes == 0 {
             return Err(ConfigError::Invalid(
-                "build.max_extracted_bytes must be greater than zero".to_string(),
+                "sources.max_uncompressed_bytes must be greater than zero".to_string(),
             ));
         }
 
@@ -272,8 +292,8 @@ pub struct SocketConfig {
     #[serde(default = "default_socket_path")]
     pub path: PathBuf,
 
-    #[serde(default = "default_socket_group")]
-    pub group: String,
+    #[serde(default)]
+    pub group: Option<String>,
 
     #[serde(default = "default_socket_mode")]
     pub mode: String,
@@ -290,7 +310,7 @@ impl Default for SocketConfig {
         Self {
             enabled: default_socket_enabled(),
             path: default_socket_path(),
-            group: default_socket_group(),
+            group: None,
             mode: default_socket_mode(),
         }
     }
@@ -302,10 +322,6 @@ fn default_socket_enabled() -> bool {
 
 fn default_socket_path() -> PathBuf {
     PathBuf::from("/run/build-service.sock")
-}
-
-fn default_socket_group() -> String {
-    "users".to_string()
 }
 
 fn default_socket_mode() -> String {
@@ -393,6 +409,9 @@ pub struct BuildConfig {
     pub workspace_root: PathBuf,
 
     #[serde(default)]
+    pub default_workspace_path: Option<PathBuf>,
+
+    #[serde(default)]
     pub workspace: WorkspaceConfig,
 
     #[serde(default)]
@@ -400,12 +419,6 @@ pub struct BuildConfig {
 
     #[serde(default)]
     pub run_as_group: Option<String>,
-
-    #[serde(default = "default_max_upload_bytes")]
-    pub max_upload_bytes: u64,
-
-    #[serde(default = "default_max_extracted_bytes")]
-    pub max_extracted_bytes: u64,
 
     #[serde(default)]
     pub commands: HashMap<String, PathBuf>,
@@ -421,11 +434,10 @@ impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             workspace_root: default_workspace_root(),
+            default_workspace_path: None,
             workspace: WorkspaceConfig::default(),
             run_as_user: None,
             run_as_group: None,
-            max_upload_bytes: default_max_upload_bytes(),
-            max_extracted_bytes: default_max_extracted_bytes(),
             commands: HashMap::new(),
             timeouts: TimeoutConfig::default(),
             environment: EnvironmentConfig::default(),
@@ -435,14 +447,6 @@ impl Default for BuildConfig {
 
 fn default_workspace_root() -> PathBuf {
     PathBuf::from("/var/lib/build-service/workspaces")
-}
-
-fn default_max_upload_bytes() -> u64 {
-    DEFAULT_MAX_UPLOAD_BYTES
-}
-
-fn default_max_extracted_bytes() -> u64 {
-    DEFAULT_MAX_EXTRACTED_BYTES
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +541,12 @@ pub struct ArtifactsConfig {
 
     #[serde(default)]
     pub max_bytes: Option<u64>,
+
+    #[serde(default)]
+    pub max_transfer_bytes: Option<u64>,
+
+    #[serde(default)]
+    pub max_uncompressed_bytes: Option<u64>,
 }
 
 impl Default for ArtifactsConfig {
@@ -546,6 +556,8 @@ impl Default for ArtifactsConfig {
             ttl_sec: None,
             gc_interval_sec: None,
             max_bytes: None,
+            max_transfer_bytes: None,
+            max_uncompressed_bytes: None,
         }
     }
 }
@@ -588,6 +600,22 @@ impl ArtifactsConfig {
             }
         }
 
+        if let Some(max_transfer_bytes) = self.max_transfer_bytes {
+            if max_transfer_bytes == 0 {
+                return Err(ConfigError::Invalid(
+                    "artifacts.max_transfer_bytes must be greater than zero".to_string(),
+                ));
+            }
+        }
+
+        if let Some(max_uncompressed_bytes) = self.max_uncompressed_bytes {
+            if max_uncompressed_bytes == 0 {
+                return Err(ConfigError::Invalid(
+                    "artifacts.max_uncompressed_bytes must be greater than zero".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -608,6 +636,32 @@ pub struct LoggingConfig {
 
     #[serde(default = "default_logging_console")]
     pub console: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourcesConfig {
+    #[serde(default = "default_source_transfer_bytes")]
+    pub max_transfer_bytes: u64,
+
+    #[serde(default = "default_source_uncompressed_bytes")]
+    pub max_uncompressed_bytes: u64,
+}
+
+impl Default for SourcesConfig {
+    fn default() -> Self {
+        Self {
+            max_transfer_bytes: default_source_transfer_bytes(),
+            max_uncompressed_bytes: default_source_uncompressed_bytes(),
+        }
+    }
+}
+
+fn default_source_transfer_bytes() -> u64 {
+    DEFAULT_SOURCE_TRANSFER_BYTES
+}
+
+fn default_source_uncompressed_bytes() -> u64 {
+    DEFAULT_SOURCE_UNCOMPRESSED_BYTES
 }
 
 impl Default for LoggingConfig {
@@ -683,6 +737,7 @@ mod tests {
             schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
             service: ServiceConfig::default(),
             build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
             artifacts: ArtifactsConfig::default(),
             logging: LoggingConfig::default(),
         };
@@ -692,5 +747,53 @@ mod tests {
 
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("service.socket.enabled"));
+    }
+
+    #[test]
+    fn validate_requires_existing_default_workspace_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+
+        config.build.commands.insert(
+            "make".to_string(),
+            std::env::current_exe().expect("current exe"),
+        );
+        config.artifacts.storage_root = temp.path().join("artifacts");
+        config.build.default_workspace_path = Some(temp.path().join("missing"));
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("build.default_workspace_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_socket_group_to_be_unset() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+
+        config.service.socket.group = None;
+        config.build.commands.insert(
+            "make".to_string(),
+            std::env::current_exe().expect("current exe"),
+        );
+        config.artifacts.storage_root = temp.path().join("artifacts");
+
+        config.validate().expect("config should validate");
     }
 }
