@@ -51,73 +51,6 @@ flowchart LR
 - The client streams stdout/stderr from NDJSON; on success the server emits `artifacts.zip` info only when artifacts were requested and collected.
 - `build-cli` downloads and extracts `artifacts.zip` back into the local working tree only when the exit event includes artifacts.
 
-## Non-Build Example
-
-This service is not limited to build tools. If a command is whitelisted in `build.commands`, a remote client can upload input files and ask your local machine to run that command inside the configured default workspace.
-
-One concrete example is previewing an HTML file with a local [`glimpseui`](https://github.com/hazat/glimpse) install while driving it from a remote shell on `srv`.
-
-1. On your local machine, create a config that keeps everything under `/tmp/build-service` and whitelists `glimpseui`.
-
-```toml
-schema_version = "3"
-
-[service.socket]
-enabled = true
-path = "/tmp/build-service/build-service.sock"
-mode = "0660"
-
-[service.http]
-enabled = false
-
-[build]
-workspace_root = "/tmp/build-service/workspaces"
-default_workspace_path = "/tmp/build-service/default"
-
-[build.commands]
-glimpseui = "/usr/local/bin/glimpseui"
-
-[sources]
-max_transfer_bytes = 134217728
-max_uncompressed_bytes = 1342177280
-
-[artifacts]
-storage_root = "/tmp/build-service/artifacts"
-```
-
-2. On your local machine, create the directories and start `build-service`.
-
-```bash
-mkdir -p /tmp/build-service/default
-mkdir -p /tmp/build-service/workspaces
-mkdir -p /tmp/build-service/artifacts
-build-service --config /path/to/build-service.toml
-```
-
-3. On your local machine, create a reverse Unix-socket tunnel so `srv` can reach your local daemon.
-
-```bash
-ssh -N -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
-  -R /tmp/build-service.sock:/tmp/build-service/build-service.sock \
-  srv
-```
-
-4. On `srv`, run `build-cli` against the forwarded socket and upload the HTML file you want to open locally.
-
-```bash
-build-cli \
-  --endpoint unix:///tmp/build-service.sock \
-  --source demo.html \
-  glimpseui demo.html
-```
-
-What happens:
-- `build-cli` on `srv` uploads `demo.html`
-- your local daemon extracts it into `/tmp/build-service/default`
-- your local machine runs the whitelisted command `glimpseui demo.html`
-
-This same pattern works for other whitelisted local commands. The important constraint is that the daemon only executes commands listed in `build.commands`; the remote client cannot invoke arbitrary binaries.
-
 ## Configuration
 
 Sample config: `config/config.toml`
@@ -345,6 +278,73 @@ The wrapper runs `build-cli` with the command name it was invoked as (for exampl
 ## Logging
 
 Logs are written using `tracing` in a plain-text format. Configure log directory/rotation in `[logging]`.
+
+## Non-Build Example
+
+This service is not limited to build tools. If a command is whitelisted in `build.commands`, a remote client can upload input files and ask your local machine to run that command inside the configured default workspace.
+
+One concrete example is previewing an HTML file with a local [`glimpseui`](https://github.com/hazat/glimpse) install while driving it from a remote shell on `srv`.
+
+1. On your local machine, create a config that keeps everything under `/tmp/build-service` and whitelists `glimpseui`.
+
+```toml
+schema_version = "3"
+
+[service.socket]
+enabled = true
+path = "/tmp/build-service/build-service.sock"
+mode = "0660"
+
+[service.http]
+enabled = false
+
+[build]
+workspace_root = "/tmp/build-service/workspaces"
+default_workspace_path = "/tmp/build-service/default"
+
+[build.commands]
+glimpseui = "/usr/local/bin/glimpseui"
+
+[sources]
+max_transfer_bytes = 134217728
+max_uncompressed_bytes = 1342177280
+
+[artifacts]
+storage_root = "/tmp/build-service/artifacts"
+```
+
+2. On your local machine, create the directories and start `build-service`.
+
+```bash
+mkdir -p /tmp/build-service/default
+mkdir -p /tmp/build-service/workspaces
+mkdir -p /tmp/build-service/artifacts
+build-service --config /path/to/build-service.toml
+```
+
+3. On your local machine, create a reverse Unix-socket tunnel so `srv` can reach your local daemon.
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
+  -R /tmp/build-service.sock:/tmp/build-service/build-service.sock \
+  srv
+```
+
+4. On `srv`, run `build-cli` against the forwarded socket and upload the HTML file you want to open locally.
+
+```bash
+build-cli \
+  --endpoint unix:///tmp/build-service.sock \
+  --source demo.html \
+  glimpseui demo.html
+```
+
+What happens:
+- `build-cli` on `srv` uploads `demo.html`
+- your local daemon extracts it into `/tmp/build-service/default`
+- your local machine runs the whitelisted command `glimpseui demo.html`
+
+This same pattern works for other whitelisted local commands. The important constraint is that the daemon only executes commands listed in `build.commands`; the remote client cannot invoke arbitrary binaries.
 
 ## Notes
 
