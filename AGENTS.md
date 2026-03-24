@@ -49,6 +49,8 @@ When preparing PRs for main, open the PR first to get the PR number, then update
    node scripts/release.mjs major    # Breaking changes (0.1.0 -> 1.0.0)
    ```
 
+`scripts/release.mjs` is the only release entrypoint; version bumping is handled inside that script.
+
 ### What the Script Does
 
 1. Verifies working directory is clean (no uncommitted changes)

@@ -6,7 +6,7 @@
  *
  * Steps:
  * 1. Check for uncommitted changes
- * 2. Bump VERSION file
+ * 2. Bump version in Cargo.toml and Cargo.lock
  * 3. Update CHANGELOG.md: [Unreleased] -> [version] - date
  * 4. Commit and tag
  * 5. Push to remote
@@ -16,7 +16,7 @@
  */
 
 import { execSync } from "child_process";
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
@@ -56,6 +56,88 @@ function getVersion() {
 		process.exit(1);
 	}
 	return match[1];
+}
+
+function parseVersion(version) {
+	const match = version.match(/^(\d+)\.(\d+)\.(\d+)(.*)$/);
+	if (!match) {
+		console.error(`Current version "${version}" is not valid semver (X.Y.Z)`);
+		process.exit(1);
+	}
+
+	return {
+		major: Number.parseInt(match[1], 10),
+		minor: Number.parseInt(match[2], 10),
+		patch: Number.parseInt(match[3], 10),
+		suffix: match[4] || "",
+	};
+}
+
+function formatVersion(parts) {
+	return `${parts.major}.${parts.minor}.${parts.patch}${parts.suffix}`;
+}
+
+function updateCargoTomlVersion(newVersion) {
+	const cargoTomlPath = join(ROOT, "Cargo.toml");
+	let content = readFileSync(cargoTomlPath, "utf-8");
+	const versionRegex = /(\[package\][\s\S]*?\nversion\s*=\s*")[^"]*(")/;
+	if (!versionRegex.test(content)) {
+		console.error("Cargo.toml [package] version not found");
+		process.exit(1);
+	}
+
+	content = content.replace(versionRegex, `$1${newVersion}$2`);
+	writeFileSync(cargoTomlPath, content);
+}
+
+function updateCargoLockVersion(newVersion) {
+	const cargoLockPath = join(ROOT, "Cargo.lock");
+	if (!existsSync(cargoLockPath)) {
+		return;
+	}
+
+	let content = readFileSync(cargoLockPath, "utf-8");
+	const versionRegex =
+		/(\[\[package\]\]\nname = "build-service"\nversion = ")[^"]*(")/;
+	if (!versionRegex.test(content)) {
+		console.error("Cargo.lock package entry not found for build-service");
+		process.exit(1);
+	}
+
+	content = content.replace(versionRegex, `$1${newVersion}$2`);
+	writeFileSync(cargoLockPath, content);
+}
+
+function bumpVersion(bumpType) {
+	const currentVersion = getVersion();
+	const parts = parseVersion(currentVersion);
+
+	switch (bumpType) {
+		case "patch":
+			parts.patch += 1;
+			parts.suffix = "";
+			break;
+		case "minor":
+			parts.minor += 1;
+			parts.patch = 0;
+			parts.suffix = "";
+			break;
+		case "major":
+			parts.major += 1;
+			parts.minor = 0;
+			parts.patch = 0;
+			parts.suffix = "";
+			break;
+		default:
+			console.error("Usage: node scripts/release.mjs <major|minor|patch>");
+			process.exit(1);
+	}
+
+	const newVersion = formatVersion(parts);
+	updateCargoTomlVersion(newVersion);
+	updateCargoLockVersion(newVersion);
+	console.log(`  Version updated: ${currentVersion} -> ${newVersion}`);
+	return newVersion;
 }
 
 function updateChangelogForRelease(version) {
@@ -119,8 +201,7 @@ if (status && status.trim()) {
 console.log("  Working directory clean\n");
 
 console.log(`Bumping version (${BUMP_TYPE})...`);
-run(`node scripts/bump-version.mjs ${BUMP_TYPE}`);
-const version = getVersion();
+const version = bumpVersion(BUMP_TYPE);
 console.log(`  New version: ${version}\n`);
 
 console.log("Updating CHANGELOG.md...");
