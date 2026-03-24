@@ -12,6 +12,10 @@
 
 ### Changed
 - Make `.build-service/config.toml` optional for `build-cli`; it now layers config file, env vars, and CLI flags, and only requires an explicit endpoint when no client config file is present ([#14](https://github.com/kcosr/build-service/pull/14))
+- Make `service.socket.group` optional; when omitted, the daemon leaves socket group ownership unchanged and only applies the configured mode ([#14](https://github.com/kcosr/build-service/pull/14))
+
+### Fixed
+- Fix the `initgroups` call on macOS by using the Apple-specific parameter type in the pre-exec credential setup path ([#14](https://github.com/kcosr/build-service/pull/14))
 
 ## [0.4.4] - 2026-03-09
 

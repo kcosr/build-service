@@ -339,6 +339,36 @@ build-cli \
   glimpseui demo.html
 ```
 
+If you want a tiny convenience wrapper on `srv`, this shell script resolves the input file, changes into its directory, and invokes `build-cli` with the right relative arguments:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: $0 <html-file>" >&2
+  exit 2
+fi
+
+input="$1"
+
+if [ ! -f "$input" ]; then
+  echo "file not found: $input" >&2
+  exit 1
+fi
+
+endpoint="${BUILD_SERVICE_ENDPOINT:-unix:///tmp/build-service.sock}"
+abs_dir="$(cd "$(dirname "$input")" && pwd)"
+base="$(basename "$input")"
+
+cd "$abs_dir"
+
+exec build-cli \
+  --endpoint "$endpoint" \
+  --source "$base" \
+  glimpseui "$base"
+```
+
 What happens:
 - `build-cli` on `srv` uploads `demo.html`
 - your local daemon extracts it into `/tmp/build-service/default`
