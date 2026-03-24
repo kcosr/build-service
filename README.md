@@ -25,19 +25,21 @@ If your environment includes untrusted or semi-trusted workloads, consider addit
 
 ## Architecture
 
-```
-+---------------------+         +----------------------+
-|  Client             |         |  Host                |
-|                     |         |                      |
-|  build-cli          |-- metadata + optional source -->|
-|                     |         |      build-service     |
-|   (HTTP / UDS)      |         |   validate request   |
-|                     |<- NDJSON ------+               |
-|                     |<- artifacts.zip+               |
-|                     |         |      v               |
-+---------------------+         |   exec allowed cmd   |
-                                |                      |
-                                +----------------------+
+```mermaid
+flowchart LR
+    subgraph Client
+        CLI[build-cli]
+    end
+
+    subgraph Host
+        SERVICE[build-service]
+        CMD[exec allowed command]
+    end
+
+    CLI -->|metadata + optional source.zip| SERVICE
+    SERVICE -->|NDJSON stream| CLI
+    SERVICE -->|artifacts.zip| CLI
+    SERVICE -->|validate request| CMD
 ```
 
 ## Build Flow
