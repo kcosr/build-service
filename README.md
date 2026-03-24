@@ -124,7 +124,7 @@ Sample config: `config/config.toml`
 
 Key fields:
 - `schema_version`: config schema version (currently "3").
-- `service.socket.*`: Unix socket enablement, path, group, mode.
+- `service.socket.*`: Unix socket enablement, path, optional group ownership, and mode.
 - `service.http.*`: HTTP enablement, listen address, auth, and optional TLS.
 - `build.workspace_root`: base directory for temp workspaces.
 - `build.default_workspace_path`: optional permanent workspace used when no reusable workspace is requested; the server does not GC or clean this directory.

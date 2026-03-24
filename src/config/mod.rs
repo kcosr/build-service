@@ -113,10 +113,12 @@ impl Config {
         }
 
         if self.service.socket.enabled {
-            if self.service.socket.group.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "service.socket.group must not be empty".to_string(),
-                ));
+            if let Some(group) = &self.service.socket.group {
+                if group.trim().is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "service.socket.group must not be empty when set".to_string(),
+                    ));
+                }
             }
 
             if !self.service.socket.path.is_absolute() {
@@ -290,8 +292,8 @@ pub struct SocketConfig {
     #[serde(default = "default_socket_path")]
     pub path: PathBuf,
 
-    #[serde(default = "default_socket_group")]
-    pub group: String,
+    #[serde(default)]
+    pub group: Option<String>,
 
     #[serde(default = "default_socket_mode")]
     pub mode: String,
@@ -308,7 +310,7 @@ impl Default for SocketConfig {
         Self {
             enabled: default_socket_enabled(),
             path: default_socket_path(),
-            group: default_socket_group(),
+            group: None,
             mode: default_socket_mode(),
         }
     }
@@ -320,10 +322,6 @@ fn default_socket_enabled() -> bool {
 
 fn default_socket_path() -> PathBuf {
     PathBuf::from("/run/build-service.sock")
-}
-
-fn default_socket_group() -> String {
-    "users".to_string()
 }
 
 fn default_socket_mode() -> String {
@@ -775,5 +773,27 @@ mod tests {
             err.to_string().contains("build.default_workspace_path"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_allows_socket_group_to_be_unset() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+
+        config.service.socket.group = None;
+        config.build.commands.insert(
+            "make".to_string(),
+            std::env::current_exe().expect("current exe"),
+        );
+        config.artifacts.storage_root = temp.path().join("artifacts");
+
+        config.validate().expect("config should validate");
     }
 }

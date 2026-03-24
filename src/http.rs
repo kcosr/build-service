@@ -438,20 +438,25 @@ fn setup_socket(config: &Config) -> Result<UnixListener, HttpError> {
     let listener = UnixListener::bind(socket_path)?;
     unsafe { libc::umask(old_umask) };
 
-    let gid = crate::user::lookup_group_gid(&config.service.socket.group)?;
+    let gid = match config.service.socket.group.as_deref() {
+        Some(group) => Some(crate::user::lookup_group_gid(group)?),
+        None => None,
+    };
     apply_socket_permissions(socket_path, gid, config.service.socket.parse_mode()?)?;
 
     Ok(listener)
 }
 
-fn apply_socket_permissions(path: &Path, gid: u32, mode: u32) -> io::Result<()> {
-    let gid_t = gid as libc::gid_t;
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket path"))?;
-    let uid = !0 as libc::uid_t;
-    let ret = unsafe { libc::chown(c_path.as_ptr(), uid, gid_t) };
-    if ret != 0 {
-        return Err(io::Error::last_os_error());
+fn apply_socket_permissions(path: &Path, gid: Option<u32>, mode: u32) -> io::Result<()> {
+    if let Some(gid) = gid {
+        let gid_t = gid as libc::gid_t;
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket path"))?;
+        let uid = !0 as libc::uid_t;
+        let ret = unsafe { libc::chown(c_path.as_ptr(), uid, gid_t) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
 
     let permissions = std::fs::Permissions::from_mode(mode);

@@ -5,7 +5,7 @@ schema_version = "3"
 [service.socket]
 enabled = true
 path = "/run/build-service.sock"
-group = "users"
+# group = "users"
 mode = "0660"
 
 [service.http]

@@ -10,7 +10,7 @@
 
 - Host OS: Rocky Linux
 - Container runtime: Podman (rootless)
-- Socket access group: configurable (e.g., `users`)
+- Socket access group: optional; configure it only when the socket must be shared across users
 
 ## Architecture
 
@@ -71,7 +71,7 @@ schema_version = "3"
 [service.socket]
 enabled = true
 path = "/run/build-service.sock"
-group = "users"
+# group = "users"
 mode = "0660"
 
 [service.http]
