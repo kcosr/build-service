@@ -339,7 +339,7 @@ build-cli \
   glimpseui demo.html
 ```
 
-If you want a tiny convenience wrapper on `srv`, this shell script resolves the input file, changes into its directory, and invokes `build-cli` with the right relative arguments:
+Or create a small `glimpseui` wrapper script on `srv` and place it earlier in `PATH`. This version resolves the input file, changes into its directory, and invokes `build-cli` with the right relative arguments:
 
 ```bash
 #!/usr/bin/env bash
@@ -367,6 +367,12 @@ exec build-cli \
   --endpoint "$endpoint" \
   --source "$base" \
   glimpseui "$base"
+```
+
+With that wrapper in `PATH`, usage on `srv` becomes:
+
+```bash
+glimpseui demo.html
 ```
 
 What happens:
