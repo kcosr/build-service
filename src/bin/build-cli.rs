@@ -208,6 +208,7 @@ enum Endpoint {
 #[derive(Debug)]
 enum BuildError {
     ConnectionFailed(String),
+    WorkspaceHttpStatus { status: u16, message: String },
     Other(String),
 }
 
@@ -215,6 +216,7 @@ impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BuildError::ConnectionFailed(msg) | BuildError::Other(msg) => write!(f, "{msg}"),
+            BuildError::WorkspaceHttpStatus { message, .. } => write!(f, "{message}"),
         }
     }
 }
@@ -976,7 +978,7 @@ fn run_build_command(
                 let local_fallback = connection.map(|c| c.local_fallback).unwrap_or(false);
                 return ExitCode::from(connection_failure_exit_code(local_fallback));
             }
-            BuildError::Other(msg) => {
+            BuildError::Other(msg) | BuildError::WorkspaceHttpStatus { message: msg, .. } => {
                 eprintln!("build request failed: {msg}");
                 return ExitCode::from(1);
             }
@@ -1843,7 +1845,11 @@ fn run_workspace_command(
         }
         Err(err) => {
             eprintln!("workspace request failed: {err}");
-            ExitCode::from(1)
+            match err {
+                BuildError::WorkspaceHttpStatus { status: 409, .. } => ExitCode::from(2),
+                BuildError::WorkspaceHttpStatus { status: 404, .. } => ExitCode::from(3),
+                _ => ExitCode::from(1),
+            }
         }
     }
 }
@@ -1939,9 +1945,10 @@ fn run_workspace_lifecycle(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_else(|_| "".to_string());
-        return Err(BuildError::Other(format!(
-            "server returned {status}: {body}"
-        )));
+        return Err(BuildError::WorkspaceHttpStatus {
+            status: status.as_u16(),
+            message: format!("server returned {status}: {body}"),
+        });
     }
 
     let lifecycle: WorkspaceLifecycleResponse = response
@@ -1949,7 +1956,7 @@ fn run_workspace_lifecycle(
         .map_err(|err| BuildError::Other(format!("invalid response format: {err}")))?;
     if lifecycle.status != action.status() {
         return Err(BuildError::Other(format!(
-            "unexpected workspace status {}, expected {}",
+            "unexpected workspace status {}, expected {}; workspace may have been mutated, check server state",
             lifecycle.status,
             action.status()
         )));

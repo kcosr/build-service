@@ -427,7 +427,7 @@ async fn reset_workspace(
         Ok(Err(WorkspaceError::InvalidId)) => bad_request("workspace id must match [A-Za-z0-9_-]+"),
         Ok(Err(WorkspaceError::NotFound)) => not_found("workspace not found"),
         Ok(Err(WorkspaceError::Busy)) => conflict("workspace_busy"),
-        Ok(Err(err)) => server_error(&format!("failed to reset workspace: {err}")),
+        Ok(Err(err)) => lifecycle_server_error("failed to reset workspace", &err),
         Err(err) => server_error(&err),
     }
 }
@@ -460,7 +460,7 @@ async fn delete_workspace(
         Ok(Err(WorkspaceError::InvalidId)) => bad_request("workspace id must match [A-Za-z0-9_-]+"),
         Ok(Err(WorkspaceError::NotFound)) => not_found("workspace not found"),
         Ok(Err(WorkspaceError::Busy)) => conflict("workspace_busy"),
-        Ok(Err(err)) => server_error(&format!("failed to delete workspace: {err}")),
+        Ok(Err(err)) => lifecycle_server_error("failed to delete workspace", &err),
         Err(err) => server_error(&err),
     }
 }
@@ -619,6 +619,14 @@ fn server_error(message: &str) -> Response {
     error!("http handler error: {message}");
     let body = Json(ErrorResponse {
         error: "internal error".to_string(),
+    });
+    (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+}
+
+fn lifecycle_server_error(context: &str, err: &WorkspaceError) -> Response {
+    error!("{context}: {err}");
+    let body = Json(ErrorResponse {
+        error: err.to_string(),
     });
     (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
 }
