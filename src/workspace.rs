@@ -44,6 +44,8 @@ pub enum WorkspaceError {
     DefaultWorkspaceRequired,
     #[error("workspace is busy")]
     Busy,
+    #[error("workspace not found")]
+    NotFound,
     #[error("workspace error: {0}")]
     Io(#[from] io::Error),
     #[error("invalid workspace metadata: {0}")]
@@ -202,21 +204,75 @@ impl WorkspaceState {
         let ttl_sec = plan.ttl_sec.unwrap_or(self.settings.default_ttl_sec);
         let last_used = SystemTime::now();
         let meta = WorkspaceMeta { ttl_sec, last_used };
+        self.write_metadata_file(workspace_id, &meta)?;
+
+        let mut metadata = self.metadata.lock().expect("workspace metadata lock");
+        metadata.insert(workspace_id.clone(), meta);
+        Ok(())
+    }
+
+    pub fn reset_workspace(
+        self: &Arc<WorkspaceState>,
+        raw_id: &str,
+    ) -> Result<String, WorkspaceError> {
+        let id = normalize_workspace_id(raw_id)?;
+        let _guard = self.try_acquire(&id)?;
+        let path = self.workspace_path(&id);
+        if !path.is_dir() {
+            return Err(WorkspaceError::NotFound);
+        }
+
+        fs::remove_dir_all(&path)?;
+        fs::create_dir_all(path.join(".build-service"))?;
+
+        let meta = {
+            let metadata = self.metadata.lock().expect("workspace metadata lock");
+            metadata.get(&id).cloned().unwrap_or_else(|| WorkspaceMeta {
+                ttl_sec: self.settings.default_ttl_sec,
+                last_used: SystemTime::now(),
+            })
+        };
+        self.write_metadata_file(&id, &meta)?;
+
+        let mut metadata = self.metadata.lock().expect("workspace metadata lock");
+        metadata.insert(id.clone(), meta);
+        Ok(id)
+    }
+
+    pub fn delete_workspace(
+        self: &Arc<WorkspaceState>,
+        raw_id: &str,
+    ) -> Result<String, WorkspaceError> {
+        let id = normalize_workspace_id(raw_id)?;
+        let _guard = self.try_acquire(&id)?;
+        let path = self.workspace_path(&id);
+        if !path.is_dir() {
+            return Err(WorkspaceError::NotFound);
+        }
+
+        fs::remove_dir_all(&path)?;
+        let mut metadata = self.metadata.lock().expect("workspace metadata lock");
+        metadata.remove(&id);
+        Ok(id)
+    }
+
+    fn write_metadata_file(
+        &self,
+        workspace_id: &str,
+        meta: &WorkspaceMeta,
+    ) -> Result<(), WorkspaceError> {
         let meta_dir = self.workspace_path(workspace_id).join(".build-service");
         fs::create_dir_all(&meta_dir)?;
 
         let meta_file = WorkspaceMetaFile {
-            workspace_id: workspace_id.clone(),
-            ttl_sec,
-            last_used: format_timestamp(last_used)?,
+            workspace_id: workspace_id.to_string(),
+            ttl_sec: meta.ttl_sec,
+            last_used: format_timestamp(meta.last_used)?,
         };
         let meta_path = meta_dir.join("meta.json");
         let payload = serde_json::to_vec(&meta_file)
             .map_err(|err| WorkspaceError::Metadata(err.to_string()))?;
         fs::write(&meta_path, payload)?;
-
-        let mut metadata = self.metadata.lock().expect("workspace metadata lock");
-        metadata.insert(workspace_id.clone(), meta);
         Ok(())
     }
 }
@@ -274,6 +330,14 @@ pub fn sanitize_workspace_id(id: &str) -> String {
     }
 
     output
+}
+
+fn normalize_workspace_id(raw_id: &str) -> Result<String, WorkspaceError> {
+    let id = sanitize_workspace_id(raw_id);
+    if id.is_empty() {
+        return Err(WorkspaceError::InvalidId);
+    }
+    Ok(id)
 }
 
 fn gc_workspaces(state: &WorkspaceState) -> Result<(), WorkspaceError> {
@@ -499,5 +563,80 @@ mod tests {
         let plan = state.plan_request(&request).expect("plan");
         assert_eq!(plan.path, default_workspace);
         assert_eq!(plan.managed_id, None);
+    }
+
+    #[test]
+    fn reset_workspace_clears_contents_and_preserves_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let state = Arc::new(WorkspaceState::new(
+            temp.path().to_path_buf(),
+            None,
+            WorkspaceConfig::default(),
+        ));
+        let plan = WorkspacePlan {
+            path: temp.path().join("custom"),
+            managed_id: Some("custom".to_string()),
+            record_use: true,
+            ttl_sec: Some(3600),
+            create: true,
+            client_supplied: true,
+            refresh: false,
+            lock_key: Some("custom".to_string()),
+        };
+        std::fs::create_dir_all(&plan.path).expect("workspace");
+        state.record_use(&plan).expect("record use");
+        std::fs::write(plan.path.join("source.txt"), b"source").expect("source");
+
+        let id = state.reset_workspace("custom").expect("reset");
+
+        assert_eq!(id, "custom");
+        assert!(plan.path.is_dir());
+        assert!(!plan.path.join("source.txt").exists());
+        assert!(plan.path.join(".build-service/meta.json").is_file());
+    }
+
+    #[test]
+    fn delete_workspace_removes_directory_and_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let state = Arc::new(WorkspaceState::new(
+            temp.path().to_path_buf(),
+            None,
+            WorkspaceConfig::default(),
+        ));
+        let plan = WorkspacePlan {
+            path: temp.path().join("custom"),
+            managed_id: Some("custom".to_string()),
+            record_use: true,
+            ttl_sec: Some(3600),
+            create: true,
+            client_supplied: true,
+            refresh: false,
+            lock_key: Some("custom".to_string()),
+        };
+        std::fs::create_dir_all(&plan.path).expect("workspace");
+        state.record_use(&plan).expect("record use");
+
+        let id = state.delete_workspace("custom").expect("delete");
+
+        assert_eq!(id, "custom");
+        assert!(!plan.path.exists());
+        let metadata = state.metadata.lock().expect("metadata");
+        assert!(!metadata.contains_key("custom"));
+    }
+
+    #[test]
+    fn lifecycle_workspace_rejects_active_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let state = Arc::new(WorkspaceState::new(
+            temp.path().to_path_buf(),
+            None,
+            WorkspaceConfig::default(),
+        ));
+        std::fs::create_dir_all(temp.path().join("custom")).expect("workspace");
+        let _guard = state.try_acquire("custom").expect("guard");
+
+        let err = state.reset_workspace("custom").unwrap_err();
+
+        assert!(matches!(err, WorkspaceError::Busy));
     }
 }

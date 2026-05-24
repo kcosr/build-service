@@ -97,6 +97,7 @@ fn run_build_cli(current_dir: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_build-cli"))
         .current_dir(current_dir)
         .env_remove("BUILD_SERVICE_ENABLED")
+        .arg("build")
         .arg("make")
         .output()
         .expect("run build-cli")

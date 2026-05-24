@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use hyper::server::conn::http1;
@@ -57,6 +57,12 @@ struct AppState {
 #[derive(serde::Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceLifecycleResponse {
+    workspace_id: String,
+    status: &'static str,
 }
 
 pub async fn run(
@@ -148,6 +154,8 @@ fn build_router(state: AppState, max_transfer_bytes: u64) -> Router {
     Router::new()
         .route("/v1/builds", post(start_build))
         .route("/v1/builds/:build_id/artifacts.zip", get(get_artifact))
+        .route("/v1/workspaces/:workspace_id/reset", post(reset_workspace))
+        .route("/v1/workspaces/:workspace_id", delete(delete_workspace))
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_body))
 }
@@ -391,6 +399,58 @@ async fn get_artifact(
     response
 }
 
+async fn reset_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Response {
+    if let Some(response) = authorize(
+        &headers,
+        &state.config.service.http.auth,
+        state.auth_required,
+    ) {
+        return response;
+    }
+
+    match state.workspace_state.reset_workspace(&workspace_id) {
+        Ok(workspace_id) => Json(WorkspaceLifecycleResponse {
+            workspace_id,
+            status: "reset",
+        })
+        .into_response(),
+        Err(WorkspaceError::InvalidId) => bad_request("workspace id must match [A-Za-z0-9_-]+"),
+        Err(WorkspaceError::NotFound) => not_found("workspace not found"),
+        Err(WorkspaceError::Busy) => conflict("workspace_busy"),
+        Err(err) => server_error(&format!("failed to reset workspace: {err}")),
+    }
+}
+
+async fn delete_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Response {
+    if let Some(response) = authorize(
+        &headers,
+        &state.config.service.http.auth,
+        state.auth_required,
+    ) {
+        return response;
+    }
+
+    match state.workspace_state.delete_workspace(&workspace_id) {
+        Ok(workspace_id) => Json(WorkspaceLifecycleResponse {
+            workspace_id,
+            status: "deleted",
+        })
+        .into_response(),
+        Err(WorkspaceError::InvalidId) => bad_request("workspace id must match [A-Za-z0-9_-]+"),
+        Err(WorkspaceError::NotFound) => not_found("workspace not found"),
+        Err(WorkspaceError::Busy) => conflict("workspace_busy"),
+        Err(err) => server_error(&format!("failed to delete workspace: {err}")),
+    }
+}
+
 fn authorize(headers: &HeaderMap, auth: &HttpAuthConfig, enforce: bool) -> Option<Response> {
     if !enforce {
         return None;
@@ -525,6 +585,13 @@ fn conflict(message: &str) -> Response {
         error: message.to_string(),
     });
     (StatusCode::CONFLICT, body).into_response()
+}
+
+fn not_found(message: &str) -> Response {
+    let body = Json(ErrorResponse {
+        error: message.to_string(),
+    });
+    (StatusCode::NOT_FOUND, body).into_response()
 }
 
 fn payload_too_large(message: &str) -> Response {
@@ -746,6 +813,47 @@ mod tests {
         .expect("build task");
 
         assert_zip_contains(&zip_bytes, "out/copied.txt", "source");
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_workspace_reset_and_delete_manage_workspace() {
+        let env = setup_env();
+        let workspace = env.temp.path().join("workspace").join("custom");
+        std::fs::create_dir_all(workspace.join(".build-service")).expect("workspace metadata");
+        std::fs::write(workspace.join("stale.txt"), b"stale").expect("stale file");
+
+        let (addr, server_handle) = start_http_server(env.app).await;
+
+        tokio::task::spawn_blocking(move || {
+            let client = Client::new();
+            let base_url = format!("http://{addr}");
+            let reset_url = format!("{base_url}/v1/workspaces/custom/reset");
+            let reset: serde_json::Value = client
+                .post(reset_url)
+                .send()
+                .expect("reset send")
+                .json()
+                .expect("reset json");
+            assert_eq!(reset["workspace_id"], "custom");
+            assert_eq!(reset["status"], "reset");
+            assert!(!workspace.join("stale.txt").exists());
+            assert!(workspace.join(".build-service/meta.json").is_file());
+
+            let delete_url = format!("{base_url}/v1/workspaces/custom");
+            let deleted: serde_json::Value = client
+                .delete(delete_url)
+                .send()
+                .expect("delete send")
+                .json()
+                .expect("delete json");
+            assert_eq!(deleted["workspace_id"], "custom");
+            assert_eq!(deleted["status"], "deleted");
+            assert!(!workspace.exists());
+        })
+        .await
+        .expect("workspace task");
+
         server_handle.abort();
     }
 

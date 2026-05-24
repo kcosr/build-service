@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -550,6 +550,7 @@ fn extract_source_archive(
         WorkspaceManifest::default()
     };
     let mut manifest_dirty = false;
+    let mut seen_source_paths = HashSet::new();
 
     let mut extracted_bytes = 0u64;
     let mut buffer = vec![0u8; 8192];
@@ -580,6 +581,7 @@ fn extract_source_archive(
                 .map_err(|err| BuildError::new("source_archive", format!("mkdir failed: {err}")))?;
             continue;
         }
+        seen_source_paths.insert(rel_path.clone());
 
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)
@@ -718,8 +720,119 @@ fn extract_source_archive(
         }
     }
 
+    if use_manifest && remove_stale_manifest_entries(dest, &mut manifest, &seen_source_paths)? {
+        manifest_dirty = true;
+    }
+
     if use_manifest && manifest_dirty {
         write_workspace_manifest(dest, &manifest)?;
+    }
+
+    Ok(())
+}
+
+fn remove_stale_manifest_entries(
+    dest: &Path,
+    manifest: &mut WorkspaceManifest,
+    seen_source_paths: &HashSet<String>,
+) -> Result<bool, BuildError> {
+    let stale_paths: Vec<String> = manifest
+        .entries
+        .keys()
+        .filter(|path| !seen_source_paths.contains(*path))
+        .cloned()
+        .collect();
+    let mut changed = false;
+
+    for rel_path in stale_paths {
+        manifest.entries.remove(&rel_path);
+        changed = true;
+
+        let Some(path) = safe_manifest_path(dest, &rel_path) else {
+            warn!("skipping unsafe stale workspace manifest path {rel_path:?}");
+            continue;
+        };
+
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                std::fs::remove_file(&path).map_err(|err| {
+                    BuildError::new(
+                        "source_archive",
+                        format!("failed to remove stale source file {rel_path}: {err}"),
+                    )
+                })?;
+                prune_empty_parent_dirs(dest, path.parent())?;
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                warn!("stale source manifest path is now a directory: {:?}", path);
+            }
+            Ok(_) => {
+                warn!(
+                    "stale source manifest path is not a regular file: {:?}",
+                    path
+                );
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(BuildError::new(
+                    "source_archive",
+                    format!("failed to stat stale source file {rel_path}: {err}"),
+                ));
+            }
+        }
+    }
+
+    Ok(changed)
+}
+
+fn safe_manifest_path(dest: &Path, rel_path: &str) -> Option<PathBuf> {
+    let path = Path::new(rel_path);
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) || is_internal_build_service_path(path)
+    {
+        return None;
+    }
+
+    Some(dest.join(path))
+}
+
+fn prune_empty_parent_dirs(dest: &Path, parent: Option<&Path>) -> Result<(), BuildError> {
+    let Some(mut current) = parent else {
+        return Ok(());
+    };
+
+    while current != dest && current.starts_with(dest) && !is_internal_build_service_path(current) {
+        match std::fs::remove_dir(current) {
+            Ok(_) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::DirectoryNotEmpty
+                        | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                break;
+            }
+            Err(err) => {
+                return Err(BuildError::new(
+                    "source_archive",
+                    format!(
+                        "failed to prune empty source directory {:?}: {err}",
+                        current
+                    ),
+                ));
+            }
+        }
+
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
     }
 
     Ok(())
@@ -1128,6 +1241,56 @@ mod tests {
     }
 
     #[test]
+    fn extract_source_archive_removes_stale_manifest_sources_only() {
+        let temp = tempdir().expect("tempdir");
+        let dest = temp.path().join("workspace");
+        std::fs::create_dir_all(dest.join(".build-service")).expect("dest metadata dir");
+        let first = create_test_zip_entries(&[
+            ("src/current.txt", b"current" as &[u8]),
+            ("src/stale.txt", b"stale" as &[u8]),
+        ])
+        .expect("first zip");
+        let second = create_test_zip_entries(&[("src/current.txt", b"current" as &[u8])])
+            .expect("second zip");
+
+        extract_source_archive(first.path(), &dest, 1024, true, false).expect("first extract");
+        std::fs::write(dest.join("src/generated.o"), b"object").expect("generated file");
+
+        extract_source_archive(second.path(), &dest, 1024, true, false).expect("second extract");
+
+        assert!(dest.join("src/current.txt").is_file());
+        assert!(!dest.join("src/stale.txt").exists());
+        assert!(dest.join("src/generated.o").is_file());
+        let manifest = load_workspace_manifest(&dest);
+        assert!(manifest.entries.contains_key("src/current.txt"));
+        assert!(!manifest.entries.contains_key("src/stale.txt"));
+    }
+
+    #[test]
+    fn extract_source_archive_drops_stale_manifest_entry_when_path_is_directory() {
+        let temp = tempdir().expect("tempdir");
+        let dest = temp.path().join("workspace");
+        std::fs::create_dir_all(dest.join(".build-service")).expect("dest metadata dir");
+        let first = create_test_zip_entries(&[
+            ("src/current.txt", b"current" as &[u8]),
+            ("src/stale.txt", b"stale" as &[u8]),
+        ])
+        .expect("first zip");
+        let second = create_test_zip_entries(&[("src/current.txt", b"current" as &[u8])])
+            .expect("second zip");
+
+        extract_source_archive(first.path(), &dest, 1024, true, false).expect("first extract");
+        std::fs::remove_file(dest.join("src/stale.txt")).expect("remove stale file");
+        std::fs::create_dir(dest.join("src/stale.txt")).expect("directory replacement");
+
+        extract_source_archive(second.path(), &dest, 1024, true, false).expect("second extract");
+
+        assert!(dest.join("src/stale.txt").is_dir());
+        let manifest = load_workspace_manifest(&dest);
+        assert!(!manifest.entries.contains_key("src/stale.txt"));
+    }
+
+    #[test]
     fn wait_with_timeout_cancels_on_disconnect() {
         let mut child = Command::new("sh")
             .arg("-c")
@@ -1180,12 +1343,18 @@ mod tests {
     }
 
     fn create_test_zip(name: &str, contents: &[u8]) -> io::Result<NamedTempFile> {
+        create_test_zip_entries(&[(name, contents)])
+    }
+
+    fn create_test_zip_entries(entries: &[(&str, &[u8])]) -> io::Result<NamedTempFile> {
         let temp = NamedTempFile::new()?;
         let file = temp.reopen()?;
         let mut zip = ZipWriter::new(file);
         let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file(name, options)?;
-        zip.write_all(contents)?;
+        for (name, contents) in entries {
+            zip.start_file(*name, options)?;
+            zip.write_all(contents)?;
+        }
         zip.finish()?;
         Ok(temp)
     }

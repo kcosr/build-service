@@ -75,6 +75,7 @@ fn build_cli_runs_without_repo_config_and_omits_source_part() {
         .current_dir(temp.path())
         .env_remove("BUILD_SERVICE_ENABLED")
         .env("BUILD_SERVICE_ENDPOINT", &endpoint)
+        .arg("build")
         .arg("make")
         .output()
         .expect("run build-cli");

@@ -91,20 +91,24 @@ If no config file is found, CLI flags and env vars must provide enough to make t
 # Simple command execution (no sources, no artifacts)
 # Server uses default workspace
 build-cli --endpoint unix:///tmp/build-service.sock \
+  build \
   make -j4 all
 
 # With relative cwd within the default workspace
 build-cli --endpoint unix:///tmp/build-service.sock \
+  build \
   --cwd my-project \
   cargo build --release
 
 # With explicit workspace ID
 build-cli --endpoint unix:///tmp/build-service.sock \
+  build \
   --workspace-id my-project --workspace-reuse \
   make -j4 all
 
 # With sources uploaded, artifacts downloaded
 build-cli --endpoint unix:///tmp/build-service.sock \
+  build \
   --source 'src/**' --source 'Makefile' \
   --source-exclude 'src/test/**' \
   --artifact 'dist/**' \
@@ -112,6 +116,7 @@ build-cli --endpoint unix:///tmp/build-service.sock \
 
 # With env vars and timeout
 build-cli --endpoint unix:///tmp/build-service.sock \
+  build \
   --env CC=clang --env VERBOSE=1 \
   --timeout 600 \
   make
@@ -119,18 +124,18 @@ build-cli --endpoint unix:///tmp/build-service.sock \
 # ── With config file present (CLI overrides config) ───
 
 # Config provides defaults; CLI overrides timeout
-build-cli --timeout 900 make -j4 all
+build-cli build --timeout 900 make -j4 all
 
 # Config provides sources; CLI adds an extra artifact pattern
-build-cli --artifact 'coverage/**' make test
+build-cli build --artifact 'coverage/**' make test
 
 # ── Via environment variables ─────────────────────────
 
 export BUILD_SERVICE_ENDPOINT="unix:///tmp/build-service.sock"
 
 # build-cli and the wrapper both work with minimal flags
-build-cli make -j4 all
-build-cli --cwd my-project cargo test
+build-cli build make -j4 all
+build-cli build --cwd my-project cargo test
 ```
 
 ### Wrapper Script Changes
@@ -139,9 +144,9 @@ Update `build-wrapper.sh` to work without a config directory:
 
 ```
 if .build-service/config.toml found:
-    → existing behavior (exec build-cli <tool> <args>)
+    → exec build-cli build <tool> <args>
 elif BUILD_SERVICE_ENDPOINT env var is set:
-    → exec build-cli <tool> <args>
+    → exec build-cli build <tool> <args>
     (build-cli picks up endpoint and other settings from env vars)
 else:
     → fall back to real tool
