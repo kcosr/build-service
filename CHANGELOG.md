@@ -3,13 +3,13 @@
 ## [Unreleased]
 
 ### Breaking Changes
-- `build-cli` now requires the explicit `build` subcommand for build requests; use `build-cli build <command>` instead of `build-cli <command>`. Wrapper scripts should call `build-cli build "$cmd" "$@"`.
+- `build-cli` now requires the explicit `build` subcommand for build requests; use `build-cli build <command>` instead of `build-cli <command>`. Wrapper scripts should call `build-cli build "$cmd" "$@"` ([#15](https://github.com/kcosr/build-service/pull/15)).
 
 ### Added
-- Add `POST /v1/workspaces/{id}/reset` and `DELETE /v1/workspaces/{id}` HTTP endpoints, with matching `build-cli workspace reset` and `build-cli workspace delete` subcommands, for manual lifecycle management of managed reusable workspaces.
+- Add `POST /v1/workspaces/{id}/reset` and `DELETE /v1/workspaces/{id}` HTTP endpoints, with matching `build-cli workspace reset` and `build-cli workspace delete` subcommands, for manual lifecycle management of managed reusable workspaces ([#15](https://github.com/kcosr/build-service/pull/15)).
 
 ### Changed
-- Managed reusable workspace source extraction now removes manifest-tracked source files that are absent from the latest source archive while preserving generated files and build outputs.
+- Managed reusable workspace source extraction now removes manifest-tracked source files that are absent from the latest source archive while preserving generated files and build outputs ([#15](https://github.com/kcosr/build-service/pull/15)).
 
 ## [0.5.0] - 2026-03-24
 
