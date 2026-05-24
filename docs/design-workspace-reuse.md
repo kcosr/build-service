@@ -141,6 +141,8 @@ build-cli workspace reset --workspace-id custom_id
 build-cli workspace delete --workspace-id custom_id
 ```
 
+Lifecycle endpoints share the build endpoint's transport auth model: Unix socket requests do not send bearer auth, and TCP requests require bearer auth when HTTP auth is configured.
+
 Wrapper scripts invoke `build-cli build <tool> ...` so symlinked tools such as `make` remain transparent.
 
 ### Workspace id file

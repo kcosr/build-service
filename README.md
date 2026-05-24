@@ -204,6 +204,8 @@ Clears a managed reusable workspace and recreates its `.build-service` metadata 
 
 Deletes a managed reusable workspace and drops its metadata.
 
+Lifecycle endpoints share the build endpoint's transport auth model: Unix socket requests do not send bearer auth, and TCP requests require bearer auth when `service.http.auth.required = true`.
+
 Both endpoints return JSON on success:
 
 ```json
@@ -264,7 +266,10 @@ build-cli --endpoint https://builds.example.com --token <token> build make -j4 a
 # Managed workspace lifecycle
 build-cli workspace reset --workspace-id custom_id
 build-cli workspace delete --workspace-id custom_id
+build-cli --endpoint unix:///tmp/build-service.sock workspace reset --workspace-id custom_id
 ```
+
+For `build-cli workspace reset` and `build-cli workspace delete`, `409 workspace_busy` exits with code `2` and `404 workspace not found` exits with code `3`.
 
 Environment:
 - `BUILD_SERVICE_ENDPOINT`: endpoint URL (`http://`, `https://`, or `unix://`)
@@ -294,7 +299,9 @@ ln -s /usr/local/bin/build-wrapper /usr/local/bin/cargo
 
 Ensure the real tools are still available later in `PATH` (for example in `/usr/bin`). The wrapper removes its own directory from `PATH` before falling back, so it will pick the system tool instead of re-invoking itself.
 
-The wrapper runs `build-cli build` with the command name it was invoked as (for example `make` or `cargo`) when either a repo-local config exists or `BUILD_SERVICE_ENDPOINT` is set. The wrapper falls back to the local command in two cases:
+The wrapper runs `build-cli build` with the command name it was invoked as (for example `make` or `cargo`) when either a repo-local config exists or `BUILD_SERVICE_ENDPOINT` is set. If you maintain custom wrapper scripts, update them to call `build-cli build <tool> ...`.
+
+The wrapper falls back to the local command in two cases:
 1. Neither `.build-service/config.toml` nor `BUILD_SERVICE_ENDPOINT` is present
 2. `build-cli` exits with code `222` because build-service is disabled or the endpoint is unreachable with local fallback enabled
 
