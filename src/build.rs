@@ -560,6 +560,8 @@ fn extract_source_archive(
             BuildError::new("source_archive", format!("failed to read zip entry: {err}"))
         })?;
 
+        validate_zip_entry_path(file.name())?;
+
         let Some(enclosed) = file.enclosed_name() else {
             return Err(BuildError::new(
                 "source_archive",
@@ -745,13 +747,15 @@ fn remove_stale_manifest_entries(
     let mut changed = false;
 
     for rel_path in stale_paths {
-        manifest.entries.remove(&rel_path);
-        changed = true;
-
         let Some(path) = safe_manifest_path(dest, &rel_path) else {
             warn!("skipping unsafe stale workspace manifest path {rel_path:?}");
             continue;
         };
+
+        if !stale_path_parent_stays_in_workspace(dest, &path)? {
+            warn!("skipping stale workspace manifest path through external parent: {rel_path:?}");
+            continue;
+        }
 
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
@@ -761,18 +765,27 @@ fn remove_stale_manifest_entries(
                         format!("failed to remove stale source file {rel_path}: {err}"),
                     )
                 })?;
+                manifest.entries.remove(&rel_path);
+                changed = true;
                 prune_empty_parent_dirs(dest, path.parent())?;
             }
             Ok(metadata) if metadata.is_dir() => {
                 warn!("stale source manifest path is now a directory: {:?}", path);
+                manifest.entries.remove(&rel_path);
+                changed = true;
             }
             Ok(_) => {
                 warn!(
                     "stale source manifest path is not a regular file: {:?}",
                     path
                 );
+                manifest.entries.remove(&rel_path);
+                changed = true;
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                manifest.entries.remove(&rel_path);
+                changed = true;
+            }
             Err(err) => {
                 return Err(BuildError::new(
                     "source_archive",
@@ -783,6 +796,30 @@ fn remove_stale_manifest_entries(
     }
 
     Ok(changed)
+}
+
+fn validate_zip_entry_path(name: &str) -> Result<(), BuildError> {
+    if name.contains('\\') {
+        return Err(BuildError::new(
+            "source_archive",
+            "zip entry had invalid path",
+        ));
+    }
+
+    let path = Path::new(name);
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(BuildError::new(
+            "source_archive",
+            "zip entry had invalid path",
+        ));
+    }
+
+    Ok(())
 }
 
 fn safe_manifest_path(dest: &Path, rel_path: &str) -> Option<PathBuf> {
@@ -800,12 +837,45 @@ fn safe_manifest_path(dest: &Path, rel_path: &str) -> Option<PathBuf> {
     Some(dest.join(path))
 }
 
+fn stale_path_parent_stays_in_workspace(dest: &Path, path: &Path) -> Result<bool, BuildError> {
+    let canonical_dest = std::fs::canonicalize(dest).map_err(|err| {
+        BuildError::new(
+            "source_archive",
+            format!("failed to canonicalize workspace: {err}"),
+        )
+    })?;
+
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let canonical_parent = match std::fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => {
+            return Err(BuildError::new(
+                "source_archive",
+                format!("failed to canonicalize stale source parent: {err}"),
+            ));
+        }
+    };
+
+    Ok(canonical_parent.starts_with(canonical_dest))
+}
+
 fn prune_empty_parent_dirs(dest: &Path, parent: Option<&Path>) -> Result<(), BuildError> {
     let Some(mut current) = parent else {
         return Ok(());
     };
 
-    while current != dest && current.starts_with(dest) && !is_internal_build_service_path(current) {
+    while current != dest && current.starts_with(dest) {
+        if current
+            .strip_prefix(dest)
+            .ok()
+            .is_some_and(is_internal_build_service_path)
+        {
+            break;
+        }
+
         match std::fs::remove_dir(current) {
             Ok(_) => {}
             Err(err)
@@ -1288,6 +1358,63 @@ mod tests {
         assert!(dest.join("src/stale.txt").is_dir());
         let manifest = load_workspace_manifest(&dest);
         assert!(!manifest.entries.contains_key("src/stale.txt"));
+    }
+
+    #[test]
+    fn extract_source_archive_rejects_parent_dir_internal_bypass() {
+        let temp = tempdir().expect("tempdir");
+        let dest = temp.path().join("workspace");
+        std::fs::create_dir_all(dest.join(".build-service")).expect("dest metadata dir");
+        let source = create_test_zip("foo/../.build-service/manifest.json", b"bad").expect("zip");
+
+        let err = extract_source_archive(source.path(), &dest, 1024, true, false).unwrap_err();
+
+        assert_eq!(err.code, "source_archive");
+        assert!(err.message.contains("invalid path"));
+        assert!(!dest.join(".build-service/manifest.json").exists());
+    }
+
+    #[test]
+    fn extract_source_archive_rejects_backslash_paths() {
+        let temp = tempdir().expect("tempdir");
+        let dest = temp.path().join("workspace");
+        std::fs::create_dir_all(&dest).expect("dest dir");
+        let source = create_test_zip("..\\.build-service\\manifest.json", b"bad").expect("zip");
+
+        let err = extract_source_archive(source.path(), &dest, 1024, true, false).unwrap_err();
+
+        assert_eq!(err.code, "source_archive");
+        assert!(err.message.contains("invalid path"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn extract_source_archive_skips_stale_path_through_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir");
+        let dest = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(dest.join(".build-service")).expect("dest metadata dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let first = create_test_zip("src/foo.txt", b"owned").expect("first zip");
+        let second = create_test_zip("other.txt", b"other").expect("second zip");
+
+        extract_source_archive(first.path(), &dest, 1024, true, false).expect("first extract");
+        std::fs::remove_file(dest.join("src/foo.txt")).expect("remove source file");
+        std::fs::remove_dir(dest.join("src")).expect("remove source dir");
+        std::fs::write(outside.join("foo.txt"), b"outside").expect("outside file");
+        symlink(&outside, dest.join("src")).expect("symlink source parent");
+
+        extract_source_archive(second.path(), &dest, 1024, true, false).expect("second extract");
+
+        assert_eq!(
+            std::fs::read(outside.join("foo.txt")).expect("outside file"),
+            b"outside"
+        );
+        let manifest = load_workspace_manifest(&dest);
+        assert!(manifest.entries.contains_key("src/foo.txt"));
+        assert!(manifest.entries.contains_key("other.txt"));
     }
 
     #[test]

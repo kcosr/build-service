@@ -218,21 +218,30 @@ impl WorkspaceState {
         let id = normalize_workspace_id(raw_id)?;
         let _guard = self.try_acquire(&id)?;
         let path = self.workspace_path(&id);
-        if !path.is_dir() {
-            return Err(WorkspaceError::NotFound);
-        }
-
-        fs::remove_dir_all(&path)?;
-        fs::create_dir_all(path.join(".build-service"))?;
-
         let meta = {
             let metadata = self.metadata.lock().expect("workspace metadata lock");
-            metadata.get(&id).cloned().unwrap_or_else(|| WorkspaceMeta {
-                ttl_sec: self.settings.default_ttl_sec,
-                last_used: SystemTime::now(),
-            })
+            metadata.get(&id).cloned().ok_or(WorkspaceError::NotFound)?
         };
-        self.write_metadata_file(&id, &meta)?;
+
+        if let Err(err) = fs::remove_dir_all(&path) {
+            if err.kind() == io::ErrorKind::NotFound {
+                let mut metadata = self.metadata.lock().expect("workspace metadata lock");
+                metadata.remove(&id);
+                return Err(WorkspaceError::NotFound);
+            }
+            return Err(err.into());
+        }
+
+        if let Err(err) = fs::create_dir_all(path.join(".build-service")) {
+            let mut metadata = self.metadata.lock().expect("workspace metadata lock");
+            metadata.remove(&id);
+            return Err(err.into());
+        }
+        if let Err(err) = self.write_metadata_file(&id, &meta) {
+            let mut metadata = self.metadata.lock().expect("workspace metadata lock");
+            metadata.remove(&id);
+            return Err(err);
+        }
 
         let mut metadata = self.metadata.lock().expect("workspace metadata lock");
         metadata.insert(id.clone(), meta);
@@ -246,13 +255,21 @@ impl WorkspaceState {
         let id = normalize_workspace_id(raw_id)?;
         let _guard = self.try_acquire(&id)?;
         let path = self.workspace_path(&id);
-        if !path.is_dir() {
-            return Err(WorkspaceError::NotFound);
-        }
+        let had_metadata = {
+            let mut metadata = self.metadata.lock().expect("workspace metadata lock");
+            metadata.remove(&id).is_some()
+        };
 
-        fs::remove_dir_all(&path)?;
-        let mut metadata = self.metadata.lock().expect("workspace metadata lock");
-        metadata.remove(&id);
+        if let Err(err) = fs::remove_dir_all(&path) {
+            if err.kind() == io::ErrorKind::NotFound {
+                return if had_metadata {
+                    Ok(id)
+                } else {
+                    Err(WorkspaceError::NotFound)
+                };
+            }
+            return Err(err.into());
+        }
         Ok(id)
     }
 
@@ -340,7 +357,7 @@ fn normalize_workspace_id(raw_id: &str) -> Result<String, WorkspaceError> {
     Ok(id)
 }
 
-fn gc_workspaces(state: &WorkspaceState) -> Result<(), WorkspaceError> {
+fn gc_workspaces(state: &Arc<WorkspaceState>) -> Result<(), WorkspaceError> {
     let now = SystemTime::now();
     let expired: Vec<String> = {
         let metadata = state.metadata.lock().expect("workspace metadata lock");
@@ -363,9 +380,11 @@ fn gc_workspaces(state: &WorkspaceState) -> Result<(), WorkspaceError> {
     };
 
     for id in expired {
-        if is_active(state, &id) {
-            continue;
-        }
+        let _guard = match state.try_acquire(&id) {
+            Ok(guard) => guard,
+            Err(WorkspaceError::Busy) => continue,
+            Err(err) => return Err(err),
+        };
         let path = state.workspace_path(&id);
         match fs::remove_dir_all(&path) {
             Ok(_) => {
@@ -378,11 +397,6 @@ fn gc_workspaces(state: &WorkspaceState) -> Result<(), WorkspaceError> {
     }
 
     Ok(())
-}
-
-fn is_active(state: &WorkspaceState, id: &str) -> bool {
-    let active = state.active.lock().expect("workspace active lock");
-    active.contains(id)
 }
 
 fn load_metadata(root: &Path) -> HashMap<String, WorkspaceMeta> {
@@ -636,6 +650,22 @@ mod tests {
         let _guard = state.try_acquire("custom").expect("guard");
 
         let err = state.reset_workspace("custom").unwrap_err();
+
+        assert!(matches!(err, WorkspaceError::Busy));
+    }
+
+    #[test]
+    fn delete_workspace_rejects_active_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let state = Arc::new(WorkspaceState::new(
+            temp.path().to_path_buf(),
+            None,
+            WorkspaceConfig::default(),
+        ));
+        std::fs::create_dir_all(temp.path().join("custom")).expect("workspace");
+        let _guard = state.try_acquire("custom").expect("guard");
+
+        let err = state.delete_workspace("custom").unwrap_err();
 
         assert!(matches!(err, WorkspaceError::Busy));
     }

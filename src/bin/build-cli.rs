@@ -3,7 +3,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use clap::{ArgAction, Parser, Subcommand};
@@ -1745,6 +1745,15 @@ fn write_workspace_id_file(repo_root: &Path, workspace_id: &str) -> io::Result<(
     Ok(())
 }
 
+fn remove_workspace_id_file(repo_root: &Path) -> io::Result<()> {
+    let path = repo_root.join(CLIENT_CONFIG_DIR).join("workspace-id");
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 struct BuildResult {
     exit_code: i32,
     timed_out: bool,
@@ -1824,6 +1833,12 @@ fn run_workspace_command(
                 "{OUTPUT_PREFIX} workspace {} {}",
                 response.workspace_id, response.status
             );
+            if matches!(action, WorkspaceLifecycleAction::Delete) {
+                if let Err(err) = remove_workspace_id_file(&repo_root) {
+                    eprintln!("failed to remove workspace-id: {err}");
+                    return ExitCode::from(1);
+                }
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -2223,6 +2238,7 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
         let mut file = archive
             .by_index(i)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        validate_zip_entry_path(file.name())?;
         let Some(enclosed) = file.enclosed_name() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2249,6 +2265,30 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
         if let Some(mode) = unix_mode {
             fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))?;
         }
+    }
+
+    Ok(())
+}
+
+fn validate_zip_entry_path(name: &str) -> io::Result<()> {
+    if name.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zip entry had invalid path",
+        ));
+    }
+
+    let path = Path::new(name);
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zip entry had invalid path",
+        ));
     }
 
     Ok(())
@@ -2313,6 +2353,17 @@ mod tests {
         fs::write(repo_root.join("README.md"), "test").expect("write readme");
         run_git(repo_root, &["add", "."]);
         run_git(repo_root, &["commit", "-m", "init"]);
+    }
+
+    fn create_test_zip(name: &str, contents: &[u8]) -> io::Result<NamedTempFile> {
+        let temp = NamedTempFile::new()?;
+        let file = temp.reopen()?;
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(name, options).map_err(io::Error::other)?;
+        zip.write_all(contents)?;
+        zip.finish().map_err(io::Error::other)?;
+        Ok(temp)
     }
 
     fn start_ndjson_server(body: String) -> (String, thread::JoinHandle<()>) {
@@ -2434,6 +2485,40 @@ mod tests {
         let archive =
             build_source_archive(temp.path(), &PatternConfig::default()).expect("archive");
         assert!(archive.is_none());
+    }
+
+    #[test]
+    fn extract_zip_rejects_parent_dir_internal_bypass() {
+        let temp = tempdir().expect("tempdir");
+        let archive = create_test_zip("foo/../.build-service/manifest.json", b"bad").expect("zip");
+
+        let err = extract_zip(archive.path(), temp.path()).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!temp.path().join(".build-service/manifest.json").exists());
+    }
+
+    #[test]
+    fn extract_zip_rejects_backslash_paths() {
+        let temp = tempdir().expect("tempdir");
+        let archive = create_test_zip("..\\.build-service\\manifest.json", b"bad").expect("zip");
+
+        let err = extract_zip(archive.path(), temp.path()).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn remove_workspace_id_file_deletes_cached_id() {
+        let temp = tempdir().expect("tempdir");
+        write_workspace_id_file(temp.path(), "custom").expect("write id");
+
+        remove_workspace_id_file(temp.path()).expect("remove id");
+        remove_workspace_id_file(temp.path()).expect("remove missing id");
+
+        assert!(read_workspace_id_file(temp.path())
+            .expect("read id")
+            .is_none());
     }
 
     #[test]
