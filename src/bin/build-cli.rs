@@ -3,10 +3,10 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand};
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -18,6 +18,7 @@ use build_service::protocol::{
     ArtifactArchive, ArtifactSpec, Request, ResponseEvent, WorkspaceRequest, SCHEMA_VERSION,
 };
 use build_service::validation::{validate_relative_path, validate_relative_pattern};
+use build_service::workspace::sanitize_workspace_id;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/build-service.sock";
 const CLIENT_CONFIG_DIR: &str = ".build-service";
@@ -43,15 +44,46 @@ const WORKSPACE_TTL_ENV: &str = "BUILD_SERVICE_WORKSPACE_TTL";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Client for the build-service daemon")]
-struct Args {
-    #[arg(long)]
-    timeout: Option<u64>,
-
-    #[arg(long, help = "Endpoint URL (http://, https://, or unix://)")]
+struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Endpoint URL (http://, https://, or unix://)"
+    )]
     endpoint: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     token: Option<String>,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    Build(Box<BuildArgs>),
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    Reset(WorkspaceLifecycleArgs),
+    Delete(WorkspaceLifecycleArgs),
+}
+
+#[derive(Debug, Parser)]
+struct WorkspaceLifecycleArgs {
+    #[arg(long)]
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct BuildArgs {
+    #[arg(long)]
+    timeout: Option<u64>,
 
     #[arg(long = "source", action = ArgAction::Append)]
     source: Vec<String>,
@@ -176,6 +208,7 @@ enum Endpoint {
 #[derive(Debug)]
 enum BuildError {
     ConnectionFailed(String),
+    WorkspaceHttpStatus { status: u16, message: String },
     Other(String),
 }
 
@@ -183,6 +216,7 @@ impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BuildError::ConnectionFailed(msg) | BuildError::Other(msg) => write!(f, "{msg}"),
+            BuildError::WorkspaceHttpStatus { message, .. } => write!(f, "{message}"),
         }
     }
 }
@@ -746,7 +780,7 @@ fn validate_build_id(build_id: &str) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
     let run_dir = match env::current_dir() {
         Ok(dir) => dir,
@@ -777,6 +811,39 @@ fn main() -> ExitCode {
         eprintln!("{OUTPUT_PREFIX} disabled (BUILD_SERVICE_ENABLED/connection.enabled)");
         return ExitCode::from(CONNECTION_FALLBACK_EXIT_CODE);
     }
+
+    match cli.command {
+        Commands::Build(args) => run_build_command(
+            *args,
+            cli.endpoint,
+            cli.token,
+            run_dir,
+            repo_root,
+            client_config,
+            config_loaded,
+        ),
+        Commands::Workspace { command } => run_workspace_command(
+            command,
+            cli.endpoint,
+            cli.token,
+            run_dir,
+            repo_root,
+            client_config,
+            config_loaded,
+        ),
+    }
+}
+
+fn run_build_command(
+    args: BuildArgs,
+    endpoint_arg: Option<String>,
+    token_arg: Option<String>,
+    run_dir: PathBuf,
+    repo_root: PathBuf,
+    client_config: ClientConfig,
+    config_loaded: bool,
+) -> ExitCode {
+    let connection = client_config.connection.as_ref();
 
     let source_patterns = match resolve_patterns(
         &client_config.sources,
@@ -881,14 +948,14 @@ fn main() -> ExitCode {
         workspace,
     };
 
-    let endpoint = match resolve_endpoint(args.endpoint, connection, config_loaded) {
+    let endpoint = match resolve_endpoint(endpoint_arg, connection, config_loaded) {
         Ok(endpoint) => endpoint,
         Err(err) => {
             eprintln!("{err}");
             return ExitCode::from(1);
         }
     };
-    let token = resolve_token(args.token, connection);
+    let token = resolve_token(token_arg, connection);
     let output_limits = match resolve_output_limits(client_config.output.as_ref(), &run_dir) {
         Ok(limits) => limits,
         Err(err) => {
@@ -911,7 +978,7 @@ fn main() -> ExitCode {
                 let local_fallback = connection.map(|c| c.local_fallback).unwrap_or(false);
                 return ExitCode::from(connection_failure_exit_code(local_fallback));
             }
-            BuildError::Other(msg) => {
+            BuildError::Other(msg) | BuildError::WorkspaceHttpStatus { message: msg, .. } => {
                 eprintln!("build request failed: {msg}");
                 return ExitCode::from(1);
             }
@@ -1680,11 +1747,221 @@ fn write_workspace_id_file(repo_root: &Path, workspace_id: &str) -> io::Result<(
     Ok(())
 }
 
+fn remove_workspace_id_file(repo_root: &Path) -> io::Result<()> {
+    let path = repo_root.join(CLIENT_CONFIG_DIR).join("workspace-id");
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 struct BuildResult {
     exit_code: i32,
     timed_out: bool,
     artifacts: Option<ArtifactArchive>,
     workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceLifecycleResponse {
+    workspace_id: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkspaceLifecycleAction {
+    Reset,
+    Delete,
+}
+
+impl WorkspaceLifecycleAction {
+    fn status(self) -> &'static str {
+        match self {
+            WorkspaceLifecycleAction::Reset => "reset",
+            WorkspaceLifecycleAction::Delete => "deleted",
+        }
+    }
+
+    fn path(self, workspace_id: &str) -> String {
+        match self {
+            WorkspaceLifecycleAction::Reset => {
+                format!("/v1/workspaces/{workspace_id}/reset")
+            }
+            WorkspaceLifecycleAction::Delete => format!("/v1/workspaces/{workspace_id}"),
+        }
+    }
+}
+
+fn run_workspace_command(
+    command: WorkspaceCommand,
+    endpoint_arg: Option<String>,
+    token_arg: Option<String>,
+    _run_dir: PathBuf,
+    repo_root: PathBuf,
+    client_config: ClientConfig,
+    config_loaded: bool,
+) -> ExitCode {
+    let connection = client_config.connection.as_ref();
+    let (action, args) = match command {
+        WorkspaceCommand::Reset(args) => (WorkspaceLifecycleAction::Reset, args),
+        WorkspaceCommand::Delete(args) => (WorkspaceLifecycleAction::Delete, args),
+    };
+
+    let workspace_id = match resolve_lifecycle_workspace_id(
+        args.workspace_id,
+        client_config.workspace.as_ref(),
+        &repo_root,
+    ) {
+        Ok(workspace_id) => workspace_id,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let endpoint = match resolve_endpoint(endpoint_arg, connection, config_loaded) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    let token = resolve_token(token_arg, connection);
+
+    match run_workspace_lifecycle(action, &workspace_id, &endpoint, token.as_deref()) {
+        Ok(response) => {
+            println!(
+                "{OUTPUT_PREFIX} workspace {} {}",
+                response.workspace_id, response.status
+            );
+            if matches!(action, WorkspaceLifecycleAction::Delete) {
+                if let Err(err) = remove_workspace_id_file(&repo_root) {
+                    eprintln!("failed to remove workspace-id: {err}");
+                    return ExitCode::from(1);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("workspace request failed: {err}");
+            match err {
+                BuildError::WorkspaceHttpStatus { status: 409, .. } => ExitCode::from(2),
+                BuildError::WorkspaceHttpStatus { status: 404, .. } => ExitCode::from(3),
+                _ => ExitCode::from(1),
+            }
+        }
+    }
+}
+
+fn resolve_lifecycle_workspace_id(
+    cli_id: Option<String>,
+    config: Option<&WorkspaceConfig>,
+    repo_root: &Path,
+) -> io::Result<String> {
+    let cli_id = cli_id.and_then(non_empty_trimmed);
+    let env_id = env::var(WORKSPACE_ID_ENV).ok().and_then(non_empty_trimmed);
+    let config_id =
+        config.and_then(|cfg| cfg.id.as_ref().and_then(|id| non_empty_trimmed(id.clone())));
+    let mut id = cli_id.or(env_id).or(config_id);
+    if let Some(ref raw_id) = id {
+        id = Some(expand_workspace_macros(raw_id, repo_root)?);
+    }
+    if id.is_none() {
+        id = read_workspace_id_file(repo_root)?;
+    }
+
+    let id = id.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace id required for workspace command",
+        )
+    })?;
+    let sanitized = sanitize_workspace_id(&id);
+    if sanitized.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace id must match [A-Za-z0-9_-]+",
+        ));
+    }
+    Ok(sanitized)
+}
+
+fn non_empty_trimmed(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn run_workspace_lifecycle(
+    action: WorkspaceLifecycleAction,
+    workspace_id: &str,
+    endpoint: &Endpoint,
+    token: Option<&str>,
+) -> Result<WorkspaceLifecycleResponse, BuildError> {
+    let path = action.path(workspace_id);
+    let (client, url, send_auth) = match endpoint {
+        Endpoint::Http { base } => (
+            Client::builder()
+                .build()
+                .map_err(|err| BuildError::Other(format!("failed to create client: {err}")))?,
+            format!("{base}{path}"),
+            true,
+        ),
+        Endpoint::Unix { path: socket } => {
+            let client = Client::builder()
+                .unix_socket(socket.clone())
+                .build()
+                .map_err(|err| BuildError::Other(format!("failed to create client: {err}")))?;
+            (client, format!("http://localhost{path}"), false)
+        }
+    };
+
+    let mut builder = match action {
+        WorkspaceLifecycleAction::Reset => client.post(url),
+        WorkspaceLifecycleAction::Delete => client.delete(url),
+    };
+    if send_auth {
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
+        }
+    }
+
+    let response = match builder.send() {
+        Ok(response) => response,
+        Err(err) => {
+            if is_connection_failure(&err) {
+                return Err(BuildError::ConnectionFailed(format!(
+                    "cannot reach endpoint: {err}"
+                )));
+            }
+            return Err(BuildError::Other(format!("request failed: {err}")));
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_else(|_| "".to_string());
+        return Err(BuildError::WorkspaceHttpStatus {
+            status: status.as_u16(),
+            message: format!("server returned {status}: {body}"),
+        });
+    }
+
+    let lifecycle: WorkspaceLifecycleResponse = response
+        .json()
+        .map_err(|err| BuildError::Other(format!("invalid response format: {err}")))?;
+    if lifecycle.status != action.status() {
+        return Err(BuildError::Other(format!(
+            "unexpected workspace status {}, expected {}; workspace may have been mutated, check server state",
+            lifecycle.status,
+            action.status()
+        )));
+    }
+    Ok(lifecycle)
 }
 
 fn run_build(
@@ -1968,6 +2245,7 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
         let mut file = archive
             .by_index(i)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        validate_zip_entry_path(file.name())?;
         let Some(enclosed) = file.enclosed_name() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1994,6 +2272,30 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
         if let Some(mode) = unix_mode {
             fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))?;
         }
+    }
+
+    Ok(())
+}
+
+fn validate_zip_entry_path(name: &str) -> io::Result<()> {
+    if name.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zip entry had invalid path",
+        ));
+    }
+
+    let path = Path::new(name);
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zip entry had invalid path",
+        ));
     }
 
     Ok(())
@@ -2058,6 +2360,17 @@ mod tests {
         fs::write(repo_root.join("README.md"), "test").expect("write readme");
         run_git(repo_root, &["add", "."]);
         run_git(repo_root, &["commit", "-m", "init"]);
+    }
+
+    fn create_test_zip(name: &str, contents: &[u8]) -> io::Result<NamedTempFile> {
+        let temp = NamedTempFile::new()?;
+        let file = temp.reopen()?;
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(name, options).map_err(io::Error::other)?;
+        zip.write_all(contents)?;
+        zip.finish().map_err(io::Error::other)?;
+        Ok(temp)
     }
 
     fn start_ndjson_server(body: String) -> (String, thread::JoinHandle<()>) {
@@ -2179,6 +2492,40 @@ mod tests {
         let archive =
             build_source_archive(temp.path(), &PatternConfig::default()).expect("archive");
         assert!(archive.is_none());
+    }
+
+    #[test]
+    fn extract_zip_rejects_parent_dir_internal_bypass() {
+        let temp = tempdir().expect("tempdir");
+        let archive = create_test_zip("foo/../.build-service/manifest.json", b"bad").expect("zip");
+
+        let err = extract_zip(archive.path(), temp.path()).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!temp.path().join(".build-service/manifest.json").exists());
+    }
+
+    #[test]
+    fn extract_zip_rejects_backslash_paths() {
+        let temp = tempdir().expect("tempdir");
+        let archive = create_test_zip("..\\.build-service\\manifest.json", b"bad").expect("zip");
+
+        let err = extract_zip(archive.path(), temp.path()).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn remove_workspace_id_file_deletes_cached_id() {
+        let temp = tempdir().expect("tempdir");
+        write_workspace_id_file(temp.path(), "custom").expect("write id");
+
+        remove_workspace_id_file(temp.path()).expect("remove id");
+        remove_workspace_id_file(temp.path()).expect("remove missing id");
+
+        assert!(read_workspace_id_file(temp.path())
+            .expect("read id")
+            .is_none());
     }
 
     #[test]
@@ -2733,5 +3080,56 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let err = expand_workspace_macros("custom-{branch}", temp.path());
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn cli_requires_build_subcommand_for_builds() {
+        let cli = Cli::try_parse_from(["build-cli", "build", "--timeout", "30", "make", "-j4"])
+            .expect("parse build");
+        match cli.command {
+            Commands::Build(args) => {
+                assert_eq!(args.timeout, Some(30));
+                assert_eq!(args.command, "make");
+                assert_eq!(args.args, vec!["-j4"]);
+            }
+            _ => panic!("expected build command"),
+        }
+
+        assert!(Cli::try_parse_from(["build-cli", "make"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_workspace_lifecycle_with_global_endpoint() {
+        let cli = Cli::try_parse_from([
+            "build-cli",
+            "--endpoint",
+            "unix:///tmp/build-service.sock",
+            "workspace",
+            "reset",
+            "--workspace-id",
+            "custom",
+        ])
+        .expect("parse workspace reset");
+
+        assert_eq!(
+            cli.endpoint.as_deref(),
+            Some("unix:///tmp/build-service.sock")
+        );
+        match cli.command {
+            Commands::Workspace {
+                command: WorkspaceCommand::Reset(args),
+            } => assert_eq!(args.workspace_id.as_deref(), Some("custom")),
+            _ => panic!("expected workspace reset"),
+        }
+    }
+
+    #[test]
+    fn resolve_lifecycle_workspace_id_sanitizes_macros() {
+        let temp = tempdir().expect("tempdir");
+        let id =
+            resolve_lifecycle_workspace_id(Some("feature/add-auth".to_string()), None, temp.path())
+                .expect("workspace id");
+
+        assert_eq!(id, "feature-add-auth");
     }
 }

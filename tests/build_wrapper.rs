@@ -52,6 +52,7 @@ fn wrapper_uses_build_cli_when_endpoint_env_is_set_without_repo_config() {
                 system_path
             ),
         )
+        .env_remove("BUILD_SERVICE_ENABLED")
         .env("BUILD_SERVICE_ENDPOINT", "unix:///tmp/build-service.sock")
         .output()
         .expect("run wrapper");
@@ -59,7 +60,7 @@ fn wrapper_uses_build_cli_when_endpoint_env_is_set_without_repo_config() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("build-cli:make"),
+        stdout.contains("build-cli:build make"),
         "unexpected stdout: {stdout}"
     );
     assert!(!stdout.contains("local:"), "unexpected stdout: {stdout}");

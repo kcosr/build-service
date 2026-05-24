@@ -38,6 +38,7 @@ include = ["out/**"]
         .env_remove("BUILD_SERVICE_ENABLED")
         .arg("--endpoint")
         .arg(&endpoint)
+        .arg("build")
         .arg("make")
         .output()
         .expect("run build-cli")

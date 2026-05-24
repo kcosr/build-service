@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use hyper::server::conn::http1;
@@ -57,6 +57,12 @@ struct AppState {
 #[derive(serde::Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceLifecycleResponse {
+    workspace_id: String,
+    status: &'static str,
 }
 
 pub async fn run(
@@ -148,6 +154,8 @@ fn build_router(state: AppState, max_transfer_bytes: u64) -> Router {
     Router::new()
         .route("/v1/builds", post(start_build))
         .route("/v1/builds/:build_id/artifacts.zip", get(get_artifact))
+        .route("/v1/workspaces/:workspace_id/reset", post(reset_workspace))
+        .route("/v1/workspaces/:workspace_id", delete(delete_workspace))
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_body))
 }
@@ -391,6 +399,72 @@ async fn get_artifact(
     response
 }
 
+async fn reset_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Response {
+    if let Some(response) = authorize(
+        &headers,
+        &state.config.service.http.auth,
+        state.auth_required,
+    ) {
+        return response;
+    }
+
+    let workspace_state = Arc::clone(&state.workspace_state);
+    let result =
+        tokio::task::spawn_blocking(move || workspace_state.reset_workspace(&workspace_id))
+            .await
+            .map_err(|err| format!("workspace reset task failed: {err}"));
+
+    match result {
+        Ok(Ok(workspace_id)) => Json(WorkspaceLifecycleResponse {
+            workspace_id,
+            status: "reset",
+        })
+        .into_response(),
+        Ok(Err(WorkspaceError::InvalidId)) => bad_request("workspace id must match [A-Za-z0-9_-]+"),
+        Ok(Err(WorkspaceError::NotFound)) => not_found("workspace not found"),
+        Ok(Err(WorkspaceError::Busy)) => conflict("workspace_busy"),
+        Ok(Err(err)) => lifecycle_server_error("failed to reset workspace", &err),
+        Err(err) => server_error(&err),
+    }
+}
+
+async fn delete_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Response {
+    if let Some(response) = authorize(
+        &headers,
+        &state.config.service.http.auth,
+        state.auth_required,
+    ) {
+        return response;
+    }
+
+    let workspace_state = Arc::clone(&state.workspace_state);
+    let result =
+        tokio::task::spawn_blocking(move || workspace_state.delete_workspace(&workspace_id))
+            .await
+            .map_err(|err| format!("workspace delete task failed: {err}"));
+
+    match result {
+        Ok(Ok(workspace_id)) => Json(WorkspaceLifecycleResponse {
+            workspace_id,
+            status: "deleted",
+        })
+        .into_response(),
+        Ok(Err(WorkspaceError::InvalidId)) => bad_request("workspace id must match [A-Za-z0-9_-]+"),
+        Ok(Err(WorkspaceError::NotFound)) => not_found("workspace not found"),
+        Ok(Err(WorkspaceError::Busy)) => conflict("workspace_busy"),
+        Ok(Err(err)) => lifecycle_server_error("failed to delete workspace", &err),
+        Err(err) => server_error(&err),
+    }
+}
+
 fn authorize(headers: &HeaderMap, auth: &HttpAuthConfig, enforce: bool) -> Option<Response> {
     if !enforce {
         return None;
@@ -527,6 +601,13 @@ fn conflict(message: &str) -> Response {
     (StatusCode::CONFLICT, body).into_response()
 }
 
+fn not_found(message: &str) -> Response {
+    let body = Json(ErrorResponse {
+        error: message.to_string(),
+    });
+    (StatusCode::NOT_FOUND, body).into_response()
+}
+
 fn payload_too_large(message: &str) -> Response {
     let body = Json(ErrorResponse {
         error: message.to_string(),
@@ -542,11 +623,20 @@ fn server_error(message: &str) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
 }
 
+fn lifecycle_server_error(context: &str, err: &WorkspaceError) -> Response {
+    error!("{context}: {err}");
+    let body = Json(ErrorResponse {
+        error: err.to_string(),
+    });
+    (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ArtifactsConfig, BuildConfig, Config, LoggingConfig, ServiceConfig};
     use crate::protocol::{ArtifactSpec, Request, ResponseEvent, SCHEMA_VERSION};
+    use crate::workspace::WorkspacePlan;
     use reqwest::blocking::multipart::{Form, Part};
     use reqwest::blocking::Client;
     use std::collections::HashMap;
@@ -568,6 +658,7 @@ mod tests {
     struct TestEnv {
         temp: TempDir,
         app: Router,
+        workspace_state: Arc<WorkspaceState>,
     }
 
     #[tokio::test]
@@ -653,7 +744,7 @@ mod tests {
             .insert("build".to_string(), script_path);
         config.artifacts.storage_root = artifacts_root;
 
-        let app = build_app(config);
+        let (app, _) = build_app(config);
         let (addr, server_handle) = start_http_server(app).await;
 
         let (status, body) = tokio::task::spawn_blocking(move || {
@@ -728,7 +819,7 @@ mod tests {
             .insert("copy".to_string(), script_path);
         config.artifacts.storage_root = artifacts_root;
 
-        let app = build_app(config);
+        let (app, _) = build_app(config);
         let (addr, server_handle) = start_http_server(app).await;
 
         let zip_bytes = tokio::task::spawn_blocking(move || {
@@ -746,6 +837,59 @@ mod tests {
         .expect("build task");
 
         assert_zip_contains(&zip_bytes, "out/copied.txt", "source");
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_workspace_reset_and_delete_manage_workspace() {
+        let env = setup_env();
+        let workspace = env.temp.path().join("workspace").join("custom");
+        std::fs::create_dir_all(workspace.join(".build-service")).expect("workspace metadata");
+        std::fs::write(workspace.join("stale.txt"), b"stale").expect("stale file");
+        env.workspace_state
+            .record_use(&WorkspacePlan {
+                path: workspace.clone(),
+                managed_id: Some("custom".to_string()),
+                record_use: true,
+                ttl_sec: Some(3600),
+                create: true,
+                client_supplied: true,
+                refresh: false,
+                lock_key: Some("custom".to_string()),
+            })
+            .expect("record workspace");
+
+        let (addr, server_handle) = start_http_server(env.app).await;
+
+        tokio::task::spawn_blocking(move || {
+            let client = Client::new();
+            let base_url = format!("http://{addr}");
+            let reset_url = format!("{base_url}/v1/workspaces/custom/reset");
+            let reset: serde_json::Value = client
+                .post(reset_url)
+                .send()
+                .expect("reset send")
+                .json()
+                .expect("reset json");
+            assert_eq!(reset["workspace_id"], "custom");
+            assert_eq!(reset["status"], "reset");
+            assert!(!workspace.join("stale.txt").exists());
+            assert!(workspace.join(".build-service/meta.json").is_file());
+
+            let delete_url = format!("{base_url}/v1/workspaces/custom");
+            let deleted: serde_json::Value = client
+                .delete(delete_url)
+                .send()
+                .expect("delete send")
+                .json()
+                .expect("delete json");
+            assert_eq!(deleted["workspace_id"], "custom");
+            assert_eq!(deleted["status"], "deleted");
+            assert!(!workspace.exists());
+        })
+        .await
+        .expect("workspace task");
+
         server_handle.abort();
     }
 
@@ -979,8 +1123,12 @@ echo "Build finished successfully"
             .insert("slow".to_string(), script_path);
         config.artifacts.storage_root = artifacts_root;
 
-        let app = build_app(config);
-        TestEnv { temp, app }
+        let (app, workspace_state) = build_app(config);
+        TestEnv {
+            temp,
+            app,
+            workspace_state,
+        }
     }
 
     fn setup_env() -> TestEnv {
@@ -1022,11 +1170,15 @@ echo "Build finished successfully"
             .insert("build".to_string(), script_path);
         config.artifacts.storage_root = artifacts_root;
 
-        let app = build_app(config);
-        TestEnv { temp, app }
+        let (app, workspace_state) = build_app(config);
+        TestEnv {
+            temp,
+            app,
+            workspace_state,
+        }
     }
 
-    fn build_app(config: Config) -> Router {
+    fn build_app(config: Config) -> (Router, Arc<WorkspaceState>) {
         let max_transfer_bytes = config.sources.max_transfer_bytes;
         let workspace_state = Arc::new(WorkspaceState::new(
             config.build.workspace_root.clone(),
@@ -1036,9 +1188,9 @@ echo "Build finished successfully"
         let state = AppState {
             config: Arc::new(config),
             auth_required: false,
-            workspace_state,
+            workspace_state: Arc::clone(&workspace_state),
         };
-        build_router(state, max_transfer_bytes)
+        (build_router(state, max_transfer_bytes), workspace_state)
     }
 
     async fn start_http_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {

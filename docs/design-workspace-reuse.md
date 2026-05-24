@@ -5,7 +5,7 @@ Reuse build workspaces across runs to enable incremental builds while keeping th
 
 ## Key Decisions
 - **IDs:** `ws_<uuid>` for server-generated workspace directories, `bld_<uuid>` for build runs/artifacts.
-- **Source handling:** Always extract sources into the workspace. Reuse does not clean old files. A manifest lets the server skip rewriting unchanged files; `refresh` forces a full resync.
+- **Source handling:** Always extract sources into the workspace. For reusable workspaces, the manifest tracks source files written by build-service; source files missing from the latest archive are removed from the workspace and manifest. Generated files not present in the manifest are left alone. `refresh` forces rewriting current source files.
 - **Workspace metadata:** Only for reusable workspaces; stored inside `.build-service/` in the workspace (metadata + manifest).
 - **Ephemeral builds:** No metadata written; workspace deleted after build.
 - **Client control:** Reuse is enabled via client config/env; no CLI flags.
@@ -81,16 +81,23 @@ Note: For ephemeral builds, omit `workspace_id` in the exit event.
 ### Reuse enabled, no workspace id
 1. Generate `ws_<uuid>` and `bld_<uuid>`.
 2. Create workspace dir + `.build-service/`.
-3. Extract sources (always). Use `manifest.json` to skip rewriting unchanged files unless `refresh` is set.
-4. Run build; collect artifacts.
-5. Write/update `meta.json` with TTL/last_used; write `manifest.json`.
-6. **Keep workspace dir.**
+3. Extract sources (when a source archive is supplied). Use `manifest.json` to skip rewriting unchanged files unless `refresh` is set.
+4. Remove manifest-owned source files that are absent from the latest source archive. If no source archive is supplied, leave the manifest and workspace untouched.
+5. Run build; collect artifacts.
+6. Write/update `meta.json` with TTL/last_used; write `manifest.json`.
+7. **Keep workspace dir.**
 
 ### Reuse enabled, id provided
 - If workspace exists: reuse it, extract sources, update metadata.
 - If missing:
   - `create=true` → create new workspace with provided id.
   - `create=false` or absent → **reject request**.
+
+### Manual lifecycle
+- `POST /v1/workspaces/<workspace_id>/reset` clears a managed reusable workspace and recreates `.build-service/` metadata for the same id.
+- `DELETE /v1/workspaces/<workspace_id>` removes a managed reusable workspace and drops metadata.
+- Both operations reject active workspaces with `409 workspace_busy`.
+- Neither operation applies to the configured default workspace.
 
 ### Concurrency (workspace lock)
 - A workspace may only have **one active build** at a time.
@@ -126,6 +133,17 @@ BUILD_SERVICE_WORKSPACE_CREATE=true
 BUILD_SERVICE_WORKSPACE_REFRESH=true
 BUILD_SERVICE_WORKSPACE_TTL=3600
 ```
+
+### CLI
+```
+build-cli build make -j4 all
+build-cli workspace reset --workspace-id custom_id
+build-cli workspace delete --workspace-id custom_id
+```
+
+Lifecycle endpoints share the build endpoint's transport auth model: Unix socket requests do not send bearer auth, and TCP requests require bearer auth when HTTP auth is configured.
+
+Wrapper scripts invoke `build-cli build <tool> ...` so symlinked tools such as `make` remain transparent.
 
 ### Workspace id file
 - `.build-service/workspace-id`

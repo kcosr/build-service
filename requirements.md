@@ -56,7 +56,7 @@ POSIX shell wrapper installed earlier in `PATH` than `/usr/bin/make`:
 
 ```sh
 #!/bin/sh
-exec build-cli "$@"
+exec build-cli build make "$@"
 ```
 
 ## Configuration
@@ -189,12 +189,14 @@ Notes:
 - Temp-dir retention is OS-managed and may be short-lived. Persistent log retention requires setting `output.log_dir` to a durable path and cleaning old build directories separately.
 - Source include patterns that match nothing are skipped.
 - Source upload is optional. With no source include patterns, the client sends metadata only.
+- Managed reusable workspace source extraction syncs manifest-owned source files: files from prior source uploads that are absent from the latest source archive are removed, while generated files and build outputs are left alone. With no source archive, the manifest and workspace are left untouched.
 - Artifact download is optional. With no artifact include patterns, the server omits `artifacts` and the client skips extraction.
 - In env-only mode, source packaging and artifact extraction are rooted at the current working directory because there is no repo config root.
 - `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{repo}`, `{branch}`, and `{uid}`; the client expands `{repo}` to the repo root directory name, `{branch}` to the current git branch, and `{uid}` to the effective user id before sending the request.
 - When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
 - The configured default workspace is serialized behind a single lock; concurrent requests return `workspace_busy`.
 - Endpoint must start with `http://`, `https://`, or `unix://`.
+- Direct build requests use `build-cli build <command> [args...]`. Wrapper scripts must insert the `build` subcommand before the host command name.
 - HTTPS endpoints use the OS trust store at runtime, so `build-cli` honors system-installed CA certificates (including local intercepting proxy CAs).
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml`. With a config file present, the final endpoint fallback is `unix:///run/build-service.sock`.
 - Pattern precedence is additive: config values, then comma-separated env vars, then repeatable CLI flags.
@@ -242,6 +244,14 @@ Example metadata:
 ### Artifact Download
 
 `GET /v1/builds/{build_id}/artifacts.zip`
+
+### Managed Workspace Lifecycle
+
+`POST /v1/workspaces/{workspace_id}/reset`
+
+`DELETE /v1/workspaces/{workspace_id}`
+
+Both endpoints target only managed reusable workspaces under `build.workspace_root`. Successful responses include `workspace_id` and `status` (`reset` or `deleted`). Active workspaces return `409 workspace_busy`; missing workspaces return `404`.
 
 ## Validation and Security
 

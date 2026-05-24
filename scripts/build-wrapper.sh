@@ -18,7 +18,7 @@ fi
 dir=$(pwd)
 while :; do
     if [ "$disabled" != "true" ] && [ -f "$dir/$config_dir/$config_file" ]; then
-        build-cli "$cmd" "$@"
+        build-cli build "$cmd" "$@"
         exit_code=$?
         # Exit code 222 means connection failed, or build-service was explicitly disabled
         # Fall through to execute local build tool
@@ -35,7 +35,7 @@ while :; do
 done
 
 if [ "$disabled" != "true" ] && [ -n "$endpoint_env" ]; then
-    build-cli "$cmd" "$@"
+    build-cli build "$cmd" "$@"
     exit_code=$?
     # Exit code 222 means connection failed, or build-service was explicitly disabled
     # Fall through to execute local build tool

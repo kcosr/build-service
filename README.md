@@ -48,6 +48,7 @@ flowchart LR
 - `build-cli` layers client settings as config file -> env vars -> CLI flags.
 - If source patterns are configured, `build-cli` zips matching files and posts `metadata` + `source.zip`; otherwise it sends metadata only.
 - The server resolves either a managed reusable workspace (`workspace.reuse = true`) or the configured `build.default_workspace_path`.
+- For managed reusable workspaces, source extraction syncs manifest-owned source files: files from prior source uploads that are absent from the latest source archive are removed, while generated files and build outputs are left alone.
 - The client streams stdout/stderr from NDJSON; on success the server emits `artifacts.zip` info only when artifacts were requested and collected.
 - `build-cli` downloads and extracts `artifacts.zip` back into the local working tree only when the exit event includes artifacts.
 
@@ -137,7 +138,8 @@ Notes:
 - Temp-dir retention is OS-managed. If you rely on saved logs, set `output.log_dir` to a persistent location and clean up old build directories yourself.
 - When workspace reuse is enabled, the CLI reads `.build-service/workspace-id` if no workspace id is configured and writes it when the server returns `workspace_id`.
 - `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{repo}`, `{branch}`, and `{uid}`; the CLI expands `{repo}` to the repo root directory name, `{branch}` to the current git branch, and `{uid}` to the effective user id, and the server sanitizes the resulting workspace id.
-- Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force a full resync of sources for the next build.
+- Reusable workspace source extraction removes previously uploaded source files that are no longer present in the latest source archive. It does not clean object files, caches, or other files that were not written from a source archive.
+- Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force rewriting current source files for the next build.
 - Set `connection.enabled = false` (or `BUILD_SERVICE_ENABLED=false`) to force the wrapper to skip build-service and run the local tool. `BUILD_SERVICE_ENABLED` overrides the config when set.
 - If no config file is found, `BUILD_SERVICE_ENDPOINT` or `--endpoint` is required.
 - When a config file is present, endpoint resolution still falls back to `unix:///run/build-service.sock`.
@@ -193,6 +195,25 @@ For managed reusable workspaces, the exit event includes `workspace_id`. Builds 
 ### Artifact Download
 `GET /v1/builds/{build_id}/artifacts.zip`
 
+### Managed Workspace Lifecycle
+`POST /v1/workspaces/{workspace_id}/reset`
+
+Clears a managed reusable workspace and recreates its `.build-service` metadata directory. This does not operate on `build.default_workspace_path`.
+
+`DELETE /v1/workspaces/{workspace_id}`
+
+Deletes a managed reusable workspace and drops its metadata.
+
+Lifecycle endpoints share the build endpoint's transport auth model: Unix socket requests do not send bearer auth, and TCP requests require bearer auth when `service.http.auth.required = true`.
+
+Both endpoints return JSON on success:
+
+```json
+{"workspace_id":"custom_id","status":"reset"}
+```
+
+`DELETE` returns `"status":"deleted"`. Active workspaces return `409 workspace_busy`; missing workspaces return `404`.
+
 ## Path Validation
 
 - `cwd` and all glob patterns must be relative and cannot contain `..`.
@@ -231,17 +252,24 @@ sudo systemctl enable --now build-service
 
 ```
 # Config-backed mode
-build-cli make -j4 all
-build-cli --timeout 1800 make clean all
+build-cli build make -j4 all
+build-cli build --timeout 1800 make clean all
 
 # Env-only mode
-BUILD_SERVICE_ENDPOINT=unix:///tmp/build-service.sock build-cli make -j4 all
-build-cli --endpoint unix:///tmp/build-service.sock --cwd project cargo test
-build-cli --endpoint unix:///tmp/build-service.sock --source 'src/**' --artifact 'dist/**' make
+BUILD_SERVICE_ENDPOINT=unix:///tmp/build-service.sock build-cli build make -j4 all
+build-cli --endpoint unix:///tmp/build-service.sock build --cwd project cargo test
+build-cli --endpoint unix:///tmp/build-service.sock build --source 'src/**' --artifact 'dist/**' make
 
 # HTTP
-build-cli --endpoint https://builds.example.com --token <token> make -j4 all
+build-cli --endpoint https://builds.example.com --token <token> build make -j4 all
+
+# Managed workspace lifecycle
+build-cli workspace reset --workspace-id custom_id
+build-cli workspace delete --workspace-id custom_id
+build-cli --endpoint unix:///tmp/build-service.sock workspace reset --workspace-id custom_id
 ```
+
+For `build-cli workspace reset` and `build-cli workspace delete`, `409 workspace_busy` exits with code `2` and `404 workspace not found` exits with code `3`.
 
 Environment:
 - `BUILD_SERVICE_ENDPOINT`: endpoint URL (`http://`, `https://`, or `unix://`)
@@ -271,7 +299,9 @@ ln -s /usr/local/bin/build-wrapper /usr/local/bin/cargo
 
 Ensure the real tools are still available later in `PATH` (for example in `/usr/bin`). The wrapper removes its own directory from `PATH` before falling back, so it will pick the system tool instead of re-invoking itself.
 
-The wrapper runs `build-cli` with the command name it was invoked as (for example `make` or `cargo`) when either a repo-local config exists or `BUILD_SERVICE_ENDPOINT` is set. The wrapper falls back to the local command in two cases:
+The wrapper runs `build-cli build` with the command name it was invoked as (for example `make` or `cargo`) when either a repo-local config exists or `BUILD_SERVICE_ENDPOINT` is set. If you maintain custom wrapper scripts, update them to call `build-cli build <tool> ...`.
+
+The wrapper falls back to the local command in two cases:
 1. Neither `.build-service/config.toml` nor `BUILD_SERVICE_ENDPOINT` is present
 2. `build-cli` exits with code `222` because build-service is disabled or the endpoint is unreachable with local fallback enabled
 
@@ -335,6 +365,7 @@ ssh -N -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
 ```bash
 build-cli \
   --endpoint unix:///tmp/build-service.sock \
+  build \
   --source demo.html \
   glimpseui demo.html
 ```
@@ -365,6 +396,7 @@ cd "$abs_dir"
 
 exec build-cli \
   --endpoint "$endpoint" \
+  build \
   --source "$base" \
   glimpseui "$base"
 ```
