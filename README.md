@@ -34,6 +34,7 @@ https://github.com/kcosr/build-service/releases
 Supported release platforms are currently:
 
 - `linux-x86_64`
+- `macos-arm64`
 
 Extract the archive on the host that will run the service. The archive contains
 the optimized service and client binaries, sample config, systemd unit,
@@ -42,7 +43,7 @@ wrapper script, and project documentation.
 Install on the host:
 
 ```bash
-RELEASE_ROOT=/path/to/build-service-VERSION-linux-x86_64
+RELEASE_ROOT=/path/to/build-service-VERSION-PLATFORM
 
 sudo install -m 0755 "$RELEASE_ROOT/bin/build-service" /usr/local/bin/build-service
 sudo install -m 0755 "$RELEASE_ROOT/bin/build-cli" /usr/local/bin/build-cli
@@ -312,16 +313,18 @@ script. Then add a fresh `## [Unreleased]` section with the standard
 `_No unreleased changes._` placeholder, commit it as
 `Prepare for next release`, and push `main`.
 
-Release binaries are packaged separately after the Linux x86_64 binaries have
-been built by the release operator. Supported release archives currently use
-this name:
+Release binaries are packaged separately after the target-platform binaries
+have been built by the release operator. Build Linux x86_64 on Linux, and build
+macOS ARM64 natively on Apple Silicon. Supported release archives currently use
+these names:
 
 ```text
 build-service-VERSION-linux-x86_64.tar.gz
+build-service-VERSION-macos-arm64.tar.gz
 ```
 
 Each archive should contain one top-level directory named
-`build-service-VERSION-linux-x86_64` with:
+`build-service-VERSION-PLATFORM` with:
 
 - `bin/build-service` - service daemon.
 - `bin/build-cli` - client CLI.
@@ -337,7 +340,7 @@ Example packaging flow:
 
 ```bash
 VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "build-service") | .version')
-PLATFORM=linux-x86_64
+PLATFORM=linux-x86_64 # or macos-arm64
 OUT=/tmp/build-service-release-${VERSION}
 ROOT="build-service-${VERSION}-${PLATFORM}"
 
