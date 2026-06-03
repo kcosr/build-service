@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.1] - 2026-06-03
 
 ### Breaking Changes
 - `build-cli` now requires the explicit `build` subcommand for build requests; use `build-cli build <command>` instead of `build-cli <command>`. Wrapper scripts should call `build-cli build "$cmd" "$@"` ([#15](https://github.com/kcosr/build-service/pull/15)).
