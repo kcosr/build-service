@@ -11,6 +11,7 @@
 ### Changed
 - Managed reusable workspace source extraction now removes manifest-tracked source files that are absent from the latest source archive while preserving generated files and build outputs ([#15](https://github.com/kcosr/build-service/pull/15)).
 - Release automation now creates normal GitHub releases ([#16](https://github.com/kcosr/build-service/pull/16)).
+- Release version bumping is now handled inside the single release script, matching sibling Rust release tooling ([#16](https://github.com/kcosr/build-service/pull/16)).
 - Documented release download/install guidance and Linux x86_64 archive packaging, with source builds moved to the development workflow ([#16](https://github.com/kcosr/build-service/pull/16)).
 
 ## [0.5.0] - 2026-03-24
