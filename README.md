@@ -23,6 +23,42 @@ If your environment includes untrusted or semi-trusted workloads, consider addit
 - **build-cli**: client that resolves config from CLI/env/config file, optionally packages sources, sends requests (HTTP or UDS), relays NDJSON output, and extracts artifacts when present.
 - **build wrapper**: a POSIX shell shim that replaces build tools in containers.
 
+## Install
+
+Download the latest archive for your platform from GitHub Releases:
+
+```text
+https://github.com/kcosr/build-service/releases
+```
+
+Supported release platforms are currently:
+
+- `linux-x86_64`
+- `macos-arm64`
+
+Extract the archive on the host that will run the service. The archive contains
+the optimized service and client binaries, sample config, systemd unit,
+wrapper script, and project documentation.
+
+Install on the host:
+
+```bash
+RELEASE_ROOT=/path/to/build-service-VERSION-PLATFORM
+
+sudo install -m 0755 "$RELEASE_ROOT/bin/build-service" /usr/local/bin/build-service
+sudo install -m 0755 "$RELEASE_ROOT/bin/build-cli" /usr/local/bin/build-cli
+sudo install -d -m 0755 /etc/build-service
+sudo install -m 0644 "$RELEASE_ROOT/config/config.toml" /etc/build-service/config.toml
+sudo install -d -m 0755 /var/log/build-service
+sudo install -m 0644 "$RELEASE_ROOT/systemd/build-service.service" \
+  /etc/systemd/system/build-service.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now build-service
+```
+
+For unsupported platforms or local development, build from source in the
+[Development](#development) section.
+
 ## Architecture
 
 ```mermaid
@@ -228,24 +264,94 @@ On timeout:
 3. Send `SIGKILL` if still running
 4. Emit `{"type":"exit","code":124,"timed_out":true}`
 
-## Build and Install
+## Development
 
-Build locally:
+Use source builds for local development or unsupported release platforms. Run
+build commands from the cloned repository root.
 
-```
+```bash
 cargo build --release
 ```
 
-Install on host:
+The release binaries are:
 
+```text
+target/release/build-service
+target/release/build-cli
 ```
-sudo cp target/release/build-service /usr/local/bin/
-sudo mkdir -p /etc/build-service
-sudo cp config/config.toml /etc/build-service/config.toml
-sudo mkdir -p /var/log/build-service
-sudo cp systemd/build-service.service /etc/systemd/system/build-service.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now build-service
+
+For substantial code changes, run:
+
+```bash
+cargo fmt
+cargo clippy
+cargo test
+cargo build --release
+```
+
+## Release
+
+Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
+Use `current` when `Cargo.toml` already has the intended release version, use
+`patch`, `minor`, or `major`, or pass an explicit version:
+
+```bash
+node scripts/release.mjs current
+node scripts/release.mjs patch
+node scripts/release.mjs minor
+node scripts/release.mjs major
+node scripts/release.mjs 0.6.0
+```
+
+The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
+matching git tag, creates a GitHub release with notes from the changelog,
+then commits a fresh `Unreleased` section for the next cycle.
+
+If GitHub release creation fails after the commit and tag are pushed, recover
+by creating the release manually for the existing tag instead of rerunning the
+script. Then add a fresh `## [Unreleased]` section with the standard
+`_No unreleased changes._` placeholder, commit it as
+`Prepare for next release`, and push `main`.
+
+Release binaries are packaged separately after the target-platform binaries
+have been built by the release operator. Build Linux x86_64 on Linux, and build
+macOS ARM64 natively on Apple Silicon. Supported release archives currently use
+these names:
+
+```text
+build-service-VERSION-linux-x86_64.tar.gz
+build-service-VERSION-macos-arm64.tar.gz
+```
+
+Each archive should contain one top-level directory named
+`build-service-VERSION-PLATFORM` with:
+
+- `bin/build-service` - service daemon.
+- `bin/build-cli` - client CLI.
+- `README.md`
+- `LICENSE`
+- `CHANGELOG.md`
+- `config/`
+- `systemd/`
+- `scripts/build-wrapper.sh`
+- `docs/`
+
+Example packaging flow:
+
+```bash
+VERSION=$(sed -n '/^\[package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+PLATFORM=linux-x86_64 # or macos-arm64
+OUT=/tmp/build-service-release-${VERSION}
+ROOT="build-service-${VERSION}-${PLATFORM}"
+
+rm -rf "$OUT/$ROOT" "$OUT/${ROOT}.tar.gz"
+mkdir -p "$OUT/$ROOT/bin" "$OUT/$ROOT/scripts"
+install -m 755 target/release/build-service "$OUT/$ROOT/bin/build-service"
+install -m 755 target/release/build-cli "$OUT/$ROOT/bin/build-cli"
+cp README.md LICENSE CHANGELOG.md "$OUT/$ROOT/"
+cp scripts/build-wrapper.sh "$OUT/$ROOT/scripts/"
+cp -R config systemd docs "$OUT/$ROOT/"
+tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
 ```
 
 ## CLI Usage
