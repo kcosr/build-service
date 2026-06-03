@@ -330,23 +330,24 @@ Each archive should contain one top-level directory named
 - `CHANGELOG.md`
 - `config/`
 - `systemd/`
-- `scripts/`
+- `scripts/build-wrapper.sh`
 - `docs/`
 
 Example packaging flow:
 
 ```bash
-VERSION=0.5.1
+VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "build-service") | .version')
 PLATFORM=linux-x86_64
 OUT=/tmp/build-service-release-${VERSION}
 ROOT="build-service-${VERSION}-${PLATFORM}"
 
 rm -rf "$OUT/$ROOT" "$OUT/${ROOT}.tar.gz"
-mkdir -p "$OUT/$ROOT/bin"
+mkdir -p "$OUT/$ROOT/bin" "$OUT/$ROOT/scripts"
 install -m 755 target/release/build-service "$OUT/$ROOT/bin/build-service"
 install -m 755 target/release/build-cli "$OUT/$ROOT/bin/build-cli"
 cp README.md LICENSE CHANGELOG.md "$OUT/$ROOT/"
-cp -R config systemd scripts docs "$OUT/$ROOT/"
+cp scripts/build-wrapper.sh "$OUT/$ROOT/scripts/"
+cp -R config systemd docs "$OUT/$ROOT/"
 tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
 ```
 
