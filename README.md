@@ -23,6 +23,41 @@ If your environment includes untrusted or semi-trusted workloads, consider addit
 - **build-cli**: client that resolves config from CLI/env/config file, optionally packages sources, sends requests (HTTP or UDS), relays NDJSON output, and extracts artifacts when present.
 - **build wrapper**: a POSIX shell shim that replaces build tools in containers.
 
+## Install
+
+Download the latest archive for your platform from GitHub Releases:
+
+```text
+https://github.com/kcosr/build-service/releases
+```
+
+Supported release platforms are currently:
+
+- `linux-x86_64`
+
+Extract the archive on the host that will run the service. The archive contains
+the optimized service and client binaries, sample config, systemd unit,
+wrapper script, and project documentation.
+
+Install on the host:
+
+```bash
+RELEASE_ROOT=/path/to/build-service-VERSION-linux-x86_64
+
+sudo install -m 0755 "$RELEASE_ROOT/bin/build-service" /usr/local/bin/build-service
+sudo install -m 0755 "$RELEASE_ROOT/bin/build-cli" /usr/local/bin/build-cli
+sudo install -d -m 0755 /etc/build-service
+sudo install -m 0644 "$RELEASE_ROOT/config/config.toml" /etc/build-service/config.toml
+sudo install -d -m 0755 /var/log/build-service
+sudo install -m 0644 "$RELEASE_ROOT/systemd/build-service.service" \
+  /etc/systemd/system/build-service.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now build-service
+```
+
+For unsupported platforms or local development, build from source in the
+[Development](#development) section.
+
 ## Architecture
 
 ```mermaid
@@ -228,24 +263,88 @@ On timeout:
 3. Send `SIGKILL` if still running
 4. Emit `{"type":"exit","code":124,"timed_out":true}`
 
-## Build and Install
+## Development
 
-Build locally:
+Use source builds for local development or unsupported release platforms. Run
+build commands from the cloned repository root.
 
-```
+```bash
 cargo build --release
 ```
 
-Install on host:
+The release binaries are:
 
+```text
+target/release/build-service
+target/release/build-cli
 ```
-sudo cp target/release/build-service /usr/local/bin/
-sudo mkdir -p /etc/build-service
-sudo cp config/config.toml /etc/build-service/config.toml
-sudo mkdir -p /var/log/build-service
-sudo cp systemd/build-service.service /etc/systemd/system/build-service.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now build-service
+
+For substantial code changes, run:
+
+```bash
+cargo fmt
+cargo clippy
+cargo test
+cargo build --release
+```
+
+## Release
+
+Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
+Use `current` when `Cargo.toml` already has the intended release version, or
+use `patch`, `minor`, or `major`:
+
+```bash
+node scripts/release.mjs current
+node scripts/release.mjs patch
+node scripts/release.mjs minor
+node scripts/release.mjs major
+```
+
+The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
+matching git tag, creates a GitHub release with notes from the changelog,
+then commits a fresh `Unreleased` section for the next cycle.
+
+If GitHub release creation fails after the commit and tag are pushed, recover
+by creating the release manually for the existing tag instead of rerunning the
+script.
+
+Release binaries are packaged separately after the Linux x86_64 binaries have
+been built by the release operator. Supported release archives currently use
+this name:
+
+```text
+build-service-VERSION-linux-x86_64.tar.gz
+```
+
+Each archive should contain one top-level directory named
+`build-service-VERSION-linux-x86_64` with:
+
+- `bin/build-service` - service daemon.
+- `bin/build-cli` - client CLI.
+- `README.md`
+- `LICENSE`
+- `CHANGELOG.md`
+- `config/`
+- `systemd/`
+- `scripts/`
+- `docs/`
+
+Example packaging flow:
+
+```bash
+VERSION=0.5.1
+PLATFORM=linux-x86_64
+OUT=/tmp/build-service-release-${VERSION}
+ROOT="build-service-${VERSION}-${PLATFORM}"
+
+rm -rf "$OUT/$ROOT" "$OUT/${ROOT}.tar.gz"
+mkdir -p "$OUT/$ROOT/bin"
+install -m 755 target/release/build-service "$OUT/$ROOT/bin/build-service"
+install -m 755 target/release/build-cli "$OUT/$ROOT/bin/build-cli"
+cp README.md LICENSE CHANGELOG.md "$OUT/$ROOT/"
+cp -R config systemd scripts docs "$OUT/$ROOT/"
+tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
 ```
 
 ## CLI Usage
