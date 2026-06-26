@@ -129,6 +129,7 @@ max_uncompressed_bytes = 1342177280
 
 [artifacts]
 storage_root = "/var/lib/build-service/artifacts"
+# restricted_patterns = ["*.cc", "**/*.cc", "*.cpp", "**/*.cpp", "*.h", "**/*.h", "*.hpp", "**/*.hpp"]
 # ttl_sec = 86400
 # gc_interval_sec = 3600
 # max_bytes = 1073741824
@@ -238,8 +239,11 @@ Example metadata:
 {"type":"stderr","data":"..."}
 {"type":"exit","code":0,"timed_out":false,
  "workspace_id":"custom_id",
- "artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":123456}}
+ "artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":123456},
+ "artifact_restrictions":{"omitted_count":2,"matched_patterns":["**/*.cpp","**/*.h"]}}
 ```
+
+Server-side `artifacts.restricted_patterns` omit matching artifacts after client includes/excludes and before artifact size limits. Restricted files do not fail the build, do not count toward artifact size limits, and are reported without file paths.
 
 ### Artifact Download
 

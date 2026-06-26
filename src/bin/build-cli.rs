@@ -15,7 +15,8 @@ use zip::write::FileOptions;
 use zip::ZipWriter;
 
 use build_service::protocol::{
-    ArtifactArchive, ArtifactSpec, Request, ResponseEvent, WorkspaceRequest, SCHEMA_VERSION,
+    ArtifactArchive, ArtifactRestrictions, ArtifactSpec, Request, ResponseEvent, WorkspaceRequest,
+    SCHEMA_VERSION,
 };
 use build_service::validation::{validate_relative_path, validate_relative_pattern};
 use build_service::workspace::sanitize_workspace_id;
@@ -991,6 +992,13 @@ fn run_build_command(
         }
     }
 
+    if let Some(restrictions) = &build.artifact_restrictions {
+        if let Err(err) = write_artifact_restrictions_notice(restrictions) {
+            eprintln!("failed to report artifact restrictions: {err}");
+            return ExitCode::from(1);
+        }
+    }
+
     if build.exit_code != 0 {
         return to_exit_code(build.exit_code, build.timed_out);
     }
@@ -1760,6 +1768,7 @@ struct BuildResult {
     exit_code: i32,
     timed_out: bool,
     artifacts: Option<ArtifactArchive>,
+    artifact_restrictions: Option<ArtifactRestrictions>,
     workspace_id: Option<String>,
 }
 
@@ -2041,6 +2050,7 @@ fn read_responses(
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
     let mut artifacts: Option<ArtifactArchive> = None;
+    let mut artifact_restrictions: Option<ArtifactRestrictions> = None;
     let mut workspace_id: Option<String> = None;
     let mut output = OutputLimiter::new(output_limits);
     let mut log_capture = LogCaptureState::new(output_limits);
@@ -2098,11 +2108,13 @@ fn read_responses(
                 code,
                 timed_out: timed,
                 artifacts: event_artifacts,
+                artifact_restrictions: event_artifact_restrictions,
                 workspace_id: event_workspace_id,
             } => {
                 exit_code = Some(code);
                 timed_out = timed;
                 artifacts = event_artifacts;
+                artifact_restrictions = event_artifact_restrictions;
                 workspace_id = event_workspace_id;
                 break;
             }
@@ -2165,9 +2177,35 @@ fn read_responses(
             exit_code: code,
             timed_out,
             artifacts,
+            artifact_restrictions,
             workspace_id,
         }),
         None => Err(BuildError::Other("missing exit event".to_string())),
+    }
+}
+
+fn write_artifact_restrictions_notice(restrictions: &ArtifactRestrictions) -> io::Result<()> {
+    let mut stderr = io::stderr();
+    writeln!(stderr, "{}", artifact_restrictions_notice(restrictions))
+}
+
+fn artifact_restrictions_notice(restrictions: &ArtifactRestrictions) -> String {
+    let file_label = if restrictions.omitted_count == 1 {
+        "file was"
+    } else {
+        "files were"
+    };
+    if restrictions.matched_patterns.is_empty() {
+        format!(
+            "{OUTPUT_PREFIX} {} requested artifact {file_label} omitted by server artifact restrictions",
+            restrictions.omitted_count
+        )
+    } else {
+        format!(
+            "{OUTPUT_PREFIX} {} requested artifact {file_label} omitted by server artifact restrictions: {}",
+            restrictions.omitted_count,
+            restrictions.matched_patterns.join(", ")
+        )
     }
 }
 
@@ -2371,6 +2409,19 @@ mod tests {
         zip.write_all(contents)?;
         zip.finish().map_err(io::Error::other)?;
         Ok(temp)
+    }
+
+    #[test]
+    fn artifact_restrictions_notice_lists_patterns_without_paths() {
+        let restrictions = ArtifactRestrictions {
+            omitted_count: 2,
+            matched_patterns: vec!["**/*.cpp".to_string(), "**/*.h".to_string()],
+        };
+
+        assert_eq!(
+            artifact_restrictions_notice(&restrictions),
+            "[build-service] 2 requested artifact files were omitted by server artifact restrictions: **/*.cpp, **/*.h"
+        );
     }
 
     fn start_ndjson_server(body: String) -> (String, thread::JoinHandle<()>) {

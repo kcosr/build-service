@@ -69,6 +69,7 @@ storage_root = "/var/lib/build-service/artifacts"
 # max_bytes = 1073741824
 # max_transfer_bytes = 536870912
 # max_uncompressed_bytes = 2147483648
+# restricted_patterns = ["*.cc", "**/*.cc", "*.cpp", "**/*.cpp", "*.h", "**/*.h", "*.hpp", "**/*.hpp"]
 
 [logging]
 level = "info"

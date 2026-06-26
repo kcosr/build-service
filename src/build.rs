@@ -199,6 +199,7 @@ pub fn execute_build(
             code: 1,
             timed_out: false,
             artifacts: None,
+            artifact_restrictions: None,
             workspace_id,
         });
     }
@@ -378,6 +379,7 @@ fn run_build_in_workspace(
                 code: exit_code,
                 timed_out,
                 artifacts: None,
+                artifact_restrictions: None,
                 workspace_id: workspace_id.map(|id| id.to_string()),
             })
             .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
@@ -405,6 +407,7 @@ fn run_build_in_workspace(
                     code: 1,
                     timed_out: false,
                     artifacts: None,
+                    artifact_restrictions: None,
                     workspace_id: workspace_id.map(|id| id.to_string()),
                 })
                 .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
@@ -416,7 +419,8 @@ fn run_build_in_workspace(
         .blocking_send(ResponseEvent::Exit {
             code: exit_code,
             timed_out,
-            artifacts,
+            artifacts: artifacts.archive,
+            artifact_restrictions: artifacts.restrictions,
             workspace_id: workspace_id.map(|id| id.to_string()),
         })
         .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;

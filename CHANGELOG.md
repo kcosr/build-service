@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Add server-side `artifacts.restricted_patterns` to omit configured artifact paths from archives and report path-free restriction metadata to clients.
+
 ### Fixed
 - Fixed release script cleanup handling after successful GitHub release creation.
 - Improved release-script diagnostics and changelog validation edge cases.

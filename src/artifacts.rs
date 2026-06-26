@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use zip::write::FileOptions;
 use zip::ZipWriter;
 
 use crate::config::ArtifactsConfig;
-use crate::protocol::{ArtifactArchive, ArtifactSpec};
+use crate::protocol::{ArtifactArchive, ArtifactRestrictions, ArtifactSpec};
 use crate::validation::validate_relative_pattern;
 
 const DEFAULT_GC_INTERVAL_SECS: u64 = 3600;
@@ -58,14 +58,23 @@ pub enum ArtifactError {
     UncompressedTooLarge { max_bytes: u64 },
 }
 
+#[derive(Debug, Clone)]
+pub struct ArtifactCollection {
+    pub archive: Option<ArtifactArchive>,
+    pub restrictions: Option<ArtifactRestrictions>,
+}
+
 pub fn collect_artifacts_zip(
     build_root: &Path,
     spec: &ArtifactSpec,
     config: &ArtifactsConfig,
     build_id: &str,
-) -> Result<Option<ArtifactArchive>, ArtifactError> {
+) -> Result<ArtifactCollection, ArtifactError> {
     if spec.include.is_empty() {
-        return Ok(None);
+        return Ok(ArtifactCollection {
+            archive: None,
+            restrictions: None,
+        });
     }
 
     let root = fs::canonicalize(build_root).map_err(|source| ArtifactError::Io {
@@ -75,7 +84,7 @@ pub fn collect_artifacts_zip(
 
     let mut excludes = spec.exclude.clone();
     excludes.push(INTERNAL_EXCLUDE_PATTERN.to_string());
-    let exclude_patterns = compile_patterns(&excludes)?;
+    let exclude_patterns = compile_patterns(&excludes, "artifacts.exclude")?;
     let mut matched_files: HashMap<PathBuf, PathBuf> = HashMap::new();
 
     for pattern in &spec.include {
@@ -139,10 +148,19 @@ pub fn collect_artifacts_zip(
         }
     }
 
+    let restrictions = apply_restricted_patterns(
+        &mut matched_files,
+        &config.restricted_patterns,
+        "artifacts.restricted_patterns",
+    )?;
+
     // If no files matched any patterns, return None
     if matched_files.is_empty() {
         info!("no artifacts matched any patterns");
-        return Ok(None);
+        return Ok(ArtifactCollection {
+            archive: None,
+            restrictions,
+        });
     }
 
     let dest_dir = config.storage_root.join(build_id);
@@ -168,10 +186,13 @@ pub fn collect_artifacts_zip(
         config.max_uncompressed_bytes,
     )?;
 
-    Ok(Some(ArtifactArchive {
-        path: format!("/v1/builds/{build_id}/artifacts.zip"),
-        size,
-    }))
+    Ok(ArtifactCollection {
+        archive: Some(ArtifactArchive {
+            path: format!("/v1/builds/{build_id}/artifacts.zip"),
+            size,
+        }),
+        restrictions,
+    })
 }
 
 fn sum_matched_file_sizes(matched_files: &HashMap<PathBuf, PathBuf>) -> Result<u64, ArtifactError> {
@@ -231,13 +252,11 @@ fn collect_recursive_prefix(
     Ok(false)
 }
 
-fn compile_patterns(patterns: &[String]) -> Result<Vec<glob::Pattern>, ArtifactError> {
+fn compile_patterns(patterns: &[String], field: &str) -> Result<Vec<glob::Pattern>, ArtifactError> {
     let mut compiled = Vec::new();
     for pattern in patterns {
-        validate_relative_pattern(pattern, "artifacts.exclude").map_err(|err| {
-            ArtifactError::InvalidPattern {
-                message: err.to_string(),
-            }
+        validate_relative_pattern(pattern, field).map_err(|err| ArtifactError::InvalidPattern {
+            message: err.to_string(),
         })?;
         let glob = glob::Pattern::new(pattern).map_err(|source| ArtifactError::GlobPattern {
             pattern: pattern.to_string(),
@@ -246,6 +265,55 @@ fn compile_patterns(patterns: &[String]) -> Result<Vec<glob::Pattern>, ArtifactE
         compiled.push(glob);
     }
     Ok(compiled)
+}
+
+fn apply_restricted_patterns(
+    matched_files: &mut HashMap<PathBuf, PathBuf>,
+    restricted_patterns: &[String],
+    field: &str,
+) -> Result<Option<ArtifactRestrictions>, ArtifactError> {
+    if restricted_patterns.is_empty() || matched_files.is_empty() {
+        return Ok(None);
+    }
+
+    let compiled = compile_patterns(restricted_patterns, field)?;
+    let mut restricted_paths = HashSet::new();
+    let mut matched_pattern_indexes = HashSet::new();
+
+    for (canonical, rel) in matched_files.iter() {
+        let rel_str = rel.to_string_lossy();
+        let mut restricted = false;
+        for (index, pattern) in compiled.iter().enumerate() {
+            if pattern.matches(&rel_str) {
+                restricted = true;
+                matched_pattern_indexes.insert(index);
+            }
+        }
+        if restricted {
+            restricted_paths.insert(canonical.clone());
+        }
+    }
+
+    if restricted_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let omitted_count = restricted_paths.len();
+    for path in restricted_paths {
+        matched_files.remove(&path);
+    }
+
+    let matched_patterns = restricted_patterns
+        .iter()
+        .enumerate()
+        .filter(|(index, _pattern)| matched_pattern_indexes.contains(index))
+        .map(|(_index, pattern)| pattern.clone())
+        .collect();
+
+    Ok(Some(ArtifactRestrictions {
+        omitted_count,
+        matched_patterns,
+    }))
 }
 
 fn collect_dir_files(
@@ -599,18 +667,35 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
+    use zip::ZipArchive;
+
+    fn artifacts_config(root: &Path) -> ArtifactsConfig {
+        ArtifactsConfig {
+            storage_root: root.join("artifacts"),
+            ..ArtifactsConfig::default()
+        }
+    }
+
+    fn zip_entry_names(path: &Path) -> Vec<String> {
+        let file = File::open(path).expect("open zip");
+        let mut archive = ZipArchive::new(file).expect("read zip");
+        let mut names = Vec::new();
+        for index in 0..archive.len() {
+            names.push(
+                archive
+                    .by_index(index)
+                    .expect("zip entry")
+                    .name()
+                    .to_string(),
+            );
+        }
+        names
+    }
 
     #[test]
     fn collect_artifacts_no_match_returns_none() {
         let root = tempdir().expect("tempdir");
-        let config = ArtifactsConfig {
-            storage_root: root.path().join("artifacts"),
-            ttl_sec: None,
-            gc_interval_sec: None,
-            max_bytes: None,
-            max_transfer_bytes: None,
-            max_uncompressed_bytes: None,
-        };
+        let config = artifacts_config(root.path());
         let spec = ArtifactSpec {
             include: vec!["out/*.bin".to_string()],
             exclude: vec![],
@@ -618,20 +703,17 @@ mod tests {
 
         // Glob miss no longer fails - just returns None if no files matched
         let result = collect_artifacts_zip(root.path(), &spec, &config, "bld").unwrap();
-        assert!(result.is_none(), "expected None when no files match");
+        assert!(
+            result.archive.is_none(),
+            "expected None when no files match"
+        );
+        assert!(result.restrictions.is_none());
     }
 
     #[test]
     fn collect_artifacts_creates_zip() {
         let root = tempdir().expect("tempdir");
-        let config = ArtifactsConfig {
-            storage_root: root.path().join("artifacts"),
-            ttl_sec: None,
-            gc_interval_sec: None,
-            max_bytes: None,
-            max_transfer_bytes: None,
-            max_uncompressed_bytes: None,
-        };
+        let config = artifacts_config(root.path());
         let output = root.path().join("out");
         std::fs::create_dir_all(&output).expect("mkdir");
         std::fs::write(output.join("app"), "bin").expect("write");
@@ -642,10 +724,124 @@ mod tests {
 
         let archive = collect_artifacts_zip(root.path(), &spec, &config, "bld")
             .expect("collect")
+            .archive
             .expect("archive");
         assert!(archive.path.ends_with("artifacts.zip"));
         let zip_path = config.storage_root.join("bld").join("artifacts.zip");
         assert!(zip_path.exists());
+    }
+
+    #[test]
+    fn collect_artifacts_omits_restricted_files_and_reports_patterns() {
+        let root = tempdir().expect("tempdir");
+        let output = root.path().join("out");
+        std::fs::create_dir_all(&output).expect("mkdir");
+        std::fs::write(output.join("app.bin"), "bin").expect("write app");
+        std::fs::write(root.path().join("foo.cpp"), "source").expect("write source");
+
+        let mut config = artifacts_config(root.path());
+        config.restricted_patterns = vec!["foo.*".to_string(), "*.cpp".to_string()];
+        let spec = ArtifactSpec {
+            include: vec!["**".to_string(), "foo.cpp".to_string()],
+            exclude: vec![],
+        };
+
+        let result = collect_artifacts_zip(root.path(), &spec, &config, "bld").expect("collect");
+        let restrictions = result.restrictions.expect("restrictions");
+        assert_eq!(restrictions.omitted_count, 1);
+        assert_eq!(restrictions.matched_patterns, vec!["foo.*", "*.cpp"]);
+
+        let archive = result.archive.expect("archive");
+        assert!(archive.path.ends_with("artifacts.zip"));
+        let names = zip_entry_names(&config.storage_root.join("bld").join("artifacts.zip"));
+        assert_eq!(names, vec!["out/app.bin"]);
+    }
+
+    #[test]
+    fn collect_artifacts_all_restricted_returns_no_archive_with_summary() {
+        let root = tempdir().expect("tempdir");
+        std::fs::write(root.path().join("foo.cpp"), "source").expect("write source");
+
+        let mut config = artifacts_config(root.path());
+        config.restricted_patterns = vec!["*.cpp".to_string()];
+        let spec = ArtifactSpec {
+            include: vec!["*.cpp".to_string()],
+            exclude: vec![],
+        };
+
+        let result = collect_artifacts_zip(root.path(), &spec, &config, "bld").expect("collect");
+        assert!(result.archive.is_none());
+        let restrictions = result.restrictions.expect("restrictions");
+        assert_eq!(restrictions.omitted_count, 1);
+        assert_eq!(restrictions.matched_patterns, vec!["*.cpp"]);
+        assert!(!config
+            .storage_root
+            .join("bld")
+            .join("artifacts.zip")
+            .exists());
+    }
+
+    #[test]
+    fn collect_artifacts_absent_restriction_match_returns_no_summary() {
+        let root = tempdir().expect("tempdir");
+        let output = root.path().join("out");
+        std::fs::create_dir_all(&output).expect("mkdir");
+        std::fs::write(output.join("app.bin"), "bin").expect("write app");
+
+        let mut config = artifacts_config(root.path());
+        config.restricted_patterns = vec!["*.cpp".to_string()];
+        let spec = ArtifactSpec {
+            include: vec!["out/**".to_string()],
+            exclude: vec![],
+        };
+
+        let result = collect_artifacts_zip(root.path(), &spec, &config, "bld").expect("collect");
+        assert!(result.archive.is_some());
+        assert!(result.restrictions.is_none());
+    }
+
+    #[test]
+    fn collect_artifacts_restricted_files_do_not_count_toward_size_limits() {
+        let root = tempdir().expect("tempdir");
+        std::fs::write(root.path().join("large.h"), "artifact payload").expect("write source");
+
+        let mut config = artifacts_config(root.path());
+        config.max_uncompressed_bytes = Some(1);
+        config.restricted_patterns = vec!["*.h".to_string()];
+        let spec = ArtifactSpec {
+            include: vec!["*.h".to_string()],
+            exclude: vec![],
+        };
+
+        let result = collect_artifacts_zip(root.path(), &spec, &config, "bld").expect("collect");
+        assert!(result.archive.is_none());
+        let restrictions = result.restrictions.expect("restrictions");
+        assert_eq!(restrictions.omitted_count, 1);
+        assert_eq!(restrictions.matched_patterns, vec!["*.h"]);
+    }
+
+    #[test]
+    fn collect_artifacts_internal_excludes_are_not_reported_as_restrictions() {
+        let root = tempdir().expect("tempdir");
+        let internal = root.path().join(".build-service");
+        let output = root.path().join("out");
+        std::fs::create_dir_all(&internal).expect("mkdir internal");
+        std::fs::create_dir_all(&output).expect("mkdir out");
+        std::fs::write(internal.join("generated.h"), "internal").expect("write internal");
+        std::fs::write(output.join("app.bin"), "bin").expect("write app");
+
+        let mut config = artifacts_config(root.path());
+        config.restricted_patterns = vec!["**/*.h".to_string()];
+        let spec = ArtifactSpec {
+            include: vec!["**".to_string()],
+            exclude: vec![],
+        };
+
+        let result = collect_artifacts_zip(root.path(), &spec, &config, "bld").expect("collect");
+        assert!(result.archive.is_some());
+        assert!(result.restrictions.is_none());
+        let names = zip_entry_names(&config.storage_root.join("bld").join("artifacts.zip"));
+        assert_eq!(names, vec!["out/app.bin"]);
     }
 
     #[cfg(unix)]
@@ -659,14 +855,7 @@ mod tests {
         let link_path = root.path().join("link.txt");
         symlink(&outside_file, &link_path).expect("symlink");
 
-        let config = ArtifactsConfig {
-            storage_root: root.path().join("artifacts"),
-            ttl_sec: None,
-            gc_interval_sec: None,
-            max_bytes: None,
-            max_transfer_bytes: None,
-            max_uncompressed_bytes: None,
-        };
+        let config = artifacts_config(root.path());
         let spec = ArtifactSpec {
             include: vec!["link.txt".to_string()],
             exclude: vec![],
@@ -687,11 +876,8 @@ mod tests {
         std::fs::write(output.join("app.txt"), "artifact payload").expect("write");
         let config = ArtifactsConfig {
             storage_root: root.path().join("artifacts"),
-            ttl_sec: None,
-            gc_interval_sec: None,
-            max_bytes: None,
-            max_transfer_bytes: None,
             max_uncompressed_bytes: Some(8),
+            ..ArtifactsConfig::default()
         };
         let spec = ArtifactSpec {
             include: vec!["out/**".to_string()],
@@ -721,11 +907,8 @@ mod tests {
         std::fs::write(output.join("app.txt"), "artifact payload").expect("write");
         let config = ArtifactsConfig {
             storage_root: root.path().join("artifacts"),
-            ttl_sec: None,
-            gc_interval_sec: None,
-            max_bytes: None,
             max_transfer_bytes: Some(1),
-            max_uncompressed_bytes: None,
+            ..ArtifactsConfig::default()
         };
         let spec = ArtifactSpec {
             include: vec!["out/**".to_string()],
