@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- Add server-side `artifacts.restricted_patterns` to omit configured artifact paths from archives and report path-free restriction metadata to clients.
+- Add server-side `artifacts.restricted_patterns` to omit configured artifact paths from archives and report path-free restriction metadata to clients ([#17](https://github.com/kcosr/build-service/pull/17)).
 
 ### Fixed
 - Fixed release script cleanup handling after successful GitHub release creation.
