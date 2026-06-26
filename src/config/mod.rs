@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::logging::LoggingSettings;
+use crate::validation::validate_relative_pattern;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/build-service/config.toml";
 const DEFAULT_SCHEMA_VERSION: &str = "3";
@@ -547,6 +548,9 @@ pub struct ArtifactsConfig {
 
     #[serde(default)]
     pub max_uncompressed_bytes: Option<u64>,
+
+    #[serde(default)]
+    pub restricted_patterns: Vec<String>,
 }
 
 impl Default for ArtifactsConfig {
@@ -558,6 +562,7 @@ impl Default for ArtifactsConfig {
             max_bytes: None,
             max_transfer_bytes: None,
             max_uncompressed_bytes: None,
+            restricted_patterns: Vec::new(),
         }
     }
 }
@@ -614,6 +619,16 @@ impl ArtifactsConfig {
                     "artifacts.max_uncompressed_bytes must be greater than zero".to_string(),
                 ));
             }
+        }
+
+        for pattern in &self.restricted_patterns {
+            validate_relative_pattern(pattern, "artifacts.restricted_patterns")
+                .map_err(|err| ConfigError::Invalid(err.to_string()))?;
+            glob::Pattern::new(pattern).map_err(|err| {
+                ConfigError::Invalid(format!(
+                    "invalid glob pattern in artifacts.restricted_patterns {pattern:?}: {err}"
+                ))
+            })?;
         }
 
         Ok(())
@@ -795,5 +810,57 @@ mod tests {
         config.artifacts.storage_root = temp.path().join("artifacts");
 
         config.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn validate_rejects_absolute_artifact_restricted_pattern() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+
+        config.build.commands.insert(
+            "make".to_string(),
+            std::env::current_exe().expect("current exe"),
+        );
+        config.artifacts.storage_root = temp.path().join("artifacts");
+        config.artifacts.restricted_patterns = vec!["/tmp/*.h".to_string()];
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("artifacts.restricted_patterns"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_artifact_restricted_glob() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            sources: SourcesConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+
+        config.build.commands.insert(
+            "make".to_string(),
+            std::env::current_exe().expect("current exe"),
+        );
+        config.artifacts.storage_root = temp.path().join("artifacts");
+        config.artifacts.restricted_patterns = vec!["src/[a".to_string()];
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("artifacts.restricted_patterns"),
+            "unexpected error: {err}"
+        );
     }
 }

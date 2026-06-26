@@ -45,6 +45,12 @@ pub struct ArtifactArchive {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRestrictions {
+    pub omitted_count: usize,
+    pub matched_patterns: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkspaceRequest {
     #[serde(default)]
@@ -84,6 +90,8 @@ pub enum ResponseEvent {
         timed_out: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         artifacts: Option<ArtifactArchive>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifact_restrictions: Option<ArtifactRestrictions>,
         #[serde(skip_serializing_if = "Option::is_none")]
         workspace_id: Option<String>,
     },

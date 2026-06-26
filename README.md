@@ -109,6 +109,7 @@ Key fields:
 - `artifacts.storage_root`: artifact storage root (per-build subdirs).
 - `artifacts.max_transfer_bytes`: optional max artifact zip size per request.
 - `artifacts.max_uncompressed_bytes`: optional max total uncompressed artifact content size per request.
+- `artifacts.restricted_patterns`: optional server-side artifact glob patterns to omit from returned archives, even when requested by the client.
 - `artifacts.*`: TTL/GC settings for artifact retention.
 
 Environment overrides:
@@ -222,10 +223,12 @@ Streamed as `application/x-ndjson` until exit.
 {"type":"stderr","data":"..."}
 {"type":"exit","code":0,"timed_out":false,
  "workspace_id":"custom_id",
- "artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":123456}}
+ "artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":123456},
+ "artifact_restrictions":{"omitted_count":2,"matched_patterns":["**/*.cpp","**/*.h"]}}
 ```
 
 Artifact patterns that match no files are skipped (logged at info level). If no files match any pattern, `artifacts` is `null` in the exit event.
+Server-side `artifacts.restricted_patterns` are applied after client artifact includes/excludes and before artifact size limits. Restricted files are omitted, do not fail the build, do not count toward artifact size limits, and are reported only by omitted count plus matched restriction patterns. File paths are never listed.
 For managed reusable workspaces, the exit event includes `workspace_id`. Builds that use the default workspace omit it.
 
 ### Artifact Download

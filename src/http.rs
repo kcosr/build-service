@@ -635,7 +635,9 @@ fn lifecycle_server_error(context: &str, err: &WorkspaceError) -> Response {
 mod tests {
     use super::*;
     use crate::config::{ArtifactsConfig, BuildConfig, Config, LoggingConfig, ServiceConfig};
-    use crate::protocol::{ArtifactSpec, Request, ResponseEvent, SCHEMA_VERSION};
+    use crate::protocol::{
+        ArtifactArchive, ArtifactRestrictions, ArtifactSpec, Request, ResponseEvent, SCHEMA_VERSION,
+    };
     use crate::workspace::WorkspacePlan;
     use reqwest::blocking::multipart::{Form, Part};
     use reqwest::blocking::Client;
@@ -704,6 +706,32 @@ mod tests {
         .expect("build task");
 
         assert_zip_contains(&zip_bytes, "out/hello.txt", "hello");
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_build_omits_restricted_artifacts_without_failing() {
+        let env = setup_restricted_artifacts_env();
+        let (addr, server_handle) = start_http_server(env.app).await;
+
+        let (code, artifacts, restrictions) = tokio::task::spawn_blocking(move || {
+            let request = build_request();
+            let client = Client::new();
+            let base_url = format!("http://{addr}");
+            post_build_exit(&client, &base_url, &request, None)
+        })
+        .await
+        .expect("build task");
+
+        assert_eq!(code, 0);
+        assert!(artifacts.is_none());
+        assert_eq!(
+            restrictions,
+            Some(ArtifactRestrictions {
+                omitted_count: 1,
+                matched_patterns: vec!["**/*.h".to_string()],
+            })
+        );
         server_handle.abort();
     }
 
@@ -1178,6 +1206,54 @@ echo "Build finished successfully"
         }
     }
 
+    fn setup_restricted_artifacts_env() -> TestEnv {
+        let temp = tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let default_workspace = temp.path().join("default-workspace");
+        let artifacts_root = temp.path().join("artifacts");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&workspace_root).expect("workspace root");
+        std::fs::create_dir_all(&default_workspace).expect("default workspace");
+        std::fs::create_dir_all(&artifacts_root).expect("artifacts root");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+
+        let script_path = bin_dir.join("build.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nmkdir -p out\necho secret > out/generated.h\n",
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let mut config = Config {
+            schema_version: "3".to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig::default(),
+            sources: crate::config::SourcesConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        config.build.workspace_root = workspace_root.clone();
+        config.build.default_workspace_path = Some(default_workspace);
+        config
+            .build
+            .commands
+            .insert("build".to_string(), script_path);
+        config.artifacts.storage_root = artifacts_root;
+        config.artifacts.restricted_patterns = vec!["**/*.h".to_string()];
+
+        let (app, workspace_state) = build_app(config);
+        TestEnv {
+            temp,
+            app,
+            workspace_state,
+        }
+    }
+
     fn build_app(config: Config) -> (Router, Arc<WorkspaceState>) {
         let max_transfer_bytes = config.sources.max_transfer_bytes;
         let workspace_state = Arc::new(WorkspaceState::new(
@@ -1314,6 +1390,60 @@ echo "Build finished successfully"
         }
         let archive = artifacts.expect("missing artifacts");
         archive.path
+    }
+
+    fn post_build_exit(
+        client: &Client,
+        base_url: &str,
+        request: &Request,
+        source_archive: Option<&NamedTempFile>,
+    ) -> (i32, Option<ArtifactArchive>, Option<ArtifactRestrictions>) {
+        let metadata = serde_json::to_string(request).expect("metadata");
+        let mut form = Form::new().part(
+            "metadata",
+            Part::text(metadata)
+                .mime_str("application/json")
+                .expect("metadata mime"),
+        );
+        if let Some(source_archive) = source_archive {
+            form = form.part(
+                "source",
+                Part::file(source_archive.path())
+                    .expect("source part")
+                    .mime_str("application/zip")
+                    .expect("source mime"),
+            );
+        }
+
+        let base = base_url.trim_end_matches('/');
+        let url = format!("{base}/v1/builds");
+        let response = client.post(url).multipart(form).send().expect("send");
+        assert!(response.status().is_success());
+
+        let mut reader = BufReader::new(response);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_line(&mut line).expect("read line");
+            if bytes == 0 {
+                break;
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let event: ResponseEvent = serde_json::from_str(trimmed).expect("event parse");
+            if let ResponseEvent::Exit {
+                code,
+                artifacts,
+                artifact_restrictions,
+                ..
+            } = event
+            {
+                return (code, artifacts, artifact_restrictions);
+            }
+        }
+        panic!("missing exit event");
     }
 
     fn fetch_zip(client: &Client, base_url: &str, archive_path: &str) -> Vec<u8> {
