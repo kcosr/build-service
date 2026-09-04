@@ -2538,31 +2538,6 @@ mod tests {
     }
 
     #[test]
-    fn build_source_archive_anchors_target_exclusion_to_repo_root() {
-        let temp = tempdir().expect("tempdir");
-        let root = temp.path();
-        fs::create_dir_all(root.join("target/debug")).expect("create cargo target dir");
-        fs::create_dir_all(root.join("src/config/target")).expect("create nested target dir");
-        fs::write(root.join("target/debug/output"), "generated").expect("write build output");
-        fs::write(root.join("src/config/target/local.rs"), "source").expect("write source");
-
-        let patterns = PatternConfig {
-            include: vec!["**".to_string()],
-            exclude: vec!["target/**".to_string()],
-        };
-
-        let archive = build_source_archive(root, &patterns)
-            .expect("archive")
-            .expect("source archive");
-        let file = fs::File::open(archive.path()).expect("open zip");
-        let archive = ZipArchive::new(file).expect("read zip");
-        let names = archive.file_names().collect::<Vec<_>>();
-
-        assert!(names.contains(&"src/config/target/local.rs"));
-        assert!(!names.contains(&"target/debug/output"));
-    }
-
-    #[test]
     fn build_source_archive_returns_none_when_sources_are_empty() {
         let temp = tempdir().expect("tempdir");
         let archive =

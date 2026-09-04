@@ -165,7 +165,6 @@ CFLAGS = "-O2 -g"
 
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
-- Patterns match complete paths relative to the repository root. For example, `target/**` excludes the root Cargo build directory while retaining `src/config/target/**`.
 - Source include patterns that match nothing are skipped.
 - Source upload is optional. If no source include patterns are configured anywhere, the client sends metadata only.
 - Artifact download is optional. If no artifact include patterns are configured anywhere, the client skips artifact download entirely.
