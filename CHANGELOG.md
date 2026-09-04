@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Fixed
+- Document and regression-test that source exclusions are rooted at the repository, so `target/**` does not omit nested source directories named `target`.
 
 ## [0.5.2] - 2026-06-26
 
