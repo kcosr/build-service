@@ -2,8 +2,8 @@
 
 ## [Unreleased]
 
-### Fixed
-- Document and regression-test that source exclusions are rooted at the repository, so `target/**` does not omit nested source directories named `target`.
+### Added
+- Add documentation and regression coverage for existing root-relative source exclusions: `target/**` excludes root build output while preserving source directories such as `src/config/target/`. No runtime behavior changed.
 
 ## [0.5.2] - 2026-06-26
 
