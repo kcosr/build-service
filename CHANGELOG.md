@@ -2,12 +2,12 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+- Upgrading `build-cli` now rejects artifact archive symlinks and existing symlink components in artifact destination paths, even with unchanged configuration and without `sources.root`. Previously successful transfers using these paths now fail; use regular files and directories for artifact copy-back ([#19](https://github.com/kcosr/build-service/pull/19)).
+
 ### Added
 - Add client `sources.root` for sibling-worktree uploads and artifact copy-back, with transfer-root-relative cwd and isolated automatic workspace identities ([#19](https://github.com/kcosr/build-service/pull/19)).
 - Add documentation and regression coverage for existing root-relative source exclusions: `target/**` excludes root build output while preserving source directories such as `src/config/target/`. No runtime behavior changed.
-
-### Fixed
-- Reject artifact archive symlinks and existing destination symlink components during client extraction ([#19](https://github.com/kcosr/build-service/pull/19)).
 
 ## [0.5.2] - 2026-06-26
 
