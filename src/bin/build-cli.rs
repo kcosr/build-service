@@ -123,7 +123,7 @@ struct BuildArgs {
 #[derive(Debug, Default, Deserialize)]
 struct ClientConfig {
     #[serde(default)]
-    sources: PatternConfig,
+    sources: SourcesConfig,
     #[serde(default)]
     artifacts: PatternConfig,
     #[serde(default)]
@@ -134,6 +134,54 @@ struct ClientConfig {
     output: Option<OutputConfig>,
     #[serde(default)]
     workspace: Option<WorkspaceConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SourcesConfig {
+    root: Option<PathBuf>,
+    #[serde(flatten)]
+    patterns: PatternConfig,
+}
+
+fn resolve_transfer_root(repo_root: &Path, configured: Option<&Path>) -> io::Result<PathBuf> {
+    if configured.is_some_and(|root| root.as_os_str().is_empty() || root.is_absolute()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sources.root must be a nonempty relative path",
+        ));
+    }
+    let repo_root = fs::canonicalize(repo_root)?;
+    let root = fs::canonicalize(repo_root.join(configured.unwrap_or(Path::new("."))))?;
+    if !root.is_dir() || !repo_root.starts_with(&root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sources.root must be a directory containing the config repository",
+        ));
+    }
+    Ok(root)
+}
+
+fn transfer_workspace_id(repo_root: &Path, transfer_root: &Path) -> io::Result<String> {
+    let mut hostname = [0u8; 256];
+    // gethostname writes at most the provided buffer length.
+    if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let hostname = hostname.split(|byte| *byte == 0).next().unwrap_or_default();
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let transfer_root = fs::canonicalize(transfer_root)?;
+    let repo_root = fs::canonicalize(repo_root)?;
+    let mut hash = blake3::Hasher::new();
+    for value in [
+        hostname,
+        uid.as_bytes(),
+        transfer_root.as_os_str().as_encoded_bytes(),
+        repo_root.as_os_str().as_encoded_bytes(),
+    ] {
+        hash.update(&(value.len() as u64).to_le_bytes());
+        hash.update(value);
+    }
+    Ok(format!("transfer-{}", hash.finalize().to_hex()))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -845,9 +893,22 @@ fn run_build_command(
     config_loaded: bool,
 ) -> ExitCode {
     let connection = client_config.connection.as_ref();
+    let transfer_root =
+        match resolve_transfer_root(&repo_root, client_config.sources.root.as_deref()) {
+            Ok(root) => root,
+            Err(err) => {
+                eprintln!("failed to resolve sources.root: {err}");
+                return ExitCode::from(1);
+            }
+        };
+    let isolated_root = client_config
+        .sources
+        .root
+        .as_ref()
+        .map(|_| transfer_root.as_path());
 
     let source_patterns = match resolve_patterns(
-        &client_config.sources,
+        &client_config.sources.patterns,
         SOURCES_ENV,
         &args.source,
         SOURCES_EXCLUDE_ENV,
@@ -882,7 +943,7 @@ fn run_build_command(
         return ExitCode::from(1);
     }
 
-    let source_archive = match build_source_archive(&repo_root, &source_patterns) {
+    let source_archive = match build_source_archive(&transfer_root, &source_patterns) {
         Ok(archive) => archive,
         Err(err) => {
             eprintln!("failed to package sources: {err}");
@@ -893,7 +954,7 @@ fn run_build_command(
     let cwd = match resolve_request_cwd(
         args.cwd,
         client_config.request.as_ref(),
-        &repo_root,
+        &transfer_root,
         &run_dir,
     ) {
         Ok(cwd) => cwd,
@@ -929,6 +990,7 @@ fn run_build_command(
         args.workspace_id,
         client_config.workspace.as_ref(),
         &repo_root,
+        isolated_root,
     ) {
         Ok(workspace) => workspace,
         Err(err) => {
@@ -1004,7 +1066,9 @@ fn run_build_command(
     }
 
     if let Some(archive) = build.artifacts {
-        if let Err(err) = download_and_extract(&archive, &endpoint, token.as_deref(), &repo_root) {
+        if let Err(err) =
+            download_and_extract(&archive, &endpoint, token.as_deref(), &transfer_root)
+        {
             eprintln!("failed to fetch artifacts: {err}");
             return ExitCode::from(1);
         }
@@ -1097,7 +1161,7 @@ fn validate_patterns(patterns: &PatternConfig, label: &str) -> io::Result<()> {
 fn resolve_relative_cwd(root: &Path, cwd: &Path) -> io::Result<Option<String>> {
     let rel = cwd
         .strip_prefix(root)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd is outside repo root"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd is outside transfer root"))?;
 
     if rel.as_os_str().is_empty() {
         return Ok(None);
@@ -1113,7 +1177,7 @@ fn resolve_relative_cwd(root: &Path, cwd: &Path) -> io::Result<Option<String>> {
 fn resolve_request_cwd(
     explicit: Option<String>,
     request: Option<&RequestConfig>,
-    repo_root: &Path,
+    transfer_root: &Path,
     run_dir: &Path,
 ) -> io::Result<Option<String>> {
     if let Some(value) = explicit {
@@ -1132,7 +1196,7 @@ fn resolve_request_cwd(
         }
     }
 
-    resolve_relative_cwd(repo_root, run_dir)
+    resolve_relative_cwd(transfer_root, &fs::canonicalize(run_dir)?)
 }
 
 fn normalize_request_cwd(value: &str) -> io::Result<Option<String>> {
@@ -1646,6 +1710,7 @@ fn resolve_workspace_config(
     cli_id: Option<String>,
     config: Option<&WorkspaceConfig>,
     repo_root: &Path,
+    transfer_root: Option<&Path>,
 ) -> io::Result<Option<WorkspaceRequest>> {
     let reuse = if cli_reuse {
         true
@@ -1685,7 +1750,7 @@ fn resolve_workspace_config(
             Some(trimmed.to_string())
         }
     });
-    let config_id = config.and_then(|cfg| cfg.id.as_ref().map(|id| id.trim().to_string()));
+    let config_id = config.and_then(|cfg| cfg.id.clone().and_then(non_empty_trimmed));
     let mut id = cli_id.or(env_id).or(config_id);
     if let Some(ref raw_id) = id {
         id = Some(expand_workspace_macros(raw_id, repo_root)?);
@@ -1710,7 +1775,10 @@ fn resolve_workspace_config(
     };
 
     if id.is_none() {
-        id = read_workspace_id_file(repo_root)?;
+        id = match transfer_root {
+            Some(root) => Some(transfer_workspace_id(repo_root, root)?),
+            None => read_workspace_id_file(repo_root)?,
+        };
     }
 
     if create && id.is_none() {
@@ -1812,6 +1880,19 @@ fn run_workspace_command(
     config_loaded: bool,
 ) -> ExitCode {
     let connection = client_config.connection.as_ref();
+    let transfer_root =
+        match resolve_transfer_root(&repo_root, client_config.sources.root.as_deref()) {
+            Ok(root) => root,
+            Err(err) => {
+                eprintln!("failed to resolve sources.root: {err}");
+                return ExitCode::from(1);
+            }
+        };
+    let isolated_root = client_config
+        .sources
+        .root
+        .as_ref()
+        .map(|_| transfer_root.as_path());
     let (action, args) = match command {
         WorkspaceCommand::Reset(args) => (WorkspaceLifecycleAction::Reset, args),
         WorkspaceCommand::Delete(args) => (WorkspaceLifecycleAction::Delete, args),
@@ -1821,6 +1902,7 @@ fn run_workspace_command(
         args.workspace_id,
         client_config.workspace.as_ref(),
         &repo_root,
+        isolated_root,
     ) {
         Ok(workspace_id) => workspace_id,
         Err(err) => {
@@ -1867,6 +1949,7 @@ fn resolve_lifecycle_workspace_id(
     cli_id: Option<String>,
     config: Option<&WorkspaceConfig>,
     repo_root: &Path,
+    transfer_root: Option<&Path>,
 ) -> io::Result<String> {
     let cli_id = cli_id.and_then(non_empty_trimmed);
     let env_id = env::var(WORKSPACE_ID_ENV).ok().and_then(non_empty_trimmed);
@@ -1877,7 +1960,10 @@ fn resolve_lifecycle_workspace_id(
         id = Some(expand_workspace_macros(raw_id, repo_root)?);
     }
     if id.is_none() {
-        id = read_workspace_id_file(repo_root)?;
+        id = match transfer_root {
+            Some(root) => Some(transfer_workspace_id(repo_root, root)?),
+            None => read_workspace_id_file(repo_root)?,
+        };
     }
 
     let id = id.ok_or_else(|| {
@@ -2275,6 +2361,7 @@ fn build_artifact_url(base: &str, path: &str) -> String {
 fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    let dest = fs::canonicalize(dest)?;
     let file = fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -2293,6 +2380,27 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
 
         let out_path = dest.join(enclosed);
         let unix_mode = file.unix_mode();
+        if unix_mode.is_some_and(|mode| mode & 0o170000 == 0o120000) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact symlinks are not supported",
+            ));
+        }
+        let mut component_path = dest.clone();
+        for component in enclosed.components() {
+            component_path.push(component);
+            match fs::symlink_metadata(&component_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "artifact destination contains a symlink",
+                    ));
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
 
         if file.is_dir() {
             fs::create_dir_all(&out_path)?;
@@ -2412,6 +2520,118 @@ mod tests {
     }
 
     #[test]
+    fn transfer_root_requires_existing_relative_ancestor() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("consumer");
+        fs::create_dir_all(repo.join("nested")).unwrap();
+        assert_eq!(
+            resolve_transfer_root(&repo, Some(Path::new(".."))).unwrap(),
+            fs::canonicalize(temp.path()).unwrap()
+        );
+        assert_eq!(
+            resolve_transfer_root(&repo, None).unwrap(),
+            fs::canonicalize(&repo).unwrap()
+        );
+        for path in [
+            Path::new(""),
+            temp.path(),
+            Path::new("missing"),
+            Path::new("nested"),
+        ] {
+            assert!(
+                resolve_transfer_root(&repo, Some(path)).is_err(),
+                "{path:?}"
+            );
+        }
+        fs::write(repo.join("file"), "").unwrap();
+        assert!(resolve_transfer_root(&repo, Some(Path::new("file"))).is_err());
+    }
+
+    #[test]
+    fn transfer_root_and_identity_use_canonical_paths() {
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("consumer");
+        let sibling = temp.path().join("sibling");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        symlink(&sibling, repo.join("wrong-root")).unwrap();
+        assert!(resolve_transfer_root(&repo, Some(Path::new("wrong-root"))).is_err());
+        symlink(temp.path(), repo.join("alias-root")).unwrap();
+        let root = resolve_transfer_root(&repo, Some(Path::new("alias-root"))).unwrap();
+        let id = transfer_workspace_id(&repo, &root).unwrap();
+        assert_eq!(id, transfer_workspace_id(&repo, &repo.join("..")).unwrap());
+        assert_ne!(id, transfer_workspace_id(&sibling, &root).unwrap());
+    }
+
+    #[test]
+    fn transfer_identity_ignores_cache_and_matches_lifecycle() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        write_workspace_id_file(temp.path(), "copied-id").unwrap();
+        let expected = transfer_workspace_id(temp.path(), temp.path()).unwrap();
+        let previous = env::var(WORKSPACE_ID_ENV).ok();
+        env::remove_var(WORKSPACE_ID_ENV);
+        let request = resolve_workspace_config(true, None, None, temp.path(), Some(temp.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.id.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            resolve_lifecycle_workspace_id(None, None, temp.path(), Some(temp.path())).unwrap(),
+            expected
+        );
+        let explicit = resolve_workspace_config(
+            true,
+            Some("explicit".into()),
+            None,
+            temp.path(),
+            Some(temp.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(explicit.id.as_deref(), Some("explicit"));
+        if let Some(value) = previous {
+            env::set_var(WORKSPACE_ID_ENV, value);
+        }
+    }
+
+    #[test]
+    fn extract_zip_rejects_existing_symlink_components() {
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("file"), "original").unwrap();
+        symlink(outside.path(), temp.path().join("linked-dir")).unwrap();
+        symlink(outside.path().join("file"), temp.path().join("linked-file")).unwrap();
+        symlink(
+            outside.path().join("missing"),
+            temp.path().join("dangling-file"),
+        )
+        .unwrap();
+        for name in ["linked-dir/file", "linked-file", "dangling-file"] {
+            let archive = create_test_zip(name, b"overwrite").unwrap();
+            assert!(extract_zip(archive.path(), temp.path()).is_err());
+        }
+        assert_eq!(
+            fs::read_to_string(outside.path().join("file")).unwrap(),
+            "original"
+        );
+        assert!(!outside.path().join("missing").exists());
+    }
+
+    #[test]
+    fn extract_zip_rejects_archive_symlinks() {
+        let temp = tempdir().unwrap();
+        let archive = NamedTempFile::new().unwrap();
+        let mut zip = ZipWriter::new(archive.reopen().unwrap());
+        zip.add_symlink("link", "outside", FileOptions::default())
+            .unwrap();
+        zip.finish().unwrap();
+        assert!(extract_zip(archive.path(), temp.path()).is_err());
+        assert!(!temp.path().join("link").exists());
+    }
+
+    #[test]
     fn artifact_restrictions_notice_lists_patterns_without_paths() {
         let restrictions = ArtifactRestrictions {
             omitted_count: 2,
@@ -2515,6 +2735,46 @@ mod tests {
             .unwrap();
         let err = client.get(format!("http://{addr}")).send().unwrap_err();
         assert!(is_connection_failure(&err));
+    }
+
+    #[test]
+    fn build_source_archive_rejects_symlinks_outside_transfer_root() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("file"), "outside").unwrap();
+        symlink(outside.path().join("file"), root.path().join("linked-file")).unwrap();
+        symlink(outside.path(), root.path().join("linked-dir")).unwrap();
+        for include in ["linked-file", "linked-dir", "linked-dir/**"] {
+            let patterns = PatternConfig {
+                include: vec![include.to_string()],
+                exclude: Vec::new(),
+            };
+            let err = build_source_archive(root.path(), &patterns).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{include}: {err}");
+            assert!(
+                err.to_string().contains("outside repo root"),
+                "{include}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_patterns_reject_parent_traversal() {
+        for include in [
+            "../sibling/**",
+            "consumer/../../outside",
+            "consumer/../file",
+        ] {
+            let patterns = PatternConfig {
+                include: vec![include.to_string()],
+                exclude: Vec::new(),
+            };
+            assert_eq!(
+                validate_patterns(&patterns, "sources").unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[test]
@@ -2744,8 +3004,9 @@ mod tests {
     #[test]
     fn resolve_workspace_config_rejects_cli_id_without_reuse() {
         let temp = tempdir().expect("tempdir");
-        let err = resolve_workspace_config(false, Some("ws-id".to_string()), None, temp.path())
-            .unwrap_err();
+        let err =
+            resolve_workspace_config(false, Some("ws-id".to_string()), None, temp.path(), None)
+                .unwrap_err();
         assert!(
             err.to_string()
                 .contains("--workspace-id requires --workspace-reuse"),
@@ -3202,9 +3463,13 @@ mod tests {
     #[test]
     fn resolve_lifecycle_workspace_id_sanitizes_macros() {
         let temp = tempdir().expect("tempdir");
-        let id =
-            resolve_lifecycle_workspace_id(Some("feature/add-auth".to_string()), None, temp.path())
-                .expect("workspace id");
+        let id = resolve_lifecycle_workspace_id(
+            Some("feature/add-auth".to_string()),
+            None,
+            temp.path(),
+            None,
+        )
+        .expect("workspace id");
 
         assert_eq!(id, "feature-add-auth");
     }

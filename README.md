@@ -124,6 +124,7 @@ This file is optional. If it is absent, `build-cli` can run from CLI flags and `
 
 ```toml
 [sources]
+# root = ".."  # optional transfer root, relative to this config's repository
 include = ["**/*"]
 exclude = [".git/**", ".build-service/**", "target/**"]
 
@@ -165,8 +166,10 @@ CFLAGS = "-O2 -g"
 
 Notes:
 - `sources` and `artifacts` patterns must be relative and cannot use `..`.
-- Patterns match complete paths relative to the repository root. For example, `target/**` excludes the root Cargo build directory while retaining `src/config/target/**`.
-- Source include patterns that match nothing are skipped.
+- `sources.root` selects an existing directory relative to the repository containing `.build-service/config.toml`. It defaults to that repository root. The resolved directory must contain the config repository; absolute paths and empty values are rejected.
+- Source and artifact patterns, explicit request cwd, and artifact extraction are relative to the transfer root. Without an explicit cwd, the invocation directory is expressed relative to that root, so invoking from a consumer still runs in that consumer.
+- Patterns match complete paths relative to the transfer root. For example, `target/**` excludes the root Cargo build directory while retaining `src/config/target/**`.
+- Source include patterns that match nothing are skipped. Artifact extraction rejects ZIP symlink entries and existing symlink destinations, and source files must resolve inside the transfer root.
 - Source upload is optional. If no source include patterns are configured anywhere, the client sends metadata only.
 - Artifact download is optional. If no artifact include patterns are configured anywhere, the client skips artifact download entirely.
 - In env-only mode, source packaging and artifact extraction are rooted at the current working directory because there is no repo config root to anchor them.
@@ -174,7 +177,7 @@ Notes:
 - Output limits are optional and still apply only to terminal output; unset means unlimited, `0` disables output. When capture is healthy, the suppression notice points to the saved log path for that stream. If capture is unavailable, the CLI falls back to the existing env-var hint (`BUILD_SERVICE_STDOUT_MAX_LINES` / `BUILD_SERVICE_STDERR_MAX_LINES`) and later summarizes suppressed lines.
 - When log capture initializes successfully, the CLI prints a final `stderr` notice with both saved log paths even if no suppression occurred.
 - Temp-dir retention is OS-managed. If you rely on saved logs, set `output.log_dir` to a persistent location and clean up old build directories yourself.
-- When workspace reuse is enabled, the CLI reads `.build-service/workspace-id` if no workspace id is configured and writes it when the server returns `workspace_id`.
+- When workspace reuse is enabled without `sources.root`, the CLI reads `.build-service/workspace-id` if no workspace id is configured and writes it when the server returns `workspace_id`. With explicit `sources.root`, an omitted workspace ID is derived from the client host, user, canonical transfer root, and config repository. Copied workspace-id files do not override this identity; workspace reset/delete resolve the same ID. Explicit IDs still take precedence and deliberately share the selected workspace. Repository macros and workspace metadata remain anchored to the config repository.
 - `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{repo}`, `{branch}`, and `{uid}`; the CLI expands `{repo}` to the repo root directory name, `{branch}` to the current git branch, and `{uid}` to the effective user id, and the server sanitizes the resulting workspace id.
 - Reusable workspace source extraction removes previously uploaded source files that are no longer present in the latest source archive. It does not clean object files, caches, or other files that were not written from a source archive.
 - Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force rewriting current source files for the next build.
@@ -188,6 +191,53 @@ Notes:
 - Connection precedence: CLI flags > env vars > `.build-service/config.toml`. With a config file present, the final fallback endpoint is `unix:///run/build-service.sock`.
 - Source/artifact pattern precedence is additive: config file, then comma-separated env vars, then repeatable CLI flags.
 - Env overrides: `BUILD_SERVICE_ENABLED`, `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_SOURCES`, `BUILD_SERVICE_SOURCES_EXCLUDE`, `BUILD_SERVICE_ARTIFACTS`, `BUILD_SERVICE_ARTIFACTS_EXCLUDE`, `BUILD_SERVICE_CWD`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
+
+### Sibling Rust worktrees
+
+For `feature/usage-receiver/` alongside `feature/access-runtime/`, install this
+config at `feature/usage-receiver/.build-service/config.toml`:
+
+```toml
+[sources]
+root = ".."
+include = ["usage-receiver/**/*", "access-runtime/**/*"]
+exclude = [
+  "usage-receiver/.git", "usage-receiver/.git/**",
+  "access-runtime/.git", "access-runtime/.git/**",
+  "usage-receiver/.build-service/**", "access-runtime/.build-service/**",
+  "usage-receiver/target/**", "access-runtime/target/**",
+]
+
+[artifacts]
+include = ["usage-receiver/**/*.rs", "usage-receiver/Cargo.lock"]
+exclude = ["usage-receiver/target/**/*.rs"]
+
+[request]
+cwd = "usage-receiver"
+timeout_sec = 3600
+
+[request.env]
+CARGO_TARGET_DIR = "target"
+
+[workspace]
+reuse = true
+create = true
+ttl_sec = 86400
+```
+
+Set `BUILD_SERVICE_ENDPOINT` and `BUILD_SERVICE_TOKEN` as usual, then run
+`build-cli build cargo fmt` from the consumer directory, or use the Cargo wrapper.
+Add each required sibling to the include/exclude lists and extend exclusions for
+local secrets and generated files. Exclude exact Cargo output directories, never
+`**/target/**`: real source modules can be named `target`. Include named executable
+paths explicitly when binary copy-back is needed.
+
+Separate feature roots and consumers receive separate automatic workspace IDs;
+branch switches within the same root keep the cache. Set `workspace.create = true`
+to allow the service to create the derived workspace on first use. An explicit `workspace.id`
+opts into that chosen identity instead. Keep sibling checkouts stable while
+packaging a build, and record their SHAs and dirty state for reproducible results.
+Returned files overwrite local files, so avoid local edits during formatting.
 
 ## Protocol
 
