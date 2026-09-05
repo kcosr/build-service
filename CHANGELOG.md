@@ -3,7 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- Add client `sources.root` for sibling-worktree uploads and artifact copy-back, with transfer-root-relative cwd and isolated automatic workspace identities ([#19](https://github.com/kcosr/build-service/pull/19)).
 - Add documentation and regression coverage for existing root-relative source exclusions: `target/**` excludes root build output while preserving source directories such as `src/config/target/`. No runtime behavior changed.
+
+### Fixed
+- Reject artifact archive symlinks and existing destination symlink components during client extraction ([#19](https://github.com/kcosr/build-service/pull/19)).
 
 ## [0.5.2] - 2026-06-26
 
