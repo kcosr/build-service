@@ -105,6 +105,7 @@ Key fields:
 - `build.commands`: allowlist mapping `command` -> absolute binary path.
 - `build.timeouts.*`: default timeout and max timeout.
 - `build.environment.allow`: allowlist of environment variables passed to the build.
+- `build.output.stdout_notice` / `build.output.stderr_notice`: optional server-configured messages emitted before command output.
 - `sources.*`: upload-side transfer and uncompressed-content limits for source archives.
 - `artifacts.storage_root`: artifact storage root (per-build subdirs).
 - `artifacts.max_transfer_bytes`: optional max artifact zip size per request.
@@ -115,6 +116,27 @@ Key fields:
 Environment overrides:
 - `BUILD_SERVICE_CONFIG`: alternate config path.
 - `BUILD_SERVICE_LOG_LEVEL`: override `logging.level`.
+
+To show a notice at the start of each accepted build, configure either or both
+streams in the **server** config:
+
+```toml
+[build.output]
+stdout_notice = "NOTICE: This build runs on the shared build server."
+stderr_notice = "NOTICE: Server policy restricts returned artifacts."
+```
+
+Notices default to empty (disabled). They are sent after the build-start event,
+before workspace preparation and command output, including when build setup
+later fails. Requests rejected before streaming begins do not receive notices.
+Configured text is literal, supports multiple lines, and gets a trailing newline
+if needed. The client cannot override it. Restart the service after changing
+the server config.
+
+Notices use the normal stdout/stderr stream: they are included in captured logs
+and count toward the CLI's output line limits. A zero limit suppresses initial
+display; configured tail output may still show the notice at completion. Log
+capture retains it when enabled.
 
 ## Repo-local Client Config
 

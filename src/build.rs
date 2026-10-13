@@ -232,6 +232,26 @@ fn run_build(
         })
         .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
 
+    for (notice, kind) in [
+        (&config.build.output.stdout_notice, StreamKind::Stdout),
+        (&config.build.output.stderr_notice, StreamKind::Stderr),
+    ] {
+        if notice.is_empty() {
+            continue;
+        }
+        let mut data = notice.clone();
+        if !data.ends_with('\n') {
+            data.push('\n');
+        }
+        let event = match kind {
+            StreamKind::Stdout => ResponseEvent::Stdout { data },
+            StreamKind::Stderr => ResponseEvent::Stderr { data },
+        };
+        sender
+            .blocking_send(event)
+            .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
+    }
+
     let run_as = resolve_run_as(config)?;
 
     let workspace = prepare_workspace(config, workspace_plan, source_archive)?;

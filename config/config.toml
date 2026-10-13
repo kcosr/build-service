@@ -30,6 +30,11 @@ workspace_root = "/var/lib/build-service/workspaces"
 # run_as_user = "build"
 # run_as_group = "build"
 
+[build.output]
+# Optional server notices sent before command output; empty values disable them.
+# stdout_notice = "NOTICE: This build runs on the shared build server."
+# stderr_notice = "NOTICE: Server policy restricts returned artifacts."
+
 [build.workspace]
 # default_ttl_sec = 7200
 # allow_permanent = false
