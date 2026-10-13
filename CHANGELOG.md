@@ -9,6 +9,7 @@
 - Add client `sources.root` for sibling-worktree uploads and artifact copy-back, with transfer-root-relative cwd and isolated automatic workspace identities ([#19](https://github.com/kcosr/build-service/pull/19)).
 - Add documentation and regression coverage for existing root-relative source exclusions: `target/**` excludes root build output while preserving source directories such as `src/config/target/`. No runtime behavior changed.
 - Add server-configured stdout/stderr notices before build setup and command output, with normal CLI log capture and output limits ([#20](https://github.com/kcosr/build-service/pull/20)).
+- Add server info logs for each excluded artifact with its build ID, relative filename, matching rule, and exclusion source ([#21](https://github.com/kcosr/build-service/pull/21)).
 
 ## [0.5.2] - 2026-06-26
 

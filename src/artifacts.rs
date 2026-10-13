@@ -70,6 +70,8 @@ pub fn collect_artifacts_zip(
     config: &ArtifactsConfig,
     build_id: &str,
 ) -> Result<ArtifactCollection, ArtifactError> {
+    let _span = tracing::info_span!("artifact_collection", build_id).entered();
+
     if spec.include.is_empty() {
         return Ok(ArtifactCollection {
             archive: None,
@@ -84,7 +86,11 @@ pub fn collect_artifacts_zip(
 
     let mut excludes = spec.exclude.clone();
     excludes.push(INTERNAL_EXCLUDE_PATTERN.to_string());
-    let exclude_patterns = compile_patterns(&excludes, "artifacts.exclude")?;
+    let mut exclusions = ArtifactExclusions {
+        patterns: compile_patterns(&excludes, "artifacts.exclude")?,
+        client_pattern_count: spec.exclude.len(),
+        logged_paths: HashSet::new(),
+    };
     let mut matched_files: HashMap<PathBuf, PathBuf> = HashMap::new();
 
     for pattern in &spec.include {
@@ -105,7 +111,7 @@ pub fn collect_artifacts_zip(
         })?;
 
         let mut found = false;
-        if collect_recursive_prefix(pattern, &root, &exclude_patterns, &mut matched_files)? {
+        if collect_recursive_prefix(pattern, &root, &mut exclusions, &mut matched_files)? {
             found = true;
         }
 
@@ -126,7 +132,7 @@ pub fn collect_artifacts_zip(
             }
 
             if canonical.is_dir() {
-                collect_dir_files(&canonical, &root, &exclude_patterns, &mut matched_files)?;
+                collect_dir_files(&canonical, &root, &mut exclusions, &mut matched_files)?;
             } else if canonical.is_file() {
                 let rel = canonical
                     .strip_prefix(&root)
@@ -134,7 +140,7 @@ pub fn collect_artifacts_zip(
                         path: canonical.clone(),
                     })?
                     .to_path_buf();
-                if !is_excluded(&rel, &exclude_patterns) {
+                if !exclusions.excludes(&rel) {
                     matched_files.entry(canonical).or_insert(rel);
                 }
             }
@@ -210,7 +216,7 @@ fn sum_matched_file_sizes(matched_files: &HashMap<PathBuf, PathBuf>) -> Result<u
 fn collect_recursive_prefix(
     pattern: &str,
     root: &Path,
-    exclude_patterns: &[glob::Pattern],
+    exclusions: &mut ArtifactExclusions,
     matched_files: &mut HashMap<PathBuf, PathBuf>,
 ) -> Result<bool, ArtifactError> {
     let base = if pattern == "**" {
@@ -245,7 +251,7 @@ fn collect_recursive_prefix(
     }
 
     if canonical.is_dir() {
-        collect_dir_files(&canonical, root, exclude_patterns, matched_files)?;
+        collect_dir_files(&canonical, root, exclusions, matched_files)?;
         return Ok(true);
     }
 
@@ -280,16 +286,25 @@ fn apply_restricted_patterns(
     let mut restricted_paths = HashSet::new();
     let mut matched_pattern_indexes = HashSet::new();
 
-    for (canonical, rel) in matched_files.iter() {
+    let mut items: Vec<_> = matched_files.iter().collect();
+    items.sort_by(|a, b| a.1.cmp(b.1));
+
+    for (canonical, rel) in items {
         let rel_str = rel.to_string_lossy();
-        let mut restricted = false;
+        let mut matching_patterns = Vec::new();
         for (index, pattern) in compiled.iter().enumerate() {
             if pattern.matches(&rel_str) {
-                restricted = true;
+                matching_patterns.push(restricted_patterns[index].as_str());
                 matched_pattern_indexes.insert(index);
             }
         }
-        if restricted {
+        if !matching_patterns.is_empty() {
+            info!(
+                path = ?rel,
+                source = "server",
+                patterns = ?matching_patterns,
+                "artifact excluded"
+            );
             restricted_paths.insert(canonical.clone());
         }
     }
@@ -319,7 +334,7 @@ fn apply_restricted_patterns(
 fn collect_dir_files(
     dir: &Path,
     root: &Path,
-    exclude_patterns: &[glob::Pattern],
+    exclusions: &mut ArtifactExclusions,
     matched_files: &mut HashMap<PathBuf, PathBuf>,
 ) -> Result<(), ArtifactError> {
     for entry in WalkDir::new(dir) {
@@ -343,7 +358,7 @@ fn collect_dir_files(
                 path: canonical.clone(),
             })?
             .to_path_buf();
-        if is_excluded(&rel, exclude_patterns) {
+        if exclusions.excludes(&rel) {
             continue;
         }
         matched_files.entry(canonical).or_insert(rel);
@@ -351,13 +366,39 @@ fn collect_dir_files(
     Ok(())
 }
 
-fn is_excluded(path: &Path, patterns: &[glob::Pattern]) -> bool {
-    if patterns.is_empty() {
-        return false;
-    }
+struct ArtifactExclusions {
+    patterns: Vec<glob::Pattern>,
+    client_pattern_count: usize,
+    logged_paths: HashSet<PathBuf>,
+}
 
-    let path_str = path.to_string_lossy();
-    patterns.iter().any(|pattern| pattern.matches(&path_str))
+impl ArtifactExclusions {
+    fn excludes(&mut self, path: &Path) -> bool {
+        let path_str = path.to_string_lossy();
+        let Some((index, pattern)) = self
+            .patterns
+            .iter()
+            .enumerate()
+            .find(|(_, pattern)| pattern.matches(&path_str))
+        else {
+            return false;
+        };
+
+        if self.logged_paths.insert(path.to_path_buf()) {
+            let source = if index < self.client_pattern_count {
+                "client"
+            } else {
+                "internal"
+            };
+            info!(
+                path = ?path,
+                source,
+                pattern = ?pattern.as_str(),
+                "artifact excluded"
+            );
+        }
+        true
+    }
 }
 
 fn write_artifacts_zip(

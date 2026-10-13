@@ -247,7 +247,12 @@ Example metadata:
  "artifact_restrictions":{"omitted_count":2,"matched_patterns":["**/*.cpp","**/*.h"]}}
 ```
 
-Server-side `artifacts.restricted_patterns` omit matching artifacts after client includes/excludes and before artifact size limits. Restricted files do not fail the build, do not count toward artifact size limits, and are reported without file paths.
+Server-side `artifacts.restricted_patterns` omit matching artifacts after client includes/excludes and before artifact size limits. Restricted files do not fail the build or count toward artifact size limits. Client restriction metadata contains counts and patterns without file paths; excluded filenames are logged on the server.
+
+The server logs artifact exclusions at info level with the build ID,
+workspace-relative filename, matching rule, and exclusion source (client,
+internal, or server). Each excluded path is logged once per build. Existing glob
+match logging is retained; client restriction metadata remains path-free.
 
 Server-side `build.output.stdout_notice` and `build.output.stderr_notice` default
 to empty (disabled). Nonempty messages are emitted as normal stdout/stderr events

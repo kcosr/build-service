@@ -301,7 +301,7 @@ Streamed as `application/x-ndjson` until exit.
 ```
 
 Artifact patterns that match no files are skipped (logged at info level). If no files match any pattern, `artifacts` is `null` in the exit event.
-Server-side `artifacts.restricted_patterns` are applied after client artifact includes/excludes and before artifact size limits. Restricted files are omitted, do not fail the build, do not count toward artifact size limits, and are reported only by omitted count plus matched restriction patterns. File paths are never listed.
+Server-side `artifacts.restricted_patterns` are applied after client artifact includes/excludes and before artifact size limits. Restricted files are omitted, do not fail the build, and do not count toward artifact size limits. The client summary contains only the omitted count and matched restriction patterns; file paths appear only in server logs.
 For managed reusable workspaces, the exit event includes `workspace_id`. Builds that use the default workspace omit it.
 
 ### Artifact Download
@@ -490,6 +490,19 @@ The wrapper falls back to the local command in two cases:
 ## Logging
 
 Logs are written using `tracing` in a plain-text format. Configure log directory/rotation in `[logging]`.
+
+At info level, artifact collection logs the original glob matches and each
+excluded file. Exclusion messages include the build ID, workspace-relative path,
+and matching rule, with `source` identifying a client exclude, the internal
+`.build-service/**` exclude, or a server restriction. Each excluded path is
+reported once per build, including when include patterns overlap. Client and
+internal exclusions report the first matching rule; server restrictions report
+all matching rules. Filenames are quoted and escaped in the server log.
+
+Glob matches can include directories and files later excluded. Recursive
+directory traversal does not log every candidate file individually. These logs
+describe collection decisions; they do not confirm that an archive was downloaded.
+The client's restriction notice still reports only counts and patterns.
 
 ## Non-Build Example
 
