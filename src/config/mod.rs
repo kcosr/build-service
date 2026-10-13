@@ -429,6 +429,9 @@ pub struct BuildConfig {
 
     #[serde(default)]
     pub environment: EnvironmentConfig,
+
+    #[serde(default)]
+    pub output: BuildOutputConfig,
 }
 
 impl Default for BuildConfig {
@@ -442,8 +445,18 @@ impl Default for BuildConfig {
             commands: HashMap::new(),
             timeouts: TimeoutConfig::default(),
             environment: EnvironmentConfig::default(),
+            output: BuildOutputConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildOutputConfig {
+    #[serde(default)]
+    pub stdout_notice: String,
+
+    #[serde(default)]
+    pub stderr_notice: String,
 }
 
 fn default_workspace_root() -> PathBuf {
@@ -734,6 +747,34 @@ fn parse_socket_mode(mode: &str) -> Result<u32, SocketModeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_output_notices_default_to_empty() {
+        let config: BuildConfig = toml::from_str("").expect("build config");
+        assert!(config.output.stdout_notice.is_empty());
+        assert!(config.output.stderr_notice.is_empty());
+
+        let config: BuildConfig =
+            toml::from_str("[output]\nstdout_notice = 'Server notice'").expect("build config");
+        assert_eq!(config.output.stdout_notice, "Server notice");
+        assert!(config.output.stderr_notice.is_empty());
+    }
+
+    #[test]
+    fn build_output_notices_preserve_configured_text() {
+        let config: BuildConfig = toml::from_str(
+            r#"[output]
+stdout_notice = "First line\nSecond line\n"
+stderr_notice = "  Server policy: $HOME is literal.  "
+"#,
+        )
+        .expect("build config");
+        assert_eq!(config.output.stdout_notice, "First line\nSecond line\n");
+        assert_eq!(
+            config.output.stderr_notice,
+            "  Server policy: $HOME is literal.  "
+        );
+    }
 
     #[test]
     fn parse_socket_mode_accepts_octal() {

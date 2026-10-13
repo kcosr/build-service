@@ -95,6 +95,10 @@ workspace_root = "/var/lib/build-service/workspaces"
 # run_as_user = "build"
 # run_as_group = "build"
 
+[build.output]
+# stdout_notice = "NOTICE: This build runs on the shared build server."
+# stderr_notice = "NOTICE: Server policy restricts returned artifacts."
+
 [build.workspace]
 # default_ttl_sec = 7200
 # allow_permanent = false
@@ -244,6 +248,16 @@ Example metadata:
 ```
 
 Server-side `artifacts.restricted_patterns` omit matching artifacts after client includes/excludes and before artifact size limits. Restricted files do not fail the build, do not count toward artifact size limits, and are reported without file paths.
+
+Server-side `build.output.stdout_notice` and `build.output.stderr_notice` default
+to empty (disabled). Nonempty messages are emitted as normal stdout/stderr events
+after the build-start event, before workspace preparation or command output.
+They also precede setup errors for accepted builds; requests rejected before
+streaming starts receive no notice. Text is literal, supports multiple lines,
+and receives a trailing newline if missing. Clients cannot override the messages.
+Notices are included in captured logs and subject to client output line limits,
+including suppression of initial display at a zero limit. Configured tail output
+can still show them at completion. Server config changes require a restart.
 
 ### Artifact Download
 
